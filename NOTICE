@@ -1,0 +1,70 @@
+litert-lm-plugin-cc
+Copyright 2026 Kurt Valcorza
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+================================================================================
+THIS PROJECT IS UNOFFICIAL
+================================================================================
+
+It is not affiliated with, endorsed by, sponsored by, or supported by Google,
+Anthropic, or OpenAI. It is an independent project by an individual author.
+
+Names such as "Gemma", "LiteRT", "LiteRT-LM", "Claude", and "Claude Code" are
+used only to identify the software this project interoperates with, as permitted
+by Section 6 (Trademarks) of the Apache License. No claim of ownership,
+affiliation, or endorsement is made or implied.
+
+================================================================================
+THIRD-PARTY SOFTWARE THIS PROJECT INTEROPERATES WITH
+================================================================================
+
+This repository does not vendor, bundle, or redistribute any of the following.
+It calls software the user installs separately, and reads file formats those
+projects define.
+
+--------------------------------------------------------------------------------
+LiteRT-LM  —  https://github.com/google-ai-edge/LiteRT-LM
+Copyright The ODML Authors
+Licensed under the Apache License, Version 2.0
+
+    The inference runtime this plugin drives. The user installs it themselves
+    (`uv tool install litert-lm`); this project starts its server and calls its
+    OpenAI-compatible endpoint.
+
+    `plugins/gemma/tools/litertlm_backend.py` additionally imports modules from
+    the user's own LiteRT-LM installation at run time (`litert_lm_cli.model`,
+    `litert_lm_builder.litertlm_core`, `litert_lm_builder.litertlm_peek`) in
+    order to read and rewrite the metadata header of a `.litertlm` file. No
+    LiteRT-LM code is copied into this repository.
+
+--------------------------------------------------------------------------------
+FlatBuffers  —  https://github.com/google/flatbuffers
+Copyright Google Inc.
+Licensed under the Apache License, Version 2.0
+
+    Used indirectly, via the copy vendored inside the user's LiteRT-LM
+    installation, to parse and rebuild the `.litertlm` metadata header.
+
+--------------------------------------------------------------------------------
+LiteRT Community model conversions  —  https://huggingface.co/litert-community
+
+    The `.litertlm` model files this plugin serves are published by the
+    litert-community organisation on Hugging Face. Each model carries its own
+    licence, which the user accepts when downloading it. This project neither
+    redistributes nor modifies the weights.
+
+    Note that repositories under `litert-community` are conversions and are
+    distinct from the original vendor repositories (for example
+    `google/gemma-4-*`), which have their own, sometimes stricter, licence
+    terms. Gating differs per repository — verify rather than assume.
+
+--------------------------------------------------------------------------------
+Structural inspiration: codex-plugin-cc  —  https://github.com/openai/codex-plugin-cc
+Copyright OpenAI
+Licensed under the Apache License, Version 2.0
+
+    The self-hosted marketplace layout used here (a repository-root
+    `.claude-plugin/marketplace.json` pointing at a plugin directory) was
+    determined by inspecting that project, which is the reference for how a
+    plugin installs from a plain GitHub repository. No code was copied.

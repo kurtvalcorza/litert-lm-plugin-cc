@@ -206,6 +206,45 @@ constitution's requirement that a cold-start figure never be presented as steady
 
 ---
 
+## R9. Repeated GPU model-switching hung the display driver
+
+**Decision**: Keep FR-026's warn-then-proceed, but state the stability risk, not just the
+latency cost. Do not add automatic model cycling anywhere.
+
+**Rationale**: During implementation testing, rapid back-and-forth `--model` switching between
+`gemma4-e4b-gpu` and `qwen3-0.6b-int4` — each switch forcing a full ML Drift engine teardown
+and re-initialisation — was followed by a host crash: bugcheck **`0x116` VIDEO_TDR_ERROR**,
+parameter 3 `0xC000009A` (`STATUS_INSUFFICIENT_RESOURCES`). The display driver hung and could
+not be reset, forcing a hard reboot.
+
+Causation is strongly indicated but **not proven**: 0x116 means the driver stopped responding,
+and the GPU work in flight was ML Drift engine churn. It is recorded here as an observed
+hazard rather than a diagnosed defect.
+
+Observed on `litert-lm` 0.14.0, driver 610.62, RTX 5070 Ti Laptop GPU (12 GB), Windows 11.
+This is the second GPU-related bugcheck on this hardware; the earlier one involved fused SDPA
+on Blackwell `sm_120` in an unrelated stack, which suggests the platform is generally
+intolerant of aggressive GPU context churn.
+
+**Consequences for this feature**:
+
+- FR-026's warning must name the stability risk and point at `--stop`, not merely report a
+  latency cost. A user who reads "tens of seconds" may decide the wait is acceptable and loop
+  anyway; that framing understates it.
+- No feature may cycle models automatically. Nothing in the current scope does, and nothing
+  added later should.
+- Benchmark or comparison workflows across models must stop the server between models rather
+  than switching in place.
+
+**Secondary finding — state files outlive their processes.** The reboot left
+`in-flight=1`, `server.pid`, and `watchdog.pid` behind, all naming dead processes. A stale
+`watchdog.pid` was enough to suppress every future watchdog, so the server would never have
+released accelerator memory again. Anything reading these files MUST verify pid **liveness**,
+not file existence, and MUST reset counters when the server is unreachable. Implemented as
+`reconcileState()` in the client and verified against the actual post-crash state.
+
+---
+
 ## R8. Known upstream defect affecting the metadata tool
 
 **Decision**: Alias the symbol at import time and comment why.

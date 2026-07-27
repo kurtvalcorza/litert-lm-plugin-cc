@@ -18,12 +18,12 @@ code MUST NOT be assumed correct — the plan identifies four gaps it does not c
 
 ## Phase 1: Setup
 
-- [ ] T001 Create the marketplace manifest at `.claude-plugin/marketplace.json` naming marketplace `litert-lm-local`, one plugin `gemma`, `source: ./plugins/gemma`, individual author (FR-027, FR-029)
-- [ ] T002 [P] Create the plugin manifest at `plugins/gemma/.claude-plugin/plugin.json` with name `gemma`, version, Apache-2.0, and an "Unofficial" description (FR-029)
-- [ ] T003 [P] Add `LICENSE` (Apache-2.0) at repository root
-- [ ] T004 [P] Add `NOTICE` at repository root crediting `google-ai-edge/LiteRT-LM` and the `litert-community` model conversions by name and licence (FR-030)
-- [ ] T005 [P] Add `.gitignore` covering `__pycache__/`, `*.pyc`, `.DS_Store`, and any local runtime-state directory
-- [ ] T006 Verify the repository layout matches plan.md — manifest at root, plugin under `plugins/gemma/`, and confirm the manifest `source` path resolves (research R4: a root-level plugin is not installable)
+- [X] T001 Create the marketplace manifest at `.claude-plugin/marketplace.json` naming marketplace `litert-lm-local`, one plugin `gemma`, `source: ./plugins/gemma`, individual author (FR-027, FR-029)
+- [X] T002 [P] Create the plugin manifest at `plugins/gemma/.claude-plugin/plugin.json` with name `gemma`, version, Apache-2.0, and an "Unofficial" description (FR-029)
+- [X] T003 [P] Add `LICENSE` (Apache-2.0) at repository root
+- [X] T004 [P] Add `NOTICE` at repository root crediting `google-ai-edge/LiteRT-LM` and the `litert-community` model conversions by name and licence (FR-030)
+- [X] T005 [P] Add `.gitignore` covering `__pycache__/`, `*.pyc`, `.DS_Store`, and any local runtime-state directory
+- [X] T006 Verify the repository layout matches plan.md — manifest at root, plugin under `plugins/gemma/`, and confirm the manifest `source` path resolves (research R4: a root-level plugin is not installable)
 
 **Checkpoint**: repository is structurally a self-hosted marketplace.
 
@@ -33,10 +33,10 @@ code MUST NOT be assumed correct — the plan identifies four gaps it does not c
 
 **⚠️ MUST complete before any user story phase.**
 
-- [ ] T007 Create the shared usage-policy skill at `plugins/gemma/skills/gemma-usage/SKILL.md` stating the capability boundary (no file access, no shell, no repo awareness, no iteration), the verification duty, the escalation rule, and that fluency is not evidence (FR-007, FR-008, FR-009, FR-010)
-- [ ] T008 Establish the runtime-state directory convention in `plugins/gemma/scripts/gemma-client.mjs` — port-keyed path, one file per fact, absent-means-default rules per `contracts/runtime-state.md`
-- [ ] T009 Reconcile cross-platform dependency discovery in `plugins/gemma/tools/litertlm_backend.py` — per-platform candidate paths, `LITERT_LM_SITE_PACKAGES` override, and an actionable message naming the install command instead of an `ImportError` trace (FR-032, Principle III)
-- [ ] T010 Reconcile the `VDataCreator`/`VdataCreator` workaround in `plugins/gemma/tools/litertlm_backend.py`, guarded by `hasattr` with a comment naming the upstream defect and the version observed (research R8, constitution Additional Constraints)
+- [X] T007 Create the shared usage-policy skill at `plugins/gemma/skills/gemma-usage/SKILL.md` stating the capability boundary (no file access, no shell, no repo awareness, no iteration), the verification duty, the escalation rule, and that fluency is not evidence (FR-007, FR-008, FR-009, FR-010)
+- [X] T008 Establish the runtime-state directory convention in `plugins/gemma/scripts/gemma-client.mjs` — port-keyed path, one file per fact, absent-means-default rules per `contracts/runtime-state.md`
+- [X] T009 Reconcile cross-platform dependency discovery in `plugins/gemma/tools/litertlm_backend.py` — per-platform candidate paths, `LITERT_LM_SITE_PACKAGES` override, and an actionable message naming the install command instead of an `ImportError` trace (FR-032, Principle III)
+- [X] T010 Reconcile the `VDataCreator`/`VdataCreator` workaround in `plugins/gemma/tools/litertlm_backend.py`, guarded by `hasattr` with a comment naming the upstream defect and the version observed (research R8, constitution Additional Constraints)
 
 **Checkpoint**: shared policy exists in exactly one place; both tools locate their dependencies portably.
 
@@ -48,16 +48,16 @@ code MUST NOT be assumed correct — the plan identifies four gaps it does not c
 
 **Independent test**: With the runtime installed and a model imported, invoke the ask command and confirm an answer returns, no hosted-provider call occurs, and the framing is non-authoritative.
 
-- [ ] T011 [US1] Reconcile argument parsing in `plugins/gemma/scripts/gemma-client.mjs` against `contracts/gemma-client-cli.md` — per-invocation `--model`, `--max-tokens`, `--system` overrides plus `--idle-timeout`, and exit code 2 for usage errors vs 1 for runtime failures (FR-004)
-- [ ] T012 [US1] Reconcile stdin handling in `plugins/gemma/scripts/gemma-client.mjs` so positional prompt precedes piped content separated by a blank line (FR-003)
-- [ ] T013 [US1] Reconcile server start-on-demand in `plugins/gemma/scripts/gemma-client.mjs` — probe first, start detached only if absent, bounded startup wait, never double-start on a healthy probe (FR-002)
-- [ ] T014 [US1] Enforce the stdout/stderr split in `plugins/gemma/scripts/gemma-client.mjs` — payload only on stdout; all notices, warnings and diagnostics on stderr
-- [ ] T015 [US1] Implement the model-switch reload warning in `plugins/gemma/scripts/gemma-client.mjs`, emitted before the request with its approximate cost (FR-026)
-- [ ] T016 [US1] Implement `--stop` in `plugins/gemma/scripts/gemma-client.mjs` to terminate both server and watchdog and clear runtime state (FR-005)
-- [ ] T017 [US1] Replace every raw failure path in `plugins/gemma/scripts/gemma-client.mjs` with a message naming the missing prerequisite or diagnostic command (Principle III)
-- [ ] T018 [US1] Create `plugins/gemma/commands/ask.md` sending a prompt and reporting the response (FR-001), delegating the honesty policy to the `gemma-usage` skill by reference and never restating it inline (FR-009)
-- [ ] T019 [US1] Create `plugins/gemma/commands/stop.md` for manual lifecycle control
-- [ ] T020 [US1] Verify Scenario 1 of `quickstart.md` end-to-end and confirm SC-001
+- [X] T011 [US1] Reconcile argument parsing in `plugins/gemma/scripts/gemma-client.mjs` against `contracts/gemma-client-cli.md` — per-invocation `--model`, `--max-tokens`, `--system` overrides plus `--idle-timeout`, and exit code 2 for usage errors vs 1 for runtime failures (FR-004)
+- [X] T012 [US1] Reconcile stdin handling in `plugins/gemma/scripts/gemma-client.mjs` so positional prompt precedes piped content separated by a blank line (FR-003)
+- [X] T013 [US1] Reconcile server start-on-demand in `plugins/gemma/scripts/gemma-client.mjs` — probe first, start detached only if absent, bounded startup wait, never double-start on a healthy probe (FR-002)
+- [X] T014 [US1] Enforce the stdout/stderr split in `plugins/gemma/scripts/gemma-client.mjs` — payload only on stdout; all notices, warnings and diagnostics on stderr
+- [X] T015 [US1] Implement the model-switch reload warning in `plugins/gemma/scripts/gemma-client.mjs`, emitted before the request with its approximate cost (FR-026)
+- [X] T016 [US1] Implement `--stop` in `plugins/gemma/scripts/gemma-client.mjs` to terminate both server and watchdog and clear runtime state (FR-005)
+- [X] T017 [US1] Replace every raw failure path in `plugins/gemma/scripts/gemma-client.mjs` with a message naming the missing prerequisite or diagnostic command (Principle III)
+- [X] T018 [US1] Create `plugins/gemma/commands/ask.md` sending a prompt and reporting the response (FR-001), delegating the honesty policy to the `gemma-usage` skill by reference and never restating it inline (FR-009)
+- [X] T019 [US1] Create `plugins/gemma/commands/stop.md` for manual lifecycle control
+- [X] T020 [US1] Verify Scenario 1 of `quickstart.md` end-to-end and confirm SC-001
 
 **Checkpoint**: US1 is independently shippable. This is the MVP.
 
@@ -92,7 +92,7 @@ code MUST NOT be assumed correct — the plan identifies four gaps it does not c
 
 **Independent test**: On a machine missing a prerequisite, the check identifies the specific gap and its fix.
 
-- [ ] T033 [US3] Reconcile `--check` in `plugins/gemma/scripts/gemma-client.mjs` to report readiness without starting anything
+- [X] T033 [US3] Reconcile `--check` in `plugins/gemma/scripts/gemma-client.mjs` to report readiness without starting anything
 - [ ] T034 [US3] Create `plugins/gemma/commands/setup.md` checking, in order: runtime installed → model imported → no model silently on the slow path → server reachable, reporting the first unmet condition with its corrective action (FR-020)
 - [ ] T035 [US3] Add the confirmation-gated repair flow to `plugins/gemma/commands/setup.md` — report the finding, ask once, invoke `patch --yes` only on explicit consent, and leave the system unchanged and usable if declined (FR-019, SC-013)
 - [ ] T036 [US3] Add accelerator-memory reporting to `plugins/gemma/commands/setup.md`, warning on thin margins and stating that a benchmark pass does not prove usability (FR-021, research R7)
@@ -156,10 +156,10 @@ Ordered after US1 because idle behaviour is unverifiable before invocation works
 - [ ] T054 [US7] Write the `stopping` marker before terminating the server in `plugins/gemma/scripts/idle-watchdog.mjs`, and clear it with `server.pid` after exit
 - [ ] T055 [US7] Implement the single-supervisor rule in `plugins/gemma/scripts/idle-watchdog.mjs` — exit rather than compete with a watchdog already supervising this port
 - [ ] T056 [US7] Implement the stale-activity backstop in `plugins/gemma/scripts/idle-watchdog.mjs` so a crashed client cannot pin accelerator memory indefinitely via a leaked `in-flight` (US7 acceptance scenario 4)
-- [ ] T057 [US7] Add activity accounting to `plugins/gemma/scripts/gemma-client.mjs` — `last-activity` before and after, `in-flight` incremented before and decremented on **every** exit path including error and interrupt (FR-024)
+- [X] T057 [US7] Add activity accounting to `plugins/gemma/scripts/gemma-client.mjs` — `last-activity` before and after, `in-flight` incremented before and decremented on **every** exit path including error and interrupt (FR-024)
 - [ ] T058 [US7] Add the `stopping` interlock to `plugins/gemma/scripts/gemma-client.mjs` — wait for exit and start fresh rather than connecting to a dying server (FR-025)
 - [ ] T059 [US7] Add restart-reason reporting to `plugins/gemma/scripts/gemma-client.mjs` so a watchdog restart is distinguishable from a first-ever start (FR-025)
-- [ ] T060 [US7] Start the watchdog from `plugins/gemma/scripts/gemma-client.mjs` only when starting a server and only if none is supervising
+- [X] T060 [US7] Start the watchdog from `plugins/gemma/scripts/gemma-client.mjs` only when starting a server and only if none is supervising
 - [ ] T061 [US7] Verify Scenario 5 of `quickstart.md` — confirm accelerator memory returns to baseline (SC-012) and, separately, that a generation longer than the idle timeout completes uninterrupted (FR-024)
 - [ ] T062 [US7] Verify Scenario 6 of `quickstart.md` for the model-switch warning (FR-026)
 - [ ] T063 [US7] Verify the disabled case — `--idle-timeout 0` keeps the server running past the period (US7 acceptance scenario 5)
