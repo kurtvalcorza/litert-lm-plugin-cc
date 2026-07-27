@@ -34,10 +34,12 @@ user's existing `litert-lm` installation rather than vendoring them (Principle I
 Plugin-owned state is a single small runtime directory holding the server's last-activity
 timestamp and an in-flight marker. No database.
 
-**Testing**: Scenario-based verification driven by `quickstart.md`, plus a dependency-free
-smoke script. No test framework is introduced — adding one would violate Principle III for a
-project whose entire surface is four scripts and five markdown files. Every mutating operation
-is verified against a real model file before being documented as working (Development Workflow).
+**Testing**: Scenario-based verification driven by `quickstart.md`, with `payload_checksum.py`
+as the one purpose-built instrument — it makes the "payload is byte-identical after a repair"
+assertion checkable rather than argued. No test framework is introduced; adding one would
+violate Principle III for a project whose entire surface is four scripts and six markdown
+files. Every mutating operation is verified against a real model file before being documented
+as working (Development Workflow).
 
 **Target Platform**: Windows 10/11 (PowerShell), WSL2, Linux, macOS.
 
@@ -49,8 +51,9 @@ model size. Repaired model ≥3x faster than the fallback path on a warm server 
 **Constraints**: No network egress except user-initiated model download. No credentials. No
 telemetry. No install step from a clean checkout. Single model resident at a time.
 
-**Scale/Scope**: One user, one machine, one resident model. Five commands, one skill, two
-executable tools, one watchdog.
+**Scale/Scope**: One user, one machine, one resident model. Five commands, one skill, three
+executable tools (`litertlm_backend.py`, `payload_checksum.py`, `gemma-client.mjs`), one
+watchdog.
 
 ## Constitution Check
 

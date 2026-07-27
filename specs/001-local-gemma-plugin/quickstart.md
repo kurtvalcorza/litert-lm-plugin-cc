@@ -16,8 +16,8 @@ criteria. Run them in order — later scenarios assume earlier ones passed.
 
 ```bash
 # In Claude Code
-/plugin marketplace add kurtvalcorza/gemma-plugin-cc
-/plugin install gemma@gemma-local
+/plugin marketplace add kurtvalcorza/litert-lm-plugin-cc
+/plugin install gemma@litert-lm-local
 ```
 
 **Expected**: install succeeds; `/gemma:ask`, `/gemma:review`, `/gemma:setup`, `/gemma:models`,
