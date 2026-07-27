@@ -69,18 +69,18 @@ code MUST NOT be assumed correct — the plan identifies four gaps it does not c
 
 **Independent test**: Diagnose a slow-path model, dry-run, apply in place, confirm the accelerator is reported and responses are measurably faster with correct output.
 
-- [ ] T021 [US2] Reconcile the `resolve` subcommand in `plugins/gemma/tools/litertlm_backend.py` to list every model with its resolved backend and flag `cpu` results (FR-011)
-- [ ] T022 [P] [US2] Reconcile the `show` subcommand in `plugins/gemma/tools/litertlm_backend.py` to dump section metadata with long-value truncation (FR-012)
-- [ ] T023 [US2] Reconcile round-trip validation in `plugins/gemma/tools/litertlm_backend.py` — content-compare unpack/repack and abort without writing if lossy (FR-014)
-- [ ] T024 [US2] Reconcile the bounds check in `plugins/gemma/tools/litertlm_backend.py` against `BLOCK_SIZE - 32`, aborting rather than overrunning into the payload (FR-015)
-- [ ] T025 [US2] Reconcile the `check` dry-run subcommand so it performs all validation and writes nothing (FR-016)
-- [ ] T026 [US2] Reconcile idempotency in `plugins/gemma/tools/litertlm_backend.py` so an already-correct file reports no change and performs no write (FR-017)
-- [ ] T027 [US2] Make reversal first-class in `plugins/gemma/tools/litertlm_backend.py` — `--backend cpu` restores the prior declaration, documented alongside `patch` rather than as a side effect (FR-018)
-- [ ] T028 [US2] Add the `--yes` flag to `patch` in `plugins/gemma/tools/litertlm_backend.py`, required for non-interactive invocation by another command (FR-019, `contracts/litertlm-backend-cli.md`)
-- [ ] T029 [US2] Implement the core write in `plugins/gemma/tools/litertlm_backend.py` — add or correct `backend_constraint` on the main section only, touching no bytes at or beyond the first block boundary, with the header and the `header_end` value at offset 24 both flushed and fsynced before exit (FR-013, `contracts/litertlm-backend-cli.md` §6–§7)
-- [ ] T030 [US2] Create `plugins/gemma/tools/payload_checksum.py` — SHA-256 of a model's payload with the first `BLOCK_SIZE` bytes skipped, expanding `~` itself since PowerShell does not expand it inside quoted arguments; this is the instrument that makes SC-005 and SC-011 checkable rather than asserted
-- [ ] T031 [US2] Verify Scenario 3 of `quickstart.md` on a real model — baseline payload checksum, dry run, patch, re-checksum, re-patch idempotency, reverse, re-checksum — confirming SC-004, SC-005 and SC-011
-- [ ] T032 [US2] Measure and record the repaired-vs-fallback speedup on a warm server to confirm SC-002, stating model, hardware and conditions (constitution Additional Constraints)
+- [X] T021 [US2] Reconcile the `resolve` subcommand in `plugins/gemma/tools/litertlm_backend.py` to list every model with its resolved backend and flag `cpu` results (FR-011)
+- [X] T022 [P] [US2] Reconcile the `show` subcommand in `plugins/gemma/tools/litertlm_backend.py` to dump section metadata with long-value truncation (FR-012)
+- [X] T023 [US2] Reconcile round-trip validation in `plugins/gemma/tools/litertlm_backend.py` — content-compare unpack/repack and abort without writing if lossy (FR-014)
+- [X] T024 [US2] Reconcile the bounds check in `plugins/gemma/tools/litertlm_backend.py` against `BLOCK_SIZE - 32`, aborting rather than overrunning into the payload (FR-015)
+- [X] T025 [US2] Reconcile the `check` dry-run subcommand so it performs all validation and writes nothing (FR-016)
+- [X] T026 [US2] Reconcile idempotency in `plugins/gemma/tools/litertlm_backend.py` so an already-correct file reports no change and performs no write (FR-017)
+- [X] T027 [US2] Make reversal first-class in `plugins/gemma/tools/litertlm_backend.py` — `--backend cpu` restores the prior declaration, documented alongside `patch` rather than as a side effect (FR-018)
+- [X] T028 [US2] Add the `--yes` flag to `patch` in `plugins/gemma/tools/litertlm_backend.py`, required for non-interactive invocation by another command (FR-019, `contracts/litertlm-backend-cli.md`)
+- [X] T029 [US2] Implement the core write in `plugins/gemma/tools/litertlm_backend.py` — add or correct `backend_constraint` on the main section only, touching no bytes at or beyond the first block boundary, with the header and the `header_end` value at offset 24 both flushed and fsynced before exit (FR-013, `contracts/litertlm-backend-cli.md` §6–§7)
+- [X] T030 [US2] Create `plugins/gemma/tools/payload_checksum.py` — SHA-256 of a model's payload with the first `BLOCK_SIZE` bytes skipped, expanding `~` itself since PowerShell does not expand it inside quoted arguments; this is the instrument that makes SC-005 and SC-011 checkable rather than asserted
+- [X] T031 [US2] Verify Scenario 3 of `quickstart.md` on a real model — baseline payload checksum, dry run, patch, re-checksum, re-patch idempotency, reverse, re-checksum — confirming SC-004, SC-005 and SC-011
+- [X] T032 [US2] Measure and record the repaired-vs-fallback speedup on a warm server to confirm SC-002, stating model, hardware and conditions (constitution Additional Constraints)
 
 **Checkpoint**: the CPU-fallback trap is both visible and fixable, safely and reversibly.
 
@@ -93,11 +93,11 @@ code MUST NOT be assumed correct — the plan identifies four gaps it does not c
 **Independent test**: On a machine missing a prerequisite, the check identifies the specific gap and its fix.
 
 - [X] T033 [US3] Reconcile `--check` in `plugins/gemma/scripts/gemma-client.mjs` to report readiness without starting anything
-- [ ] T034 [US3] Create `plugins/gemma/commands/setup.md` checking, in order: runtime installed → model imported → no model silently on the slow path → server reachable, reporting the first unmet condition with its corrective action (FR-020)
-- [ ] T035 [US3] Add the confirmation-gated repair flow to `plugins/gemma/commands/setup.md` — report the finding, ask once, invoke `patch --yes` only on explicit consent, and leave the system unchanged and usable if declined (FR-019, SC-013)
-- [ ] T036 [US3] Add accelerator-memory reporting to `plugins/gemma/commands/setup.md`, warning on thin margins and stating that a benchmark pass does not prove usability (FR-021, research R7)
-- [ ] T037 [US3] Document per-repository model gating in `plugins/gemma/commands/setup.md` — Gemma 3 gated, Gemma 4 not, `litert-community` conversions distinct from vendor repositories — with a command to check rather than assume (FR-022, research R6)
-- [ ] T038 [US3] Verify Scenario 4 of `quickstart.md`, including declining the repair offer and confirming via payload checksum that nothing was written (SC-013)
+- [X] T034 [US3] Create `plugins/gemma/commands/setup.md` checking, in order: runtime installed → model imported → no model silently on the slow path → server reachable, reporting the first unmet condition with its corrective action (FR-020)
+- [X] T035 [US3] Add the confirmation-gated repair flow to `plugins/gemma/commands/setup.md` — report the finding, ask once, invoke `patch --yes` only on explicit consent, and leave the system unchanged and usable if declined (FR-019, SC-013)
+- [X] T036 [US3] Add accelerator-memory reporting to `plugins/gemma/commands/setup.md`, warning on thin margins and stating that a benchmark pass does not prove usability (FR-021, research R7)
+- [X] T037 [US3] Document per-repository model gating in `plugins/gemma/commands/setup.md` — Gemma 3 gated, Gemma 4 not, `litert-community` conversions distinct from vendor repositories — with a command to check rather than assume (FR-022, research R6)
+- [X] T038 [US3] Verify Scenario 4 of `quickstart.md`, including declining the repair offer and confirming via payload checksum that nothing was written (SC-013)
 
 **Checkpoint**: a first-time user can reach a working answer from the readiness command alone.
 
@@ -109,11 +109,11 @@ code MUST NOT be assumed correct — the plan identifies four gaps it does not c
 
 **Independent test**: With two models differing in configured path, one command reports both sizes and both paths.
 
-- [ ] T039 [US4] Create `plugins/gemma/commands/models.md` pairing `litert-lm list` with `litertlm_backend.py resolve` and explaining why the second is the one that matters
-- [ ] T040 [US4] Document single-model residency and reload cost in `plugins/gemma/commands/models.md`, warning against interleaving models in a loop (data-model.md, Serving Process invariant)
-- [ ] T041 [US4] Document the disk-cost multiplier in `plugins/gemma/commands/models.md` — per-backend compiled caches roughly double on-disk size — and that `litert-lm delete` removes model and caches together
-- [ ] T042 [US4] Point `cpu`-resolving models at the repair procedure from `plugins/gemma/commands/models.md`
-- [ ] T043 [US4] Verify Scenario 2 of `quickstart.md` and confirm SC-003
+- [X] T039 [US4] Create `plugins/gemma/commands/models.md` pairing `litert-lm list` with `litertlm_backend.py resolve` and explaining why the second is the one that matters
+- [X] T040 [US4] Document single-model residency and reload cost in `plugins/gemma/commands/models.md`, warning against interleaving models in a loop (data-model.md, Serving Process invariant)
+- [X] T041 [US4] Document the disk-cost multiplier in `plugins/gemma/commands/models.md` — per-backend compiled caches roughly double on-disk size — and that `litert-lm delete` removes model and caches together
+- [X] T042 [US4] Point `cpu`-resolving models at the repair procedure from `plugins/gemma/commands/models.md`
+- [X] T043 [US4] Verify Scenario 2 of `quickstart.md` and confirm SC-003
 
 ---
 
@@ -123,11 +123,11 @@ code MUST NOT be assumed correct — the plan identifies four gaps it does not c
 
 **Independent test**: From a machine with no prior knowledge, follow only the README to register the source and install.
 
-- [ ] T044 [US6] Write `README.md` with the unofficial, unaffiliated disclaimer **above the fold**, before any instruction to run something (FR-028, SC-008)
-- [ ] T045 [US6] Document install and update in `README.md` — `/plugin marketplace add kurtvalcorza/litert-lm-plugin-cc` then `/plugin install gemma@litert-lm-local` — noting that `/plugin` needs an interactive terminal session
-- [ ] T046 [US6] Document prerequisites and the honest capability boundary in `README.md`, including what the plugin deliberately does not do and why (FR-034)
-- [ ] T047 [US6] Document the measured performance figures in `README.md` with model, hardware and conditions stated, and never presenting a cold-start figure as steady-state (constitution Additional Constraints)
-- [ ] T048 [US6] Verify Scenario 0 of `quickstart.md` on a clean install and confirm SC-008 by reading order
+- [X] T044 [US6] Write `README.md` with the unofficial, unaffiliated disclaimer **above the fold**, before any instruction to run something (FR-028, SC-008)
+- [X] T045 [US6] Document install and update in `README.md` — `/plugin marketplace add kurtvalcorza/litert-lm-plugin-cc` then `/plugin install gemma@litert-lm-local` — noting that `/plugin` needs an interactive terminal session
+- [X] T046 [US6] Document prerequisites and the honest capability boundary in `README.md`, including what the plugin deliberately does not do and why (FR-034)
+- [X] T047 [US6] Document the measured performance figures in `README.md` with model, hardware and conditions stated, and never presenting a cold-start figure as steady-state (constitution Additional Constraints)
+- [X] T048 [US6] Verify Scenario 0 of `quickstart.md` on a clean install and confirm SC-008 by reading order
 
 ---
 
@@ -137,10 +137,10 @@ code MUST NOT be assumed correct — the plan identifies four gaps it does not c
 
 **Independent test**: On a diff with one real defect and one merely suspicious passage, the assistant verifies each observation and names those that did not hold up.
 
-- [ ] T049 [US5] Create `plugins/gemma/commands/review.md` piping `git diff` into the client with a reviewer system instruction (FR-007)
-- [ ] T050 [US5] Add the screening protocol to `plugins/gemma/commands/review.md` — verify each observation against the actual code, report survivors, state plainly which failed, name the two expected failure modes (false positives, plausible filler)
-- [ ] T051 [US5] Handle the empty-diff case in `plugins/gemma/commands/review.md` so it reports nothing to review rather than inviting invented findings
-- [ ] T052 [US5] Verify Scenario 7 of `quickstart.md`, confirming an uncritical relay is treated as a failure of the scenario
+- [X] T049 [US5] Create `plugins/gemma/commands/review.md` piping `git diff` into the client with a reviewer system instruction (FR-007)
+- [X] T050 [US5] Add the screening protocol to `plugins/gemma/commands/review.md` — verify each observation against the actual code, report survivors, state plainly which failed, name the two expected failure modes (false positives, plausible filler)
+- [X] T051 [US5] Handle the empty-diff case in `plugins/gemma/commands/review.md` so it reports nothing to review rather than inviting invented findings
+- [X] T052 [US5] Verify Scenario 7 of `quickstart.md`, confirming an uncritical relay is treated as a failure of the scenario
 
 ---
 
@@ -170,7 +170,7 @@ Ordered after US1 because idle behaviour is unverifiable before invocation works
 
 ## Phase 10: Polish & Cross-Cutting
 
-- [ ] T064 [P] Audit all five command files for Principle I compliance — every output-relaying command references the shared skill; none restates the policy inline (SC-007, FR-009)
+- [X] T064 [P] Audit all five command files for Principle I compliance — every output-relaying command references the shared skill; none restates the policy inline (SC-007, FR-009)
 - [ ] T065 [P] Audit both tools for hardcoded absolute paths or platform-specific separators (FR-031)
 - [ ] T066 Verify Scenario 8 of `quickstart.md` on both Windows and a Unix-family environment, confirming SC-009 and SC-010
 - [ ] T067 Verify `LITERT_LM_SITE_PACKAGES` override works and that an absent runtime yields an actionable message rather than `ImportError` (FR-032)

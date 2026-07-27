@@ -31,12 +31,27 @@ USAGE
 -----
     litertlm_backend.py resolve [MODEL_DIR]        # what backend each model resolves to
     litertlm_backend.py show    <model.litertlm>   # dump section metadata
-    litertlm_backend.py check   <model.litertlm>   # dry-run the patch
-    litertlm_backend.py patch   <model.litertlm> [--backend gpu]
+    litertlm_backend.py check   <model.litertlm>   # dry-run the patch, writes nothing
+    litertlm_backend.py patch   <model.litertlm> [--backend gpu] [--yes]
 
-Patch a COPY unless you are confident:
+REVERSING
+---------
+Repair is applied in place and is reversible: re-run `patch` with the previous
+backend. This is a supported operation, not a trick.
+
+    litertlm_backend.py patch <model.litertlm> --backend gpu --yes    # repair
+    litertlm_backend.py patch <model.litertlm> --backend cpu --yes    # undo it
+
+Re-importing the model is the external fallback. Operating on a copy remains
+possible but is not required, because the write is bounded and validated:
+
     cp -r ~/.litert-lm/models/gemma4-e4b ~/.litert-lm/models/gemma4-e4b-gpu
-    litertlm_backend.py patch ~/.litert-lm/models/gemma4-e4b-gpu/model.litertlm
+
+CONSENT
+-------
+`patch` writes only after explicit consent. On a terminal it prompts; run
+non-interactively it refuses unless `--yes` is passed, which asserts that the
+caller already obtained consent in the same invocation.
 """
 
 from __future__ import annotations
@@ -251,6 +266,33 @@ def cmd_patch(args):
         print("Already correct; no write performed.")
         return
 
+    # Consent gate (FR-019). Another command driving this tool must assert that it
+    # already obtained consent, in the same invocation, by passing --yes. Without a
+    # terminal to prompt at and without --yes, refuse rather than write silently.
+    if not args.yes:
+        refusal = (
+            "ABORT: refusing to modify a model file without consent.\n"
+            "  Re-run with --yes once the user has agreed to this specific change,\n"
+            "  or run `check` instead to see what would happen without writing."
+        )
+        if not sys.stdin.isatty():
+            raise SystemExit(refusal)
+
+        prior = "cpu" if args.backend != "cpu" else "gpu"
+        print(f"\nAbout to rewrite the header of:\n  {args.model}")
+        print("Only the first 16 KB is written; the payload is not touched.")
+        print(f"Reversible with:  litertlm_backend.py patch <model> --backend {prior} --yes")
+        try:
+            answer = input("Proceed? [y/N] ")
+        except (EOFError, KeyboardInterrupt):
+            # isatty() can report a terminal that cannot actually be read from — a
+            # piped or redirected stdin under some shells. Treat it as a decline
+            # rather than letting a traceback reach the user.
+            print()
+            raise SystemExit(refusal)
+        if answer.strip().lower() not in ("y", "yes"):
+            raise SystemExit("Declined; nothing was written.")
+
     with open(args.model, "r+b") as f:
         f.seek(CORE.HEADER_BEGIN_BYTE_OFFSET)
         f.write(new)
@@ -262,8 +304,11 @@ def cmd_patch(args):
         f.flush()
         os.fsync(f.fileno())
 
+    reverse_to = "cpu" if args.backend != "cpu" else "gpu"
     print(f"header rewritten: end {header_end} -> {new_end}")
-    print("Verify with:  litertlm_backend.py resolve")
+    print(f"verify:   litertlm_backend.py resolve")
+    print(f"reverse:  litertlm_backend.py patch {args.model} --backend {reverse_to} --yes")
+    print("payload:  unchanged — confirm with payload_checksum.py")
 
 
 def main():
@@ -283,9 +328,17 @@ def main():
     p.add_argument("--backend", default="gpu", choices=["cpu", "gpu", "npu"])
     p.set_defaults(func=cmd_check)
 
-    p = sub.add_parser("patch", help="rewrite the header in place")
+    p = sub.add_parser(
+        "patch",
+        help="rewrite the header in place (reversible: re-run with the previous --backend)",
+    )
     p.add_argument("model")
-    p.add_argument("--backend", default="gpu", choices=["cpu", "gpu", "npu"])
+    p.add_argument("--backend", default="gpu", choices=["cpu", "gpu", "npu"],
+                   help="backend to declare. Passing the previous value reverses an earlier "
+                        "patch; reversal is a first-class operation, not a side effect.")
+    p.add_argument("--yes", action="store_true",
+                   help="confirm the write. Required when running non-interactively; a caller "
+                        "passing this asserts the user consented in the same invocation.")
     p.set_defaults(func=cmd_patch)
 
     args = ap.parse_args()
