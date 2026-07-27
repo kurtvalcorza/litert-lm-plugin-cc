@@ -1,0 +1,12 @@
+{
+  "name": "gemma",
+  "version": "0.1.0",
+  "description": "Call a local on-device model served by LiteRT-LM from Claude Code — offline, no API tokens. Unofficial.",
+  "author": {
+    "name": "Kurt Valcorza",
+    "url": "https://github.com/kurtvalcorza"
+  },
+  "homepage": "https://github.com/kurtvalcorza/litert-lm-plugin-cc",
+  "license": "Apache-2.0",
+  "keywords": ["gemma", "litert-lm", "local-llm", "on-device", "offline", "google-ai-edge"]
+}

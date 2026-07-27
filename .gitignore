@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Plugin runtime state (created at run time, never committed)
+.litert-lm-runtime/
+
+# Local editor/agent scratch
+.agents/

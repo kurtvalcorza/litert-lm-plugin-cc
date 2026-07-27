@@ -1,0 +1,20 @@
+# Normalise to LF in the repository. Scripts here are executed on Linux, macOS and
+# WSL as well as Windows; a CRLF shebang line breaks a script on every one of them.
+* text=auto eol=lf
+
+# Executables and data formats that must stay LF regardless of platform
+*.mjs   text eol=lf
+*.js    text eol=lf
+*.py    text eol=lf
+*.sh    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+
+# PowerShell is Windows-first; CRLF is correct and harmless there
+*.ps1   text eol=crlf
+
+# Never touch binaries
+*.png   binary
+*.litertlm binary
