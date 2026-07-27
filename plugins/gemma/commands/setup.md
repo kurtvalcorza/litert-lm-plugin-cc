@@ -99,8 +99,13 @@ change. If they decline, write nothing and say the system still works, just on t
 declining must not leave things half-configured.
 
 Reassure accurately: only the first 16 KB of the file is rewritten, the multi-gigabyte payload
-is untouched and verifiable with `payload_checksum.py`, and the change reverses with
-`--backend cpu --yes`.
+is untouched, and the change reverses with `--backend cpu --yes`.
+
+The payload claim is checkable, not just a claim — hash before and after and compare:
+
+```bash
+python "${CLAUDE_PLUGIN_ROOT}/tools/payload_checksum.py" <path-to-model.litertlm>
+```
 
 ## 4. Server reachable
 

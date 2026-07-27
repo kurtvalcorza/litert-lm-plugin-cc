@@ -127,7 +127,8 @@ code MUST NOT be assumed correct — the plan identifies four gaps it does not c
 - [X] T045 [US6] Document install and update in `README.md` — `/plugin marketplace add kurtvalcorza/litert-lm-plugin-cc` then `/plugin install gemma@litert-lm-local` — noting that `/plugin` needs an interactive terminal session
 - [X] T046 [US6] Document prerequisites and the honest capability boundary in `README.md`, including what the plugin deliberately does not do and why (FR-034)
 - [X] T047 [US6] Document the measured performance figures in `README.md` with model, hardware and conditions stated, and never presenting a cold-start figure as steady-state (constitution Additional Constraints)
-- [X] T048 [US6] Verify Scenario 0 of `quickstart.md` on a clean install and confirm SC-008 by reading order
+- [X] T048 [US6] Confirm SC-008 by reading order — disclaimer precedes any runnable instruction (verified: README line 3 vs line 53)
+- [ ] T073 [US6] **Verify Scenario 0 as an actually-installed plugin** — `/plugin marketplace add` then `/plugin install gemma@litert-lm-local`, confirm the five `/gemma:*` commands appear and one runs end-to-end. **BLOCKED: `/plugin` is an interactive dialog and is unavailable in a non-interactive session.** Open questions this closes: (a) whether `marketplace add` works against a **private** repo or requires it be public, (b) whether `${CLAUDE_PLUGIN_ROOT}` expands as assumed at runtime, (c) whether the three extra `plugin.json` keys (`homepage`, `license`, `keywords`) are accepted. Structural pre-checks all pass: manifests carry the same required keys as the known-working `openai/codex-plugin-cc`, every `${CLAUDE_PLUGIN_ROOT}` path resolves, and all frontmatter is valid.
 
 ---
 
