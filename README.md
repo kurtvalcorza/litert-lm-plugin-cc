@@ -76,6 +76,18 @@ Then:
 | `/gemma:review` | Offline second-opinion pass over your diff |
 | `/gemma:stop` | Stop the server, release accelerator memory now |
 
+## Skills
+
+Four skills ship with the plugin. Commands load them by reference, so the guidance lives in one
+place and cannot drift.
+
+| Skill | Load it when |
+|---|---|
+| [`gemma-usage`](plugins/gemma/skills/gemma-usage/SKILL.md) | Reporting anything the model produced — the honesty policy |
+| [`gemma-prompting`](plugins/gemma/skills/gemma-prompting/SKILL.md) | Composing a prompt — a 4B model needs a different shape |
+| [`litert-lm-troubleshooting`](plugins/gemma/skills/litert-lm-troubleshooting/SKILL.md) | Something is wrong — failure catalogue by symptom |
+| [`litertlm-format`](plugins/gemma/skills/litertlm-format/SKILL.md) | Debugging or extending the repair tool — container internals |
+
 ## What this is honest about
 
 The model is **an endpoint, not an agent**. It has no file access, no shell, no repository

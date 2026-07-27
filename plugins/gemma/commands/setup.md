@@ -138,3 +138,8 @@ Reference case: Gemma 4 12B benchmarks fine on a 12 GB card and cannot be served
 
 Summarise the state and name **one** next action. If everything passes, say so and mention that
 the server stops itself when idle, so nothing needs cleaning up.
+
+If a check fails in a way not covered above, load the `litert-lm-troubleshooting` skill — it
+catalogues the known failures by symptom, including the ones that look like something else
+(a model that benchmarks fine but cannot be served, a 401 that is really per-repository
+gating, a crash that leaves lying state behind).

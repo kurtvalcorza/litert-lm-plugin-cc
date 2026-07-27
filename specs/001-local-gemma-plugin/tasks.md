@@ -183,6 +183,19 @@ Ordered after US1 because idle behaviour is unverifiable before invocation works
 
 ---
 
+## Addendum: additional skills (post-implementation, user-requested)
+
+Three skills added after the feature was complete. FR-009 mandates a single shared usage
+policy; these are additive and do not change it. Each is referenced from a command so it is
+discoverable — a skill nothing points at is dead weight.
+
+- [X] T074 Create `plugins/gemma/skills/gemma-prompting/SKILL.md` — how to prompt a ~4B model (one task per call, explicit output shape, no reasoning chains, closed over open questions); referenced from `ask.md` before prompt composition
+- [X] T075 Create `plugins/gemma/skills/litertlm-format/SKILL.md` — container reference: offsets, `BLOCK_SIZE` alignment, section types, the backend-resolution rules, the object-API rewrite pattern and its four mandatory pre-write checks
+- [X] T076 Create `plugins/gemma/skills/litert-lm-troubleshooting/SKILL.md` — failure catalogue organised by symptom (TDR bugcheck, silent CPU fallback, benchmark-passes-but-serve-fails, per-repo gating, missing `uv`, retained VRAM, disk multiplier); referenced from `ask.md` and `setup.md`
+- [X] T077 Verify all four skills: frontmatter valid, `name` matches directory, cross-references resolve, `${CLAUDE_PLUGIN_ROOT}` paths exist; list them in `README.md`
+
+---
+
 ## Dependencies
 
 ```
