@@ -147,21 +147,42 @@ def read_header(path):
 
 
 def summarize(buf):
-    """Reduce a header flatbuffer to a comparable plain-Python structure."""
+    """Reduce a header flatbuffer to a comparable plain-Python structure.
+
+    This is the comparison the round-trip guard rests on, so it must cover
+    EVERYTHING the header carries. An earlier version compared only the section
+    table; SystemMetadata (author, uuid, creation_timestamp) was outside the
+    comparison, which meant a schema change that silently dropped it would still
+    have reported "content identical: True" and the tool would have written.
+    """
     meta = SCHEMA.LiteRTLMMetaData.GetRootAs(buf, 0)
+
     sections = []
     sm = meta.SectionMetadata()
-    for i in range(sm.ObjectsLength()):
-        sec = sm.Objects(i)
-        items = []
-        for j in range(sec.ItemsLength()):
-            it = sec.Items(j)
-            if it is None:
+    if sm:
+        for i in range(sm.ObjectsLength()):
+            sec = sm.Objects(i)
+            items = []
+            for j in range(sec.ItemsLength()):
+                it = sec.Items(j)
+                if it is None:
+                    continue
+                d = PEEK.kvp_to_dict(it)
+                items.append((d.get("key"), d.get("value"), d.get("value_type")))
+            sections.append(
+                (sec.BeginOffset(), sec.EndOffset(), sec.DataType(), tuple(items)))
+
+    system = []
+    sysmd = meta.SystemMetadata()
+    if sysmd:
+        for i in range(sysmd.EntriesLength()):
+            e = sysmd.Entries(i)
+            if e is None:
                 continue
-            d = PEEK.kvp_to_dict(it)
-            items.append((d.get("key"), d.get("value"), d.get("value_type")))
-        sections.append((sec.BeginOffset(), sec.EndOffset(), sec.DataType(), tuple(items)))
-    return tuple(sections)
+            d = PEEK.kvp_to_dict(e)
+            system.append((d.get("key"), d.get("value"), d.get("value_type")))
+
+    return (tuple(sections), tuple(system))
 
 
 def _text(v):

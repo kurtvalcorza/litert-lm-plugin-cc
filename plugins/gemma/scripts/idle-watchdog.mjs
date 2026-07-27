@@ -14,7 +14,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -74,6 +74,30 @@ function clearState(name) {
 function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+/**
+ * Count live in-flight requests by marker file (see gemma-client.mjs).
+ *
+ * Each marker is named `<pid>-<timestamp>`, so a marker whose owner has died is
+ * stale by definition — no timeout heuristic needed. Stale markers are removed
+ * here, which is what stops a crashed client pinning accelerator memory forever.
+ */
+function countInFlight() {
+  const dir = join(stateDir(opts.port), 'in-flight.d');
+  let entries;
+  try { entries = readdirSync(dir); } catch { return 0; }
+
+  let live = 0;
+  for (const name of entries) {
+    const pid = Number.parseInt(name.split('-')[0], 10);
+    if (pidAlive(pid)) {
+      live += 1;
+    } else {
+      try { rmSync(join(dir, name), { force: true }); } catch { /* ignore */ }
+    }
+  }
+  return live;
 }
 
 async function serverReachable() {
@@ -143,7 +167,7 @@ async function main() {
     }
     missedProbes = 0;
 
-    const inFlight = Number.parseInt(readState('in-flight', '0'), 10) || 0;
+    const inFlight = countInFlight();
     const lastActivity = Number.parseInt(readState('last-activity', String(Date.now())), 10)
       || Date.now();
     const idleFor = Date.now() - lastActivity;
@@ -165,7 +189,10 @@ async function main() {
     }
 
     clearState('server.pid');
-    clearState('in-flight');
+    try {
+      rmSync(join(stateDir(opts.port), 'in-flight.d'), { recursive: true, force: true });
+    } catch { /* ignore */ }
+    clearState('in-flight');   // legacy counter from older installs
     clearState('loaded-model');
 
     // Leave a durable breadcrumb. `stopping` is cleared on the way out, so by the

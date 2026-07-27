@@ -13,13 +13,26 @@ different ports never share state.
 | File | Format | Writer | Reader |
 |---|---|---|---|
 | `server.pid` | integer | client, after successful start | watchdog |
+| `watchdog.pid` | integer | watchdog, on adoption | client |
 | `last-activity` | epoch ms | client, before and after each request | watchdog |
-| `in-flight` | integer | client, increment before / decrement after | watchdog |
+| `in-flight.d/<pid>-<ts>` | **directory of marker files** | client, one per request | watchdog |
 | `stopping` | empty; presence is the signal | watchdog, before terminating | client |
+| `stopped-idle` | epoch ms | watchdog, before exiting | client (consumes) |
+| `loaded-model` | model id | client, after a successful request | client |
 
 **Why files, not one document**: single-fact files make every read and write atomic enough
-without a lock. Two clients incrementing `in-flight` concurrently is the only contended case,
-and it is handled by the ceiling rule below rather than by locking.
+without a lock.
+
+**Why in-flight is a directory, not a counter** *(revised during code review)*: an integer
+requires read-modify-write, and two concurrent clients can interleave — both read 0, both
+write 1 — after which one decrement drops it to 0 while a request is still running, freeing
+the watchdog to kill the server mid-generation. Creating and unlinking one uniquely-named file
+per request is atomic at the filesystem level, so no update can be lost.
+
+The marker name carries the **owning pid**, which also makes crash recovery exact rather than
+heuristic: a marker whose process no longer exists is stale by definition. The watchdog removes
+such markers as it counts, so a crashed client cannot pin accelerator memory — no timeout
+guesswork required.
 
 ## Default values
 
@@ -72,11 +85,15 @@ every POLL_INTERVAL:
 
 ## Backstop
 
-A crashed client can leave `in-flight` permanently above zero, defeating idle shutdown — the one
-failure mode that silently retains accelerator memory. Backstop: if `now - last-activity`
-exceeds a hard ceiling well beyond the idle timeout, the watchdog proceeds regardless of
-`in-flight`. No legitimate request outlives the ceiling, and the alternative is memory pinned
-until reboot.
+Stale markers are handled precisely — a marker whose pid is dead is removed as the watchdog
+counts — so a crashed client no longer pins accelerator memory, and the correctness of idle
+shutdown does not depend on a timeout.
+
+The time-based ceiling is retained as a second line of defence for the residual case where a
+pid is *reused* by an unrelated process, making a stale marker look live. If
+`now - last-activity` exceeds a hard ceiling well beyond the idle timeout, the watchdog
+proceeds regardless. No legitimate request outlives the ceiling, and the alternative failure —
+memory pinned until reboot — is worse than an early shutdown.
 
 ## Non-guarantees
 

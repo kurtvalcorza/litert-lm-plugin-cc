@@ -21,7 +21,38 @@ import hashlib
 import os
 import sys
 
-BLOCK_SIZE = 16384  # litertlm section alignment; header lives below this
+def _block_size():
+    """Read BLOCK_SIZE from the runtime rather than hardcoding it.
+
+    A wrong value here would silently hash the wrong byte range and make the
+    "payload unchanged" comparison meaningless — the failure would look like a
+    pass. Fall back to the observed 16384 only if the runtime is unavailable,
+    since this tool must still work without it.
+    """
+    try:
+        import glob  # noqa: PLC0415
+        import os as _os  # noqa: PLC0415
+        import sys as _sys  # noqa: PLC0415
+
+        home = _os.path.expanduser("~")
+        cands = [_os.environ.get("LITERT_LM_SITE_PACKAGES")]
+        appdata = _os.environ.get("APPDATA")
+        if appdata:
+            cands.append(_os.path.join(appdata, "uv", "tools", "litert-lm",
+                                       "Lib", "site-packages"))
+        cands += glob.glob(_os.path.join(home, ".local", "share", "uv", "tools",
+                                         "litert-lm", "lib", "python*", "site-packages"))
+        for c in filter(None, cands):
+            if _os.path.isdir(_os.path.join(c, "litert_lm_builder")):
+                _sys.path.insert(0, c)
+                break
+        from litert_lm_builder import litertlm_core  # noqa: PLC0415
+        return int(litertlm_core.BLOCK_SIZE)
+    except Exception:  # noqa: BLE001
+        return 16384
+
+
+BLOCK_SIZE = _block_size()
 CHUNK = 1 << 20
 
 

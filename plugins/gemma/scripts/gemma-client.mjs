@@ -73,9 +73,42 @@ function clearState(port, name) {
   try { rmSync(statePath(port, name), { force: true }); } catch { /* ignore */ }
 }
 
-function bumpInFlight(port, delta) {
-  const current = Number.parseInt(readState(port, 'in-flight', '0'), 10) || 0;
-  writeState(port, 'in-flight', Math.max(0, current + delta));
+/**
+ * In-flight tracking by marker file, not by counter.
+ *
+ * A single `in-flight` integer requires read-modify-write, which two concurrent
+ * clients can interleave: both read 0, both write 1, and one decrement then drops
+ * it to 0 while a request is still running — at which point the watchdog is free
+ * to kill the server mid-generation. Creating and unlinking one uniquely-named
+ * file per request is atomic at the filesystem level, so no update can be lost.
+ *
+ * The name carries the owning pid, which also makes crash recovery exact: a
+ * marker whose process is gone is stale by definition, no timeout guesswork.
+ */
+const IN_FLIGHT_DIR = 'in-flight.d';
+
+function acquireInFlight(port) {
+  const dir = join(stateDir(port), IN_FLIGHT_DIR);
+  const marker = join(dir, `${process.pid}-${Date.now()}`);
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(marker, '', 'utf8');
+    return marker;
+  } catch {
+    return null;   // tracking is best-effort; never fail a request over it
+  }
+}
+
+function releaseInFlight(marker) {
+  if (!marker) return;
+  try { rmSync(marker, { force: true }); } catch { /* ignore */ }
+}
+
+/** Drop every marker — used when the server is gone, so nothing can be in flight. */
+function clearInFlight(port) {
+  try {
+    rmSync(join(stateDir(port), IN_FLIGHT_DIR), { recursive: true, force: true });
+  } catch { /* ignore */ }
 }
 
 const touchActivity = (port) => writeState(port, 'last-activity', Date.now());
@@ -106,7 +139,8 @@ function reconcileState(port, serverUp) {
   if (livePid(port, 'server.pid') === null) clearState(port, 'server.pid');
   if (!serverUp) {
     // No server means nothing can legitimately be in flight against it.
-    clearState(port, 'in-flight');
+    clearInFlight(port);
+    clearState(port, 'in-flight');          // legacy counter from older installs
     clearState(port, 'stopping');
     clearState(port, 'loaded-model');
   }
@@ -277,7 +311,7 @@ async function ensureServer(opts) {
   }
 
   if (child.pid) writeState(opts.port, 'server.pid', child.pid);
-  clearState(opts.port, 'in-flight');
+  clearInFlight(opts.port);
   touchActivity(opts.port);
 
   const deadline = Date.now() + opts.startupTimeoutMs;
@@ -350,6 +384,7 @@ async function stopProcesses(opts) {
     }
   }
 
+  clearInFlight(port);
   for (const f of ['server.pid', 'watchdog.pid', 'in-flight', 'last-activity',
     'stopping', 'loaded-model', 'stopped-idle']) clearState(port, f);
 
@@ -486,19 +521,19 @@ async function main() {
 
   // Activity accounting (T057). in-flight MUST fall on every exit path, or a crashed
   // client pins the server alive forever.
+  touchActivity(opts.port);
+  const marker = acquireInFlight(opts.port);
+
   let released = false;
   const release = () => {
     if (released) return;
     released = true;
-    bumpInFlight(opts.port, -1);
+    releaseInFlight(marker);
     touchActivity(opts.port);
   };
   const onSignal = () => { release(); process.exit(130); };
   process.on('SIGINT', onSignal);
   process.on('SIGTERM', onSignal);
-
-  touchActivity(opts.port);
-  bumpInFlight(opts.port, +1);
 
   let resp;
   try {
