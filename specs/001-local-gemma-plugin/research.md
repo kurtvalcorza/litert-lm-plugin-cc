@@ -245,6 +245,29 @@ not file existence, and MUST reset counters when the server is unreachable. Impl
 
 ---
 
+## R10. First-run journey gap found by verification
+
+**Decision**: Never name a tool in remediation guidance without first checking it exists.
+
+**Rationale**: T072 ran the readiness guidance in a genuinely prerequisite-free environment (a
+WSL distro with no `litert-lm`). Step 1 said "run `uv tool install litert-lm`" — but `uv` was
+**not installed there either**, so the instruction was a dead end for exactly the audience it
+was written for. Everything downstream was fine: both tools ran, produced actionable messages,
+and emitted zero tracebacks.
+
+Remediated by checking for `uv` first, offering both its installer and a `pip install
+litert-lm` route that needs nothing extra, and adding the `PATH` note for the case where the
+install succeeds but the command still is not found.
+
+**Verification limit, stated honestly**: this was a *bounded* run. It confirmed each named
+command exists and each tool degrades gracefully without the runtime, but it did not carry
+through to a working first answer, which would require a multi-gigabyte model download in an
+environment whose GPU access is paravirtualised and unlikely to serve well. SC-006 is
+therefore verified for the guidance path, not for a full bare-metal cold start. A genuine
+first-run on fresh hardware remains the stronger test.
+
+---
+
 ## R8. Known upstream defect affecting the metadata tool
 
 **Decision**: Alias the symbol at import time and comment why.

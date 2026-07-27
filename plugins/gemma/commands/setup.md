@@ -11,9 +11,42 @@ Verify the stack end to end, report the **first** unmet condition with its fix, 
 litert-lm --version
 ```
 
-Missing → `uv tool install litert-lm`. There is **no Windows or Linux binary in GitHub
-Releases** (only macOS arm64 and Apple `.xcframework`), so PyPI/uv is the channel. Building
-from source needs Bazel and is unnecessary.
+Missing → install it. There is **no Windows or Linux binary in GitHub Releases** (only macOS
+arm64 and Apple `.xcframework`), so PyPI is the channel. Building from source needs Bazel and
+is unnecessary.
+
+`uv` is the recommended installer, but **do not assume it is present** — on a clean machine it
+usually is not, and telling the user to run `uv` when they have no `uv` is a dead end. Check:
+
+```bash
+uv --version
+```
+
+If `uv` is missing, either install it:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh          # Linux / macOS / WSL
+```
+
+```powershell
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"   # Windows
+```
+
+…or skip it entirely — plain pip works and needs nothing extra:
+
+```bash
+pip install litert-lm
+```
+
+Then install the runtime:
+
+```bash
+uv tool install litert-lm
+```
+
+Re-run `litert-lm --version` to confirm before moving on. If the command is still not found
+after a successful install, the install directory is not on `PATH` — on Linux/macOS that is
+usually `~/.local/bin`.
 
 ## 2. A model imported
 

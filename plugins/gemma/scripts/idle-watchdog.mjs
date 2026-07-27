@@ -167,6 +167,13 @@ async function main() {
     clearState('server.pid');
     clearState('in-flight');
     clearState('loaded-model');
+
+    // Leave a durable breadcrumb. `stopping` is cleared on the way out, so by the
+    // time the next client runs there would otherwise be nothing left to
+    // distinguish "we shut this down to free memory" from "never started". The
+    // client consumes and clears this to explain why its request is slow (FR-025).
+    writeState('stopped-idle', Date.now());
+
     cleanupAndExit(0);
   }
 }

@@ -239,10 +239,22 @@ async function ensureServer(opts) {
     return { models: existing, started: false };
   }
 
-  process.stderr.write(wasStopping
-    ? '[gemma] the server had been stopped to free memory after idle; restarting it, so this '
-      + 'request is slower than usual.\n'
-    : `[gemma] starting litert-lm server on ${baseUrl(opts)} ...\n`);
+  // Distinguish a restart-after-idle from a first-ever start (FR-025). The watchdog
+  // leaves `stopped-idle` behind precisely so this is answerable; consume it here.
+  const stoppedIdleAt = Number.parseInt(readState(opts.port, 'stopped-idle', ''), 10);
+  clearState(opts.port, 'stopped-idle');
+
+  if (wasStopping || Number.isInteger(stoppedIdleAt)) {
+    const agoS = Number.isInteger(stoppedIdleAt)
+      ? Math.max(1, Math.round((Date.now() - stoppedIdleAt) / 1000))
+      : null;
+    process.stderr.write(
+      '[gemma] the server had been stopped to free accelerator memory after going idle'
+      + `${agoS === null ? '' : ` (${agoS}s ago)`}; restarting it, so this request pays engine `
+      + 'initialisation and is slower than usual. Later calls will be fast.\n');
+  } else {
+    process.stderr.write(`[gemma] starting litert-lm server on ${baseUrl(opts)} ...\n`);
+  }
 
   const exe = resolveLitertLm();
   if (!exe) {
@@ -339,7 +351,7 @@ async function stopProcesses(opts) {
   }
 
   for (const f of ['server.pid', 'watchdog.pid', 'in-flight', 'last-activity',
-    'stopping', 'loaded-model']) clearState(port, f);
+    'stopping', 'loaded-model', 'stopped-idle']) clearState(port, f);
 
   return !(await probe(opts, 1000));
 }

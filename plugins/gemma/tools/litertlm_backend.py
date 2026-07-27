@@ -92,6 +92,15 @@ def load_litertlm_modules():
     """Import the CLI's bundled model/peek/core modules from wherever they live."""
     override = os.environ.get("LITERT_LM_SITE_PACKAGES")
     if override:
+        # An explicit override that does not work is a mistake worth surfacing.
+        # Silently falling back to auto-discovery would hide it and produce results
+        # from a different installation than the one the user named.
+        if not os.path.isdir(os.path.join(override, "litert_lm_cli")):
+            raise SystemExit(
+                f"LITERT_LM_SITE_PACKAGES is set to:\n  {override}\n"
+                "but no 'litert_lm_cli' package exists there.\n"
+                "  Fix the path, or unset the variable to fall back to auto-discovery."
+            )
         sys.path.insert(0, override)
     try:
         from litert_lm_cli import model as m  # noqa: PLC0415

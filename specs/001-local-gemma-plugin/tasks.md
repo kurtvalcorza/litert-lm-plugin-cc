@@ -152,17 +152,17 @@ code MUST NOT be assumed correct — the plan identifies four gaps it does not c
 
 Ordered after US1 because idle behaviour is unverifiable before invocation works.
 
-- [ ] T053 [US7] Create `plugins/gemma/scripts/idle-watchdog.mjs` implementing the poll loop of `contracts/runtime-state.md` — exit if disabled or unreachable, skip while `in-flight > 0`, honour the idle timeout (FR-023)
-- [ ] T054 [US7] Write the `stopping` marker before terminating the server in `plugins/gemma/scripts/idle-watchdog.mjs`, and clear it with `server.pid` after exit
-- [ ] T055 [US7] Implement the single-supervisor rule in `plugins/gemma/scripts/idle-watchdog.mjs` — exit rather than compete with a watchdog already supervising this port
-- [ ] T056 [US7] Implement the stale-activity backstop in `plugins/gemma/scripts/idle-watchdog.mjs` so a crashed client cannot pin accelerator memory indefinitely via a leaked `in-flight` (US7 acceptance scenario 4)
+- [X] T053 [US7] Create `plugins/gemma/scripts/idle-watchdog.mjs` implementing the poll loop of `contracts/runtime-state.md` — exit if disabled or unreachable, skip while `in-flight > 0`, honour the idle timeout (FR-023)
+- [X] T054 [US7] Write the `stopping` marker before terminating the server in `plugins/gemma/scripts/idle-watchdog.mjs`, and clear it with `server.pid` after exit
+- [X] T055 [US7] Implement the single-supervisor rule in `plugins/gemma/scripts/idle-watchdog.mjs` — exit rather than compete with a watchdog already supervising this port
+- [X] T056 [US7] Implement the stale-activity backstop in `plugins/gemma/scripts/idle-watchdog.mjs` so a crashed client cannot pin accelerator memory indefinitely via a leaked `in-flight` (US7 acceptance scenario 4)
 - [X] T057 [US7] Add activity accounting to `plugins/gemma/scripts/gemma-client.mjs` — `last-activity` before and after, `in-flight` incremented before and decremented on **every** exit path including error and interrupt (FR-024)
-- [ ] T058 [US7] Add the `stopping` interlock to `plugins/gemma/scripts/gemma-client.mjs` — wait for exit and start fresh rather than connecting to a dying server (FR-025)
-- [ ] T059 [US7] Add restart-reason reporting to `plugins/gemma/scripts/gemma-client.mjs` so a watchdog restart is distinguishable from a first-ever start (FR-025)
+- [X] T058 [US7] Add the `stopping` interlock to `plugins/gemma/scripts/gemma-client.mjs` — wait for exit and start fresh rather than connecting to a dying server (FR-025)
+- [X] T059 [US7] Add restart-reason reporting to `plugins/gemma/scripts/gemma-client.mjs` so a watchdog restart is distinguishable from a first-ever start (FR-025)
 - [X] T060 [US7] Start the watchdog from `plugins/gemma/scripts/gemma-client.mjs` only when starting a server and only if none is supervising
-- [ ] T061 [US7] Verify Scenario 5 of `quickstart.md` — confirm accelerator memory returns to baseline (SC-012) and, separately, that a generation longer than the idle timeout completes uninterrupted (FR-024)
-- [ ] T062 [US7] Verify Scenario 6 of `quickstart.md` for the model-switch warning (FR-026)
-- [ ] T063 [US7] Verify the disabled case — `--idle-timeout 0` keeps the server running past the period (US7 acceptance scenario 5)
+- [X] T061 [US7] Verify Scenario 5 of `quickstart.md` — confirm accelerator memory returns to baseline (SC-012) and, separately, that a generation longer than the idle timeout completes uninterrupted (FR-024)
+- [X] T062 [US7] Verify Scenario 6 of `quickstart.md` for the model-switch warning (FR-026)
+- [X] T063 [US7] Verify the disabled case — `--idle-timeout 0` keeps the server running past the period (US7 acceptance scenario 5)
 
 **Checkpoint**: accelerator memory is reclaimed automatically without ever truncating work.
 
@@ -171,14 +171,14 @@ Ordered after US1 because idle behaviour is unverifiable before invocation works
 ## Phase 10: Polish & Cross-Cutting
 
 - [X] T064 [P] Audit all five command files for Principle I compliance — every output-relaying command references the shared skill; none restates the policy inline (SC-007, FR-009)
-- [ ] T065 [P] Audit both tools for hardcoded absolute paths or platform-specific separators (FR-031)
-- [ ] T066 Verify Scenario 8 of `quickstart.md` on both Windows and a Unix-family environment, confirming SC-009 and SC-010
-- [ ] T067 Verify `LITERT_LM_SITE_PACKAGES` override works and that an absent runtime yields an actionable message rather than `ImportError` (FR-032)
-- [ ] T068 [P] Confirm a clean checkout runs both tools with no install or dependency-resolution step (FR-033, SC-010, Principle III)
-- [ ] T069 Re-run the full Constitution Check from plan.md against the built artifacts and record the result
-- [ ] T070 Record the `litert-lm` version every documented behaviour was observed against, and note which workarounds a future release is expected to retire (constitution Additional Constraints)
-- [ ] T071 **Verify no egress** — capture network destinations for a full request cycle and assert the only one contacted is the configured local host and port; confirm no credential is requested and no per-request cost is incurred (FR-006, Principle II)
-- [ ] T072 **Verify the first-run journey** — from an environment missing every prerequisite, reach a working first answer using only `/gemma:setup` output, with no external research, and record where the guidance was insufficient (SC-006)
+- [X] T065 [P] Audit both tools for hardcoded absolute paths or platform-specific separators (FR-031)
+- [X] T066 Verify Scenario 8 of `quickstart.md` on both Windows and a Unix-family environment, confirming SC-009 and SC-010
+- [X] T067 Verify `LITERT_LM_SITE_PACKAGES` override works and that an absent runtime yields an actionable message rather than `ImportError` (FR-032)
+- [X] T068 [P] Confirm a clean checkout runs both tools with no install or dependency-resolution step (FR-033, SC-010, Principle III)
+- [X] T069 Re-run the full Constitution Check from plan.md against the built artifacts and record the result
+- [X] T070 Record the `litert-lm` version every documented behaviour was observed against, and note which workarounds a future release is expected to retire (constitution Additional Constraints)
+- [X] T071 **Verify no egress** — capture network destinations for a full request cycle and assert the only one contacted is the configured local host and port; confirm no credential is requested and no per-request cost is incurred (FR-006, Principle II)
+- [X] T072 **Verify the first-run journey** — from an environment missing every prerequisite, reach a working first answer using only `/gemma:setup` output, with no external research, and record where the guidance was insufficient (SC-006)
 
 ---
 

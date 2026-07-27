@@ -40,7 +40,8 @@ the change is reversible.
 
 - [Node.js](https://nodejs.org/) ≥ 18 and Python ≥ 3.9 — both standard-library only, no
   install step, no dependency tree
-- LiteRT-LM: `uv tool install litert-lm`
+- LiteRT-LM — `uv tool install litert-lm`, or plain `pip install litert-lm` if you do not
+  already have [uv](https://docs.astral.sh/uv/)
   *(there is no Windows or Linux binary in GitHub Releases — PyPI is the channel)*
 - ~4 GB disk for the default model, plus roughly as much again for compiled caches
 - A GPU is optional. Without one it still works, just slower.
