@@ -70,7 +70,25 @@ rather than assume:
 curl -s https://huggingface.co/api/models/litert-community/gemma-4-E4B-it-litert-lm
 ```
 
-## 3. The CPU-fallback trap — the step that matters
+## 3. Is there an accelerator at all?
+
+**Do this before offering any repair.** The repair writes "use the GPU" into a model file;
+telling a machine with no GPU to use one is not a fix, it is damage.
+
+```bash
+nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv
+```
+
+`nvidia-smi` exists only on NVIDIA systems. Absent, or the command fails → assume **no usable
+accelerator** unless the user tells you otherwise (AMD, Intel, and Apple Silicon are not
+detected by this check and are untested with this plugin).
+
+**No accelerator?** Then everything below about the CPU-fallback trap does not apply. Say so
+plainly: the models are correctly on CPU, it will be several times slower than a GPU machine,
+and that is the expected behaviour rather than a fault. **Skip step 4 entirely — do not offer
+the repair.** Go to step 5.
+
+## 4. The CPU-fallback trap — only if an accelerator exists
 
 ```bash
 python "${CLAUDE_PLUGIN_ROOT}/tools/litertlm_backend.py" resolve
@@ -107,11 +125,15 @@ The payload claim is checkable, not just a claim — hash before and after and c
 python "${CLAUDE_PLUGIN_ROOT}/tools/payload_checksum.py" <path-to-model.litertlm>
 ```
 
-## 4. Server reachable
+## 5. Server reachable
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/gemma-client.mjs" --check
 ```
+
+`--check` reports the default model id and flags it `<-- NOT IMPORTED` if absent. The default
+is `gemma4-e4b`, matching step 2's import. If the user imported under a different id, either
+re-import under the default or pass `--model <id>` on every call.
 
 Then prove it end to end:
 
@@ -119,16 +141,16 @@ Then prove it end to end:
 node "${CLAUDE_PLUGIN_ROOT}/scripts/gemma-client.mjs" "Reply with exactly: READY"
 ```
 
-## 5. Accelerator memory headroom
+## 6. Memory headroom
 
-```bash
-nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv
-```
+Using the figures from step 3, compare available memory against the model's size and **warn
+when the margin is thin**. A model whose weights approach total VRAM may pass
+`litert-lm benchmark` and still fail in real use — benchmark does not exercise the
+embedding-lookup and vision-encoder sections. A memory-mapping error, or *"embedding lookup
+model is not initialized"*, means it does not fit.
 
-Compare against the model's size and **warn when the margin is thin**. A model whose weights
-approach total VRAM may pass `litert-lm benchmark` and still fail in real use — benchmark does
-not exercise the embedding-lookup and vision-encoder sections. A memory-mapping error, or
-*"embedding lookup model is not initialized"*, means it does not fit.
+On a CPU-only machine, the equivalent constraint is system RAM; a 3.4 GB model needs that much
+resident plus overhead.
 
 The mitigation is `--max-num-tokens 1024`, which `serve` **cannot** set — so a model needing it
 cannot be served at all through this plugin. Say that rather than letting the user discover it.

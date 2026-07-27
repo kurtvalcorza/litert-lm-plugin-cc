@@ -46,7 +46,24 @@ the change is reversible.
 - ~4 GB disk for the default model, plus roughly as much again for compiled caches
 - A GPU is optional. Without one it still works, just slower.
 
-Windows, WSL, Linux, and macOS.
+### Hardware
+
+**A GPU is optional.** Without one everything works, just several times slower — that is the
+expected behaviour, not a fault, and `/gemma:setup` will say so rather than offering a repair
+that would make no sense.
+
+Verified on: **Windows 11 + NVIDIA RTX 5070 Ti Laptop GPU (12 GB)** end to end, and **Linux
+(WSL2)** for the tooling. Everything else is plausible but untested:
+
+| Setup | Expectation |
+|---|---|
+| NVIDIA, any recent card | should work; VRAM must exceed the model size with headroom |
+| **No GPU** | works on CPU; `/gemma:setup` skips the repair step entirely |
+| AMD / Intel GPU | LiteRT-LM's backend is cross-platform, but **untested here**. The plugin's checks use `nvidia-smi`, so it will report "no accelerator" and treat you as CPU-only — conservative, not wrong |
+| macOS / Apple Silicon | LiteRT-LM ships macOS arm64 builds; the plugin's tooling has **never been run there** |
+
+If you try it on hardware not listed as verified, the failure mode to expect is a check
+reporting no accelerator rather than anything breaking.
 
 ## Install
 

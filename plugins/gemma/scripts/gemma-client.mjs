@@ -27,7 +27,9 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULTS = {
   host: '127.0.0.1',
   port: 9379,
-  model: 'gemma4-e4b-gpu',
+  // Must match the id `/gemma:setup` tells a new user to import as. A default
+  // naming some other id makes the very first call fail with "model not found".
+  model: 'gemma4-e4b',
   maxTokens: 800,
   idleTimeout: 900,          // seconds; 0 disables idle shutdown
   requestTimeoutMs: 15 * 60 * 1000,
@@ -400,12 +402,24 @@ async function chat(opts) {
   if (opts.system) messages.push({ role: 'system', content: opts.system });
   messages.push({ role: 'user', content: opts.prompt });
 
-  const res = await fetch(`${baseUrl(opts)}/v1/chat/completions`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ model: opts.model, messages, max_tokens: opts.maxTokens }),
-    signal: AbortSignal.timeout(opts.requestTimeoutMs),
-  });
+  let res;
+  try {
+    res = await fetch(`${baseUrl(opts)}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: opts.model, messages, max_tokens: opts.maxTokens }),
+      signal: AbortSignal.timeout(opts.requestTimeoutMs),
+    });
+  } catch (err) {
+    // The server drops the connection rather than returning an HTTP error for some
+    // failures, so `fetch failed` is all Node gives us. Say something useful.
+    throw new Error(
+      `lost the connection to the server mid-request (${err.message}).\n`
+      + '  The server may have exited while loading the model — a model too large for '
+      + 'available memory is the usual cause.\n'
+      + `  Check what is available:  node <this script> --list\n`
+      + '  Then retry naming one of those with --model <id>.');
+  }
 
   const text = await res.text();
   if (!res.ok) {
@@ -484,6 +498,10 @@ async function main() {
       const ids = (up.data ?? []).map((m) => m.id);
       lines.push(`models   : ${ids.length ? ids.join(', ') : '(none imported)'}`);
       lines.push(`default  : ${opts.model}${ids.includes(opts.model) ? '' : '  <-- NOT IMPORTED'}`);
+      if (!ids.includes(opts.model) && ids.length) {
+        lines.push(`           pass --model <id> to use one of the above, `
+          + `or import it as '${opts.model}'`);
+      }
       const loaded = readState(opts.port, 'loaded-model');
       if (loaded) lines.push(`resident : ${loaded}`);
     } else {
@@ -506,7 +524,19 @@ async function main() {
     throw new UsageError('no prompt supplied (pass an argument or pipe input). Try --help.');
   }
 
-  await ensureServer(opts);
+  const { models } = await ensureServer(opts);
+
+  // Fail fast on an unknown model. Sending it anyway makes the server close the
+  // connection, which surfaces as a bare "fetch failed" that names nothing.
+  const available = (models?.data ?? []).map((m) => m.id);
+  if (available.length && !available.includes(opts.model)) {
+    throw new Error(
+      `no model named '${opts.model}' is available.\n`
+      + `  Imported: ${available.join(', ')}\n`
+      + '  Pass one of those with --model <id>, or import it:\n'
+      + '    litert-lm import --from-huggingface-repo litert-community/gemma-4-E4B-it-litert-lm '
+      + `gemma-4-E4B-it.litertlm ${opts.model}`);
+  }
 
   // Model-switch warning (FR-026): the engine holds one model; switching reloads it.
   const loaded = readState(opts.port, 'loaded-model');
