@@ -1,6 +1,6 @@
 {
   "name": "gemma",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Call a local on-device model served by LiteRT-LM from Claude Code — offline, no API tokens. Unofficial.",
   "author": {
     "name": "Kurt Valcorza",
