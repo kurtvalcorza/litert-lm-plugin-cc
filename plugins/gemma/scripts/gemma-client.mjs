@@ -17,7 +17,7 @@
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { homedir, tmpdir, uptime } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -114,6 +114,38 @@ function clearInFlight(port) {
 }
 
 /**
+ * When this host last booted, as an epoch millisecond stamp.
+ *
+ * Computed once: `uptime()` advances while we run, so recomputing would make the
+ * boundary drift and two calls could disagree about the same marker.
+ */
+const BOOT_TIME_MS = Date.now() - uptime() * 1000;
+
+/**
+ * Is this marker dead wood?
+ *
+ * Pid liveness is exact only WITHIN one boot session. The OS reuses pids, so after
+ * a reboot the pid of a client that died in a crash can belong to something
+ * unrelated and very much alive — at which point a marker that describes nothing
+ * looks live forever, idle shutdown never fires, and the accelerator memory is
+ * pinned until someone runs --stop by hand. That is the exact failure this whole
+ * mechanism exists to prevent, so "the pid is alive" cannot be the only test.
+ *
+ * A marker written before the current boot cannot describe a request happening now,
+ * whatever its pid says. Observed after a real 0x116 bugcheck: the marker predated
+ * boot by two minutes and survived only because the pid happened not to be reused.
+ *
+ * The timestamp is already in the name, so this costs nothing. If it is unparseable
+ * (a marker from some older layout), fall back to the pid test rather than guessing.
+ */
+function markerIsStale(name) {
+  const [pidPart, tsPart] = name.split('-');
+  const ts = Number.parseInt(tsPart, 10);
+  if (Number.isFinite(ts) && ts < BOOT_TIME_MS) return true;
+  return !pidAlive(Number.parseInt(pidPart, 10));
+}
+
+/**
  * Drop only markers whose owning process is dead.
  *
  * Never prune by server reachability. A model switch tears the engine down and
@@ -132,8 +164,7 @@ function pruneInFlight(port) {
   let entries;
   try { entries = readdirSync(dir); } catch { return; }
   for (const name of entries) {
-    const pid = Number.parseInt(name.split('-')[0], 10);
-    if (!pidAlive(pid)) {
+    if (markerIsStale(name)) {
       try { rmSync(join(dir, name), { force: true }); } catch { /* ignore */ }
     }
   }

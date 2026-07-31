@@ -16,22 +16,31 @@ Symptoms first, since that is what you have when you arrive.
 with parameter 3 `0xC000009A` (`STATUS_INSUFFICIENT_RESOURCES`). The display driver hung and
 could not be reset.
 
-**Trigger observed**: rapid back-and-forth **model switching** on the GPU backend — each switch
-forces a full engine teardown and re-initialisation. Causation is strongly indicated, not
-proven.
+**Trigger: NOT established.** Two occurrences on the same host, five days apart. The first
+followed rapid back-and-forth **model switching**, which made teardown/re-init the obvious
+suspect. The second involved **no switch at all** — a single model had been resident, and the
+only activity was an ordinary request. One shared condition: a model was loaded on the GPU.
 
-**Rule**: never interleave models in a loop. Stop the server between models:
+Do not treat "avoid switching" as sufficient protection. It was the honest reading after one
+data point; the second contradicts it. What remains true is that this is a **display-driver**
+failure, not a LiteRT-LM one, and that it costs a reboot.
+
+**Rule (still worth keeping)**: never interleave models in a loop. Stop the server between
+models:
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/gemma-client.mjs" --stop
 ```
 
-Benchmark and comparison workflows must stop between models rather than switching in place. A
-measured pair with a stop between them ran clean where rapid switching did not.
+Benchmark and comparison workflows should stop between models rather than switching in place —
+that pairing has run clean where rapid switching did not. Just do not mistake it for immunity.
 
 **After a crash**, state files survive the reboot and lie — dead pids, leaked in-flight
-markers. The client reconciles this automatically on next run (pid liveness, not file
-existence), but if you are inspecting by hand, do not trust what is in the runtime directory.
+markers. The client reconciles this automatically on next run, and the test is **boot time as
+well as pid liveness**: pids are reused, so after a reboot a dead client's pid can belong to
+something live and unrelated, which would make a meaningless marker look like a running request
+forever and suppress idle shutdown. A marker written before the current boot is stale whatever
+its pid says. If you are inspecting by hand, do not trust what is in the runtime directory.
 
 ---
 
