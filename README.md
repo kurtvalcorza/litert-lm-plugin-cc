@@ -136,10 +136,12 @@ calls but never executes them.
 - The server starts on demand and **stops itself after 15 minutes idle**, releasing VRAM. The
   next question restarts it transparently. `--idle-timeout 0` disables this.
 - **One model is resident at a time.** Naming another forces a full engine reload.
-- ⚠️ **Never interleave models in a loop on the GPU backend.** Repeated teardown and re-init
-  has been observed to hang the display driver (bugcheck `0x116`, VIDEO_TDR_ERROR) and force a
-  reboot. Use `/gemma:stop` between models. Causation is indicated, not proven — but the
-  failure mode is severe enough to avoid entirely.
+- ⚠️ **Never switch models in place on the GPU backend.** Two hard crashes on the development
+  host (bugcheck `0x116`, VIDEO_TDR_ERROR, forced reboot) both happened while a model was
+  resident and a request named a different one, forcing teardown and re-init. Causation is
+  indicated, not proven — but the failure mode is severe enough to avoid entirely.
+  Use `/gemma:stop` between models. That mitigation has been **tested**: the same GPU
+  initialisation that preceded a crash ran clean as a cold start with nothing resident.
 - A model whose weights approach total VRAM may pass `litert-lm benchmark` and still fail in
   real use; benchmark does not exercise every section. `serve` cannot cap the context, so such
   a model cannot be served at all.

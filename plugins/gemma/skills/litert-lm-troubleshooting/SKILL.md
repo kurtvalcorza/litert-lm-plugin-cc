@@ -16,24 +16,29 @@ Symptoms first, since that is what you have when you arrive.
 with parameter 3 `0xC000009A` (`STATUS_INSUFFICIENT_RESOURCES`). The display driver hung and
 could not be reset.
 
-**Trigger: NOT established.** Two occurrences on the same host, five days apart. The first
-followed rapid back-and-forth **model switching**, which made teardown/re-init the obvious
-suspect. The second involved **no switch at all** — a single model had been resident, and the
-only activity was an ordinary request. One shared condition: a model was loaded on the GPU.
+**Trigger observed — an in-place model switch, in both occurrences.** Two crashes on the same
+host, five days apart. Each happened while **a model was already resident and a request named a
+different one**, forcing a full engine teardown and re-initialisation. Causation is strongly
+indicated, not proven — but the shared condition is specific, not vague.
 
-Do not treat "avoid switching" as sufficient protection. It was the honest reading after one
-data point; the second contradicts it. What remains true is that this is a **display-driver**
-failure, not a LiteRT-LM one, and that it costs a reboot.
+The second crash is worth reading carefully, because it looks like a counter-example and is
+not. Reconstructed from file timestamps: the switch target's GPU caches were written seconds
+before the bugcheck, so a **completed** initialisation preceded the hang — the engine did not
+choke on a malformed load. Note the trap: that model's ML Drift weight cache is legitimately
+**0 bytes**, so its presence after a crash proves nothing about whether the init finished.
+Compare sizes against a known-good run before concluding anything from cache files.
 
-**Rule (still worth keeping)**: never interleave models in a loop. Stop the server between
-models:
+**Rule**: never interleave models in a loop. Stop the server between models:
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/gemma-client.mjs" --stop
 ```
 
-Benchmark and comparison workflows should stop between models rather than switching in place —
-that pairing has run clean where rapid switching did not. Just do not mistake it for immunity.
+**This mitigation has been tested, not just asserted.** After the second crash, the identical
+GPU initialisation that preceded it was re-run — same model, same backend — but as a cold start
+with nothing resident, per the rule above. It completed cleanly, twice, with the accelerator
+memory released afterwards. Stop-then-load is the supported path; switching in place is the one
+that has hung the driver.
 
 **After a crash**, state files survive the reboot and lie — dead pids, leaked in-flight
 markers. The client reconciles this automatically on next run, and the test is **boot time as
