@@ -60,6 +60,29 @@ Reverses with `--backend cpu --yes`. See the `litertlm-format` skill for why thi
 
 ---
 
+## A model stopped loading after a repair was interrupted
+
+**Symptom**: any command touching the model reports *"could not read the header"*, usually
+naming a `struct.error` about a buffer being too small. It worked before a `patch` that was
+cut short — a crash, a reboot, a killed terminal.
+
+**Cause**: the header bytes sit at offset 32 and the length describing them sits at offset 24.
+A patch writes both. Interrupted between the two, they disagree, and the flatbuffer then reads
+truncated. **`patch --backend cpu` cannot undo this** — it reverses a *completed* patch, and
+this one never completed.
+
+**Fix**: `patch` copies the 16 KB header block aside before writing and removes it only on
+success, so a leftover copy is itself the evidence the run died.
+
+```bash
+python "${CLAUDE_PLUGIN_ROOT}/tools/litertlm_backend.py" restore <model.litertlm>
+```
+
+Every command that hits an unreadable header already says whether a backup exists. If none
+does, the model must be re-imported — the payload is intact but nothing describes it.
+
+---
+
 ## A model benchmarks fine but fails when actually used
 
 **Symptom**: `litert-lm benchmark` passes. `run` or `serve` fails with a memory-mapping error,

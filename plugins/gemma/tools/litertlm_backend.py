@@ -33,6 +33,7 @@ USAGE
     litertlm_backend.py show    <model.litertlm>   # dump section metadata
     litertlm_backend.py check   <model.litertlm>   # dry-run the patch, writes nothing
     litertlm_backend.py patch   <model.litertlm> [--backend gpu] [--yes]
+    litertlm_backend.py restore <model.litertlm>   # undo an INTERRUPTED patch
 
 REVERSING
 ---------
@@ -42,8 +43,18 @@ backend. This is a supported operation, not a trick.
     litertlm_backend.py patch <model.litertlm> --backend gpu --yes    # repair
     litertlm_backend.py patch <model.litertlm> --backend cpu --yes    # undo it
 
+That reverses a patch that COMPLETED. A patch that was interrupted is a different
+problem: the header bytes and the length that describes them live at different
+offsets, so a crash between the two writes leaves them disagreeing and the file
+stops parsing — `patch` cannot reverse what it never finished writing. So `patch`
+first copies the 16 KB header block to `<model>.litertlm.hdrbak` and removes it only
+on success. If that file is still there, the previous run died; put it back with:
+
+    litertlm_backend.py restore <model.litertlm>
+
+Any command that hits an unreadable header says this, and says which case applies.
 Re-importing the model is the external fallback. Operating on a copy remains
-possible but is not required, because the write is bounded and validated:
+possible but is not required, because the write is bounded, backed up and validated:
 
     cp -r ~/.litert-lm/models/gemma4-e4b ~/.litert-lm/models/gemma4-e4b-gpu
 
@@ -185,6 +196,28 @@ def summarize(buf):
     return (tuple(sections), tuple(system))
 
 
+def _unreadable(path, exc):
+    """Turn a header parse failure into an answer instead of a traceback.
+
+    This is what an interrupted patch looks like from the outside: the declared
+    header length and the header bytes disagree, so the flatbuffer reads truncated
+    and any command touching it explodes. That is precisely the moment to point at
+    the backup, not to print a stack.
+    """
+    backup = _backup_path(path)
+    hint = (f"  A backup from an interrupted patch is present. Restore it:\n"
+            f"    litertlm_backend.py restore {path}\n"
+            if os.path.isfile(backup)
+            else "  No backup is present, so re-import the model to replace it.\n")
+    # Qualify the type: the usual one is `struct.error`, whose bare __name__ is the
+    # unhelpfully generic "error".
+    kind = f"{type(exc).__module__}.{type(exc).__name__}".removeprefix("builtins.")
+    raise SystemExit(
+        f"{path}: could not read the header ({kind}: {exc}).\n"
+        f"{hint}"
+    )
+
+
 def _text(v):
     return v.decode() if isinstance(v, bytes) else v
 
@@ -243,31 +276,46 @@ def cmd_resolve(args):
 
 
 def cmd_show(args):
-    with io.StringIO() as devnull:
-        metadata = PEEK.read_litertlm_header(args.model, devnull)
-    sm = metadata.SectionMetadata()
-    print(f"{args.model}\nsections: {sm.ObjectsLength()}")
-    for i in range(sm.ObjectsLength()):
-        sec = sm.Objects(i)
-        print(f"\n--- section[{i}] model_type={PEEK.get_model_type(sec)!r} "
-              f"items={sec.ItemsLength()}")
-        for j in range(sec.ItemsLength()):
-            it = sec.Items(j)
-            if it is None:
-                continue
-            d = PEEK.kvp_to_dict(it)
-            val = str(d.get("value"))
-            if len(val) > 90:
-                val = val[:90] + f"...<{len(str(d.get('value')))} chars>"
-            print(f"      {d.get('key')} = {val}")
+    # Everything that walks the flatbuffer stays inside the guard. A truncated
+    # header does not fail at the read — it fails later, on the first offset that
+    # points past the buffer, which is inside these loops.
+    lines = []
+    try:
+        with io.StringIO() as devnull:
+            metadata = PEEK.read_litertlm_header(args.model, devnull)
+        sm = metadata.SectionMetadata()
+        lines.append(f"{args.model}\nsections: {sm.ObjectsLength()}")
+        for i in range(sm.ObjectsLength()):
+            sec = sm.Objects(i)
+            lines.append(f"\n--- section[{i}] model_type={PEEK.get_model_type(sec)!r} "
+                         f"items={sec.ItemsLength()}")
+            for j in range(sec.ItemsLength()):
+                it = sec.Items(j)
+                if it is None:
+                    continue
+                d = PEEK.kvp_to_dict(it)
+                val = str(d.get("value"))
+                if len(val) > 90:
+                    val = val[:90] + f"...<{len(str(d.get('value')))} chars>"
+                lines.append(f"      {d.get('key')} = {val}")
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001
+        _unreadable(args.model, e)
+    print("\n".join(lines))
 
 
 def _validate(path, backend):
     header_end, orig = read_header(path)
     limit = CORE.BLOCK_SIZE - CORE.HEADER_BEGIN_BYTE_OFFSET
 
-    identical, _ = repack(orig, None)
-    lossless = summarize(orig) == summarize(identical)
+    try:
+        identical, _ = repack(orig, None)
+        lossless = summarize(orig) == summarize(identical)
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001
+        _unreadable(path, e)
     print(f"round-trip (no change): {len(orig)} -> {len(identical)} bytes, "
           f"content identical: {lossless}")
     if not lossless:
@@ -286,7 +334,92 @@ def cmd_check(args):
     _validate(args.model, args.backend)
 
 
+def _backup_path(model):
+    return model + ".hdrbak"
+
+
+def _write_header_backup(model):
+    """Copy the whole first block aside before touching the file.
+
+    The rewrite is not atomic and cannot be made so in place: the header bytes live
+    at offset 32 and the length that describes them lives at offset 24, so a crash
+    between those two writes leaves them disagreeing and the flatbuffer parses
+    truncated. No ordering of the two fixes that — only a copy does. The block is
+    16 KB; the file it protects is several GB, and re-downloading one is the
+    alternative. This machine has already taken one unplanned BSOD.
+    """
+    with open(model, "rb") as f:
+        block = f.read(CORE.BLOCK_SIZE)
+    if len(block) != CORE.BLOCK_SIZE:
+        raise SystemExit(f"ABORT: {model} is smaller than one {CORE.BLOCK_SIZE}-byte block.")
+    path = _backup_path(model)
+    with open(path, "wb") as b:
+        b.write(block)
+        b.flush()
+        os.fsync(b.fileno())
+    return path
+
+
+def cmd_restore(args):
+    """Put back the header block saved by an interrupted `patch`."""
+    path = _backup_path(args.model)
+    if not os.path.isfile(path):
+        raise SystemExit(
+            f"No backup found at:\n  {path}\n"
+            "  A backup exists only while a patch is in progress; a completed patch\n"
+            "  removes it. If the model is broken and there is no backup, re-import it."
+        )
+    with open(path, "rb") as b:
+        block = b.read()
+    if len(block) != CORE.BLOCK_SIZE or block[:8] != CORE.HEADER_MAGIC_BYTES:
+        raise SystemExit(f"ABORT: {path} is not a valid header block; refusing to write it.")
+
+    if not _consent(
+        f"\nAbout to restore the original header block of:\n  {args.model}\nfrom {path}",
+        args.yes,
+    ):
+        raise SystemExit("Declined; nothing was written.")
+
+    with open(args.model, "r+b") as f:
+        f.seek(0)
+        f.write(block)
+        f.flush()
+        os.fsync(f.fileno())
+    os.remove(path)
+    print(f"header restored from backup; {os.path.basename(path)} removed")
+    print("verify:  litertlm_backend.py resolve")
+
+
+def _consent(preamble, assumed):
+    """Shared consent gate (FR-019). Returns True only on an explicit yes."""
+    if assumed:
+        return True
+    if not sys.stdin.isatty():
+        raise SystemExit(
+            "ABORT: refusing to modify a model file without consent.\n"
+            "  Re-run with --yes once the user has agreed to this specific change,\n"
+            "  or run `check` instead to see what would happen without writing."
+        )
+    print(preamble)
+    try:
+        answer = input("Proceed? [y/N] ")
+    except (EOFError, KeyboardInterrupt):
+        # isatty() can report a terminal that cannot actually be read from — a
+        # piped or redirected stdin under some shells. Treat it as a decline
+        # rather than letting a traceback reach the user.
+        print()
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
 def cmd_patch(args):
+    stale = _backup_path(args.model)
+    if os.path.isfile(stale):
+        print(f"WARNING: a header backup is already present:\n  {stale}\n"
+              "  That means an earlier patch did not finish. If this model no longer\n"
+              "  loads, restore it first:  litertlm_backend.py restore <model>\n",
+              file=sys.stderr)
+
     header_end, new, changed, fits = _validate(args.model, args.backend)
     if not changed:
         raise SystemExit("ABORT: no main section found to patch.")
@@ -299,44 +432,38 @@ def cmd_patch(args):
     # Consent gate (FR-019). Another command driving this tool must assert that it
     # already obtained consent, in the same invocation, by passing --yes. Without a
     # terminal to prompt at and without --yes, refuse rather than write silently.
-    if not args.yes:
-        refusal = (
-            "ABORT: refusing to modify a model file without consent.\n"
-            "  Re-run with --yes once the user has agreed to this specific change,\n"
-            "  or run `check` instead to see what would happen without writing."
-        )
-        if not sys.stdin.isatty():
-            raise SystemExit(refusal)
+    prior = "cpu" if args.backend != "cpu" else "gpu"
+    if not _consent(
+        f"\nAbout to rewrite the header of:\n  {args.model}\n"
+        "Only the first 16 KB is written; the payload is not touched.\n"
+        f"Reversible with:  litertlm_backend.py patch <model> --backend {prior} --yes",
+        args.yes,
+    ):
+        raise SystemExit("Declined; nothing was written.")
 
-        prior = "cpu" if args.backend != "cpu" else "gpu"
-        print(f"\nAbout to rewrite the header of:\n  {args.model}")
-        print("Only the first 16 KB is written; the payload is not touched.")
-        print(f"Reversible with:  litertlm_backend.py patch <model> --backend {prior} --yes")
-        try:
-            answer = input("Proceed? [y/N] ")
-        except (EOFError, KeyboardInterrupt):
-            # isatty() can report a terminal that cannot actually be read from — a
-            # piped or redirected stdin under some shells. Treat it as a decline
-            # rather than letting a traceback reach the user.
-            print()
-            raise SystemExit(refusal)
-        if answer.strip().lower() not in ("y", "yes"):
-            raise SystemExit("Declined; nothing was written.")
-
-    with open(args.model, "r+b") as f:
-        f.seek(CORE.HEADER_BEGIN_BYTE_OFFSET)
-        f.write(new)
-        new_end = CORE.HEADER_BEGIN_BYTE_OFFSET + len(new)
-        if new_end < header_end:  # scrub stale tail bytes
-            f.write(b"\x00" * (header_end - new_end))
-        f.seek(CORE.HEADER_END_LOCATION_BYTE_OFFSET)
-        f.write(struct.pack("<Q", new_end))
-        f.flush()
-        os.fsync(f.fileno())
+    backup = _write_header_backup(args.model)
+    try:
+        with open(args.model, "r+b") as f:
+            f.seek(CORE.HEADER_BEGIN_BYTE_OFFSET)
+            f.write(new)
+            new_end = CORE.HEADER_BEGIN_BYTE_OFFSET + len(new)
+            if new_end < header_end:  # scrub stale tail bytes
+                f.write(b"\x00" * (header_end - new_end))
+            f.seek(CORE.HEADER_END_LOCATION_BYTE_OFFSET)
+            f.write(struct.pack("<Q", new_end))
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        # The backup is the only way back, so say where it is before unwinding.
+        print(f"\nWrite failed. The original header is saved at:\n  {backup}\n"
+              f"  Restore it with:  litertlm_backend.py restore {args.model}",
+              file=sys.stderr)
+        raise
+    os.remove(backup)
 
     reverse_to = "cpu" if args.backend != "cpu" else "gpu"
     print(f"header rewritten: end {header_end} -> {new_end}")
-    print(f"verify:   litertlm_backend.py resolve")
+    print("verify:   litertlm_backend.py resolve")
     print(f"reverse:  litertlm_backend.py patch {args.model} --backend {reverse_to} --yes")
     print("payload:  unchanged — confirm with payload_checksum.py")
 
@@ -370,6 +497,14 @@ def main():
                    help="confirm the write. Required when running non-interactively; a caller "
                         "passing this asserts the user consented in the same invocation.")
     p.set_defaults(func=cmd_patch)
+
+    p = sub.add_parser(
+        "restore",
+        help="put back the header block saved by an interrupted patch (<model>.hdrbak)",
+    )
+    p.add_argument("model")
+    p.add_argument("--yes", action="store_true", help="confirm the write, as for patch")
+    p.set_defaults(func=cmd_restore)
 
     args = ap.parse_args()
     args.func(args)

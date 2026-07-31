@@ -16,7 +16,7 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -106,11 +106,37 @@ function releaseInFlight(marker) {
   try { rmSync(marker, { force: true }); } catch { /* ignore */ }
 }
 
-/** Drop every marker — used when the server is gone, so nothing can be in flight. */
+/** Drop every marker. Only correct once we have killed the server ourselves. */
 function clearInFlight(port) {
   try {
     rmSync(join(stateDir(port), IN_FLIGHT_DIR), { recursive: true, force: true });
   } catch { /* ignore */ }
+}
+
+/**
+ * Drop only markers whose owning process is dead.
+ *
+ * Never prune by server reachability. A model switch tears the engine down and
+ * rebuilds it, so the server is legitimately unreachable for tens of seconds
+ * *while a request is in flight* — the watchdog tolerates exactly that (see
+ * UNREACHABLE_TOLERANCE). If this pruned on unreachability instead, any second
+ * invocation landing in that window — even a read-only `--check` — would delete a
+ * live client's marker, the watchdog would then count zero in flight, and it would
+ * be free to kill the server mid-generation. That is the failure the marker files
+ * replaced the in-flight counter to prevent; pruning on reachability reintroduces it.
+ *
+ * The owning pid is in the name, so liveness is exact and needs no timeout.
+ */
+function pruneInFlight(port) {
+  const dir = join(stateDir(port), IN_FLIGHT_DIR);
+  let entries;
+  try { entries = readdirSync(dir); } catch { return; }
+  for (const name of entries) {
+    const pid = Number.parseInt(name.split('-')[0], 10);
+    if (!pidAlive(pid)) {
+      try { rmSync(join(dir, name), { force: true }); } catch { /* ignore */ }
+    }
+  }
 }
 
 const touchActivity = (port) => writeState(port, 'last-activity', Date.now());
@@ -135,15 +161,30 @@ const livePid = (port, name) => {
  * leaked `in-flight` would suppress idle shutdown on top of that.
  *
  * Observed for real after a host BSOD, which left in-flight=1 and two dead pids.
+ *
+ * Every decision here keys off PROCESS LIVENESS, never off server reachability.
+ * "The server did not answer just now" and "the server is gone" are different
+ * claims: a model switch produces the first for tens of seconds at a stretch. The
+ * watchdog already distinguishes them (UNREACHABLE_TOLERANCE); this must agree
+ * with it, or the two supervisors race and the client wins by deleting state the
+ * watchdog is still relying on.
  */
 function reconcileState(port, serverUp) {
   if (livePid(port, 'watchdog.pid') === null) clearState(port, 'watchdog.pid');
   if (livePid(port, 'server.pid') === null) clearState(port, 'server.pid');
-  if (!serverUp) {
-    // No server means nothing can legitimately be in flight against it.
-    clearInFlight(port);
+
+  // Owner-liveness only — see pruneInFlight for why reachability must not decide.
+  pruneInFlight(port);
+
+  // `stopping` is the watchdog's handshake, and it stays set through a drain loop
+  // that mostly runs AFTER the socket closes. Clearing it because the server is
+  // unreachable would therefore erase it during almost the whole shutdown, letting
+  // the next client walk past awaitNotStopping and start a second server while the
+  // first watchdog is still tearing state down. It is stale only if its author died.
+  if (livePid(port, 'watchdog.pid') === null) clearState(port, 'stopping');
+
+  if (!serverUp && livePid(port, 'server.pid') === null) {
     clearState(port, 'in-flight');          // legacy counter from older installs
-    clearState(port, 'stopping');
     clearState(port, 'loaded-model');
   }
 }
@@ -313,7 +354,9 @@ async function ensureServer(opts) {
   }
 
   if (child.pid) writeState(opts.port, 'server.pid', child.pid);
-  clearInFlight(opts.port);
+  // Prune, not wipe: another client may have acquired a marker against this same
+  // new server between our spawn and this line.
+  pruneInFlight(opts.port);
   touchActivity(opts.port);
 
   const deadline = Date.now() + opts.startupTimeoutMs;
@@ -365,24 +408,34 @@ function pidsOnPort(port) {
   return [...pids];
 }
 
-async function stopProcesses(opts) {
+/**
+ * Stop our server and watchdog.
+ *
+ * `ours` says whether a litert-lm-shaped server actually answered on this port. It
+ * gates killing whoever owns the socket, because that step is otherwise a licence
+ * to terminate an arbitrary process: the port is a guess, not an identity. Pids we
+ * recorded ourselves are always fair game — we started them.
+ */
+async function stopProcesses(opts, ours) {
   const port = opts.port;
 
   const recorded = ['watchdog.pid', 'server.pid']
     .map((n) => Number.parseInt(readState(port, n, ''), 10))
     .filter((n) => Number.isInteger(n) && n > 0);
 
-  for (const pid of [...recorded, ...pidsOnPort(port)]) {
+  for (const pid of [...recorded, ...(ours ? pidsOnPort(port) : [])]) {
     try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
   }
 
   // Confirm the port actually closed rather than assuming SIGTERM landed.
-  for (let i = 0; i < 20; i++) {
-    if (!(await probe(opts, 1000))) break;
-    await sleep(400);
-    for (const pid of pidsOnPort(port)) {
-      try { process.kill(pid, process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL'); }
-      catch { /* ignore */ }
+  if (ours) {
+    for (let i = 0; i < 20; i++) {
+      if (!(await probe(opts, 1000))) break;
+      await sleep(400);
+      for (const pid of pidsOnPort(port)) {
+        try { process.kill(pid, process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL'); }
+        catch { /* ignore */ }
+      }
     }
   }
 
@@ -477,10 +530,19 @@ async function main() {
   if (opts.action === 'help') { process.stdout.write(HELP + '\n'); return; }
 
   if (opts.action === 'stop') {
+    // A successful /v1/models is what identifies the socket owner as ours. Without
+    // it we still stop what we recorded, but we do not shoot at the port.
     const wasUp = await probe(opts);
-    const nowDown = await stopProcesses(opts);
+    const strangers = wasUp ? [] : pidsOnPort(opts.port);
+    const nowDown = await stopProcesses(opts, Boolean(wasUp));
     if (!wasUp) {
       process.stdout.write('Server was not running; state cleared.\n');
+      if (strangers.length) {
+        process.stderr.write(
+          `[gemma] note: pid ${strangers.join(', ')} is listening on port ${opts.port} but did `
+          + 'not answer /v1/models, so it is not this plugin\'s server and was left alone.\n'
+          + `  If you meant to free the port, stop that process yourself, or use --port <n>.\n`);
+      }
     } else if (nowDown) {
       process.stdout.write('Server stopped; accelerator memory released.\n');
     } else {

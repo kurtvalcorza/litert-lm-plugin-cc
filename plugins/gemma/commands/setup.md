@@ -131,9 +131,14 @@ python "${CLAUDE_PLUGIN_ROOT}/tools/payload_checksum.py" <path-to-model.litertlm
 node "${CLAUDE_PLUGIN_ROOT}/scripts/gemma-client.mjs" --check
 ```
 
-`--check` reports the default model id and flags it `<-- NOT IMPORTED` if absent. The default
-is `gemma4-e4b`, matching step 2's import. If the user imported under a different id, either
-re-import under the default or pass `--model <id>` on every call.
+`--check` never starts anything, so on a fresh machine the server is down and it can only
+report the default id as `(unverified — server is down)`. It flags `<-- NOT IMPORTED` **only
+when a server is already up** to compare against. Do not treat the absence of that flag as
+confirmation — at setup time it proves nothing.
+
+Compare against step 2 instead: the default is `gemma4-e4b`, and `litert-lm list` already told
+you what exists. If the user imported under a different id, either re-import under the default
+or pass `--model <id>` on every call.
 
 Then prove it end to end:
 

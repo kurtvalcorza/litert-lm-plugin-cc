@@ -13,7 +13,7 @@
  * Started detached by gemma-client.mjs; never invoked by a user directly.
  */
 
-import { spawn } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -110,25 +110,65 @@ async function serverReachable() {
   }
 }
 
+/**
+ * Find whatever process is listening on the port (mirrors gemma-client.mjs).
+ *
+ * litert-lm is a two-stage launcher: the pid we recorded is often not the process
+ * holding the socket, so the recorded pid alone is not enough to stop it.
+ */
+function pidsOnPort(port) {
+  const run = (cmd, args) => {
+    try {
+      return spawnSync(cmd, args, { encoding: 'utf8', windowsHide: true }).stdout ?? '';
+    } catch {
+      return '';
+    }
+  };
+
+  const out = process.platform === 'win32'
+    ? run('powershell.exe', ['-NoProfile', '-Command',
+      `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue `
+      + '| Select-Object -ExpandProperty OwningProcess'])
+    : run('lsof', ['-ti', `tcp:${port}`, '-sTCP:LISTEN']);
+
+  const pids = new Set();
+  for (const line of out.split(/\r?\n/)) {
+    const n = Number.parseInt(line.trim(), 10);
+    if (Number.isInteger(n) && n > 0) pids.add(n);
+  }
+  return [...pids];
+}
+
+/**
+ * Stop the server this watchdog supervises — and only that one.
+ *
+ * An earlier version ran `Get-Process litert-lm | Stop-Process -Force` (and `pkill -f
+ * 'litert-lm serve'` on POSIX), which kills EVERY litert-lm process on the machine.
+ * State here is deliberately keyed by port so two servers can coexist, and the
+ * client exposes --port, so that global kill contradicted the design: it would take
+ * out a server on another port, an interactive `litert-lm run`, or a benchmark. On
+ * the GPU backend an abrupt teardown of an unrelated process is not free — repeated
+ * re-init is what has been observed to hang the display driver (bugcheck 0x116).
+ *
+ * Only this port's socket owners, plus the pid we recorded ourselves, are targets.
+ */
 function terminateServer() {
-  const pid = Number.parseInt(readState('server.pid', ''), 10);
-  if (pidAlive(pid)) {
+  const targets = new Set(pidsOnPort(opts.port));
+  const recorded = Number.parseInt(readState('server.pid', ''), 10);
+  if (pidAlive(recorded)) targets.add(recorded);
+  for (const pid of targets) {
     try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
   }
-  // litert-lm is a two-stage launcher, so the recorded pid may not own the port.
-  try {
-    const [cmd, args] = process.platform === 'win32'
-      ? ['powershell', ['-NoProfile', '-Command',
-        'Get-Process litert-lm -ErrorAction SilentlyContinue | Stop-Process -Force']]
-      : ['pkill', ['-f', 'litert-lm serve']];
-    spawn(cmd, args, { stdio: 'ignore', shell: process.platform === 'win32' }).unref();
-  } catch { /* best effort */ }
 }
 
 function cleanupAndExit(code = 0) {
-  clearState('stopping');
+  // Release ownership BEFORE the handshake. A client that sees `stopping` disappear
+  // concludes the shutdown is over and immediately asks whether a watchdog is live;
+  // if `watchdog.pid` still named this (exiting) process it would decline to start
+  // one, and the server it goes on to launch would never be supervised.
   const mine = Number.parseInt(readState('watchdog.pid', ''), 10);
   if (mine === process.pid) clearState('watchdog.pid');
+  clearState('stopping');
   process.exit(code);
 }
 
@@ -163,6 +203,10 @@ async function main() {
       missedProbes += 1;
       if (missedProbes < UNREACHABLE_TOLERANCE) continue;
       clearState('server.pid');
+      // The engine died with someone else's hand on it, so nothing is resident.
+      // Leaving `loaded-model` behind makes the next client warn about a model
+      // switch that is not happening.
+      clearState('loaded-model');
       cleanupAndExit(0);        // deliberately does not touch in-flight
     }
     missedProbes = 0;
@@ -186,6 +230,12 @@ async function main() {
     for (let i = 0; i < 30; i++) {
       await sleep(500);
       if (!(await serverReachable())) break;
+      // Still answering: escalate on whatever still holds the socket. SIGTERM can be
+      // ignored, and a server left alive here holds accelerator memory indefinitely.
+      for (const pid of pidsOnPort(opts.port)) {
+        try { process.kill(pid, process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL'); }
+        catch { /* ignore */ }
+      }
     }
 
     clearState('server.pid');

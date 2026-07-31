@@ -42,6 +42,13 @@ def _block_size():
                                        "Lib", "site-packages"))
         cands += glob.glob(_os.path.join(home, ".local", "share", "uv", "tools",
                                          "litert-lm", "lib", "python*", "site-packages"))
+        # pipx, same as litertlm_backend.py._candidate_site_packages(). The two lists
+        # must agree: a location only one of them knows means this file silently uses
+        # the fallback BLOCK_SIZE while its sibling uses the real one, and the payload
+        # comparison would then hash a different range in each — a mismatch that reads
+        # as a pass.
+        cands += glob.glob(_os.path.join(home, ".local", "pipx", "venvs", "litert-lm",
+                                         "lib", "python*", "site-packages"))
         for c in filter(None, cands):
             if _os.path.isdir(_os.path.join(c, "litert_lm_builder")):
                 _sys.path.insert(0, c)
