@@ -16,29 +16,51 @@ Symptoms first, since that is what you have when you arrive.
 with parameter 3 `0xC000009A` (`STATUS_INSUFFICIENT_RESOURCES`). The display driver hung and
 could not be reset.
 
-**Trigger observed — an in-place model switch, in both occurrences.** Two crashes on the same
-host, five days apart. Each happened while **a model was already resident and a request named a
-different one**, forcing a full engine teardown and re-initialisation. Causation is strongly
-indicated, not proven — but the shared condition is specific, not vague.
+**Three occurrences on this host**, all bugcheck `0x116` with `nvlddmkm.sys` named:
 
-The second crash is worth reading carefully, because it looks like a counter-example and is
-not. Reconstructed from file timestamps: the switch target's GPU caches were written seconds
+| When | Condition at the time | Model |
+|---|---|---|
+| 2026-07-27 20:16 | in-place model switch | — |
+| 2026-07-31 20:34 | in-place model switch | — |
+| 2026-08-01 18:28 | **cold start, nothing resident** | `qwen3-4b-instruct` |
+
+**The shared condition is GPU engine initialisation, not the switch.** That is a correction: the
+first two crashes both involved a switch, and a switch forces an init, so the switch looked
+causal. The third had no switch and no resident model and hung the driver anyway. Causation
+remains indicated rather than proven in all three, but the condition common to them is the
+narrower one.
+
+Establishing the third as a genuine cold start matters, so here is the evidence rather than the
+assertion. A `--check` moments earlier reported the server down. The runtime directory left
+behind held `server.pid`, `watchdog.pid` and one in-flight marker — but **no `loaded-model`**.
+That file is written only after a completion returns, so no request had ever finished on that
+server: it was the first request against a freshly started engine.
+
+The second crash is still worth reading carefully, because it looks like a counter-example and
+is not. Reconstructed from file timestamps: the switch target's GPU caches were written seconds
 before the bugcheck, so a **completed** initialisation preceded the hang — the engine did not
 choke on a malformed load. Note the trap: that model's ML Drift weight cache is legitimately
 **0 bytes**, so its presence after a crash proves nothing about whether the init finished.
 Compare sizes against a known-good run before concluding anything from cache files.
 
-**Rule**: never interleave models in a loop. Stop the server between models:
+**Rule**: still never interleave models in a loop, because a switch stacks a teardown on top of
+an init and remains the worst case. Stop the server between models:
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-client.mjs" --stop
 ```
 
-**This mitigation has been tested, not just asserted.** After the second crash, the identical
-GPU initialisation that preceded it was re-run — same model, same backend — but as a cold start
-with nothing resident, per the rule above. It completed cleanly, twice, with the accelerator
-memory released afterwards. Stop-then-load is the supported path; switching in place is the one
-that has hung the driver.
+**But do not read that as safe.** Earlier revisions of this skill called the mitigation tested,
+on the strength of re-running the identical initialisation as a cold start — same model, same
+backend — twice, cleanly, with memory released afterwards. Those runs happened and that result
+stands; what it does not do is generalise, as 2026-08-01 showed. Stop-then-load is **lower risk,
+not safe**. On this card, treat every GPU engine init as carrying a small chance of taking the
+desktop down: do not trigger one over unsaved work, and do not schedule one where a reboot would
+cost you something.
+
+**When this is expected to stop being true**: the hang is in the display driver, so the thing to
+watch is an NVIDIA driver release, not a `litert-lm` one. Re-test on a driver update before
+assuming any of this still holds.
 
 **After a crash**, state files survive the reboot and lie — dead pids, leaked in-flight
 markers. The client reconciles this automatically on next run, and the test is **boot time as
@@ -46,6 +68,10 @@ well as pid liveness**: pids are reused, so after a reboot a dead client's pid c
 something live and unrelated, which would make a meaningless marker look like a running request
 forever and suppress idle shutdown. A marker written before the current boot is stale whatever
 its pid says. If you are inspecting by hand, do not trust what is in the runtime directory.
+
+That reconciliation was exercised again after the 2026-08-01 crash: the leftover `server.pid`,
+`watchdog.pid` and orphaned in-flight marker were all cleared by the next `--check`, with the
+port confirmed free. Recovery needs no manual cleanup.
 
 ---
 

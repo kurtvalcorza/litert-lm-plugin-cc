@@ -203,12 +203,18 @@ calls but never executes them.
   **`LITERT_LM_PLUGIN_MODEL`** to make a different id the standing default on your machine —
   editing the script instead would be overwritten by the next plugin update. `--check` shows
   when an override is active.
-- ⚠️ **Never switch models in place on the GPU backend.** Two hard crashes on the development
-  host (bugcheck `0x116`, VIDEO_TDR_ERROR, forced reboot) both happened while a model was
-  resident and a request named a different one, forcing teardown and re-init. Causation is
-  indicated, not proven — but the failure mode is severe enough to avoid entirely.
-  Use `/litertlm:stop` between models. That mitigation has been **tested**: the same GPU
-  initialisation that preceded a crash ran clean as a cold start with nothing resident.
+- ⚠️ **GPU engine initialisation has hard-crashed the development host three times.** Bugcheck
+  `0x116` (VIDEO_TDR_ERROR, driver `nvlddmkm.sys`, forced reboot), on 2026-07-27, 2026-07-31 and
+  2026-08-01. The first two happened during an **in-place model switch** — a model resident, a
+  request naming a different one. The third did not: it was a **cold start with nothing
+  resident**, which earlier revisions of this file described as the tested-safe mitigation.
+  Causation is indicated, not proven, in all three.
+  What survives: a switch forces the same initialisation and stacks a teardown on top of it, so
+  still stop the server between models with `/litertlm:stop`. What does not: stopping first makes
+  a crash **less likely, not impossible**. On this card, treat every GPU engine init as carrying
+  a small chance of taking the desktop with it, and do not trigger one over unsaved work. The
+  full record is in the [`litert-lm-troubleshooting`](plugins/litertlm/skills/litert-lm-troubleshooting/SKILL.md)
+  skill.
 - A model whose weights approach total VRAM may pass `litert-lm benchmark` and still fail in
   real use; benchmark does not exercise every section. `serve` cannot cap the context, so such
   a model cannot be served at all.
