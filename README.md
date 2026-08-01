@@ -218,17 +218,20 @@ calls but never executes them.
   **`LITERT_LM_PLUGIN_MODEL`** to make a different id the standing default on your machine —
   editing the script instead would be overwritten by the next plugin update. `--check` shows
   when an override is active.
-- ⚠️ **GPU engine initialisation has hard-crashed the development host three times.** Bugcheck
-  `0x116` (VIDEO_TDR_ERROR, driver `nvlddmkm.sys`, forced reboot), on 2026-07-27, 2026-07-31 and
-  2026-08-01. The first two happened during an **in-place model switch** — a model resident, a
-  request naming a different one. The third did not: it was a **cold start with nothing
-  resident**, which earlier revisions of this file described as the tested-safe mitigation.
-  Causation is indicated, not proven, in all three.
+- ⚠️ **GPU engine initialisation has hard-crashed the development host four times.** Bugcheck
+  `0x116` (VIDEO_TDR_ERROR, driver `nvlddmkm.sys`, forced reboot): 2026-07-27, 2026-07-31, and
+  twice on 2026-08-01. The first two happened during an **in-place model switch** — a model
+  resident, a request naming a different one. The last two did not: both were **cold starts with
+  nothing resident**, the path earlier revisions of this file called the tested-safe mitigation.
+  They were also **the only two cold-start attempts made that day**, so on this host the
+  mitigated path is currently two for two at crashing, not merely "not proven safe".
+  Causation is indicated, not proven, throughout.
   What survives: a switch forces the same initialisation and stacks a teardown on top of it, so
-  still stop the server between models with `/litertlm:stop`. What does not: stopping first makes
-  a crash **less likely, not impossible**. On this card, treat every GPU engine init as carrying
-  a small chance of taking the desktop with it, and do not trigger one over unsaved work. The
-  full record is in the [`litert-lm-troubleshooting`](plugins/litertlm/skills/litert-lm-troubleshooting/SKILL.md)
+  still stop the server between models with `/litertlm:stop`. What does not: any claim that
+  stopping first makes this safe. On this card, treat a GPU engine init as likely to take the
+  desktop with it, and do not trigger one over unsaved work. **A GPU is optional here** — CPU is
+  several times slower and has never done this. The full record, including what a crash leaves
+  behind, is in the [`litert-lm-troubleshooting`](plugins/litertlm/skills/litert-lm-troubleshooting/SKILL.md)
   skill.
 - A model whose weights approach total VRAM may pass `litert-lm benchmark` and still fail in
   real use; benchmark does not exercise every section. `serve` cannot cap the context, so such

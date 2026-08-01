@@ -16,14 +16,16 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 // The marker rule lives in one file so this and the watchdog cannot drift apart.
-import { pidAlive, reapMarkers } from './marker-state.mjs';
+// BOOT_TIME_MS comes from there too: the pid files need the same boot-session test
+// the markers already get, and one definition of "before this boot" is the point.
+import { BOOT_TIME_MS, pidAlive, reapMarkers } from './marker-state.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -139,9 +141,36 @@ function pruneInFlight(port) {
 
 const touchActivity = (port) => writeState(port, 'last-activity', Date.now());
 
+/** When a state file was last written, or null if it is not there. */
+function stateWrittenAt(port, name) {
+  try { return statSync(statePath(port, name)).mtimeMs; } catch { return null; }
+}
+
+/**
+ * The pid recorded under `name`, but only if it is ours to believe.
+ *
+ * Two tests, both required — the same pair `markerIsStale` applies to in-flight
+ * markers, for the same reason. Pid liveness is exact only WITHIN one boot session:
+ * the OS reuses pids, so after a reboot a dead server's pid can belong to something
+ * unrelated and very much alive.
+ *
+ * That is not theoretical. After the 0x116 bugcheck of 2026-08-01 20:49 this host
+ * came back with `server.pid` naming a running Discord and `watchdog.pid` naming a
+ * running VS Code, both files written two minutes before boot. Believing them cost
+ * two things: `startWatchdog` saw a supervisor that did not exist and never started
+ * one, so the server would have held accelerator memory until stopped by hand; and
+ * `stopProcesses` would have sent SIGTERM to both of those applications.
+ *
+ * marker-state.mjs already warned about exactly this and noted an earlier crash had
+ * survived it "only because the pid happened not to be reused". The rule was right;
+ * it was simply not applied here.
+ */
 const livePid = (port, name) => {
   const pid = Number.parseInt(readState(port, name, ''), 10);
-  return pidAlive(pid) ? pid : null;
+  if (!pidAlive(pid)) return null;
+  const writtenAt = stateWrittenAt(port, name);
+  if (writtenAt !== null && writtenAt < BOOT_TIME_MS) return null;   // pre-boot: a reused pid
+  return pid;
 };
 
 /**
@@ -409,15 +438,21 @@ function pidsOnPort(port) {
  *
  * `ours` says whether a litert-lm-shaped server actually answered on this port. It
  * gates killing whoever owns the socket, because that step is otherwise a licence
- * to terminate an arbitrary process: the port is a guess, not an identity. Pids we
- * recorded ourselves are always fair game — we started them.
+ * to terminate an arbitrary process: the port is a guess, not an identity.
+ *
+ * The recorded pids used to be exempt from that scepticism — "we started them", so
+ * they were signalled unconditionally. A reboot breaks that claim: the pid outlives
+ * the file only as a number, and the OS hands it to someone else. Going through
+ * livePid applies the boot-session test, so a pre-boot file names nobody now.
+ * Without it, `--stop` after a crash is a coin toss over which of your applications
+ * receives a SIGTERM.
  */
 async function stopProcesses(opts, ours) {
   const port = opts.port;
 
   const recorded = ['watchdog.pid', 'server.pid']
-    .map((n) => Number.parseInt(readState(port, n, ''), 10))
-    .filter((n) => Number.isInteger(n) && n > 0);
+    .map((n) => livePid(port, n))
+    .filter((n) => n !== null);
 
   for (const pid of [...recorded, ...(ours ? pidsOnPort(port) : [])]) {
     try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
