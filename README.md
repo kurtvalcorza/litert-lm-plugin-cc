@@ -138,10 +138,26 @@ Two consequences:
   the same family and you have one perspective twice, reading as agreement it never earned.
   Different weights are the whole point.
 
-Pointing it at a pushed branch, use the branch range. `/litertlm:review` reads
-`git diff HEAD` — uncommitted work — which on an already-committed branch is empty. It stops
-rather than invent findings, which is correct, but an empty pass and a clean pass look
-identical if you are not watching for the difference.
+Both of those situations reach for the **client directly**, not the slash command.
+`/litertlm:review` is agent-interpreted — Claude Code runs the pipeline and screens the output —
+so it is unavailable in precisely the conditions that make a local pass attractive. The client
+needs neither Claude nor a network:
+
+```bash
+git diff main...HEAD | node plugins/litertlm/scripts/litertlm-client.mjs \
+  --system "You are a concise code reviewer. Report only concrete defects: bugs, unhandled
+errors, security issues. Cite the line. If you find nothing, say so plainly." \
+  --max-tokens 1200 "Review this diff."
+```
+
+That also settles the range question. `/litertlm:review` reads `git diff HEAD` — uncommitted
+work — and its argument is a focus string, not a diff range, so on an already-committed branch
+it stops with nothing to read. Correct behaviour, but an empty pass and a clean pass look
+identical if you are not watching for the difference. Piping the range yourself avoids both.
+
+**Running the client directly means you do the screening.** Nothing sits between the model and
+you: verify every claim against the actual code before repeating it, and say plainly how many
+did not survive.
 
 ### Deliberately out of scope
 
