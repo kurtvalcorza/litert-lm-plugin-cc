@@ -138,26 +138,26 @@ Two consequences:
   the same family and you have one perspective twice, reading as agreement it never earned.
   Different weights are the whole point.
 
-Both of those situations reach for the **client directly**, not the slash command.
+Both of those situations need the **client directly**, not the slash command.
 `/litertlm:review` is agent-interpreted — Claude Code runs the pipeline and screens the output —
 so it is unavailable in precisely the conditions that make a local pass attractive. The client
-needs neither Claude nor a network:
+itself needs neither Claude nor a network: it reads a diff on stdin and writes the model's reply
+to stdout.
 
-```bash
-git diff main...HEAD | node plugins/litertlm/scripts/litertlm-client.mjs \
-  --system "You are a concise code reviewer. Report only concrete defects: bugs, unhandled
-errors, security issues. Cite the line. If you find nothing, say so plainly." \
-  --max-tokens 1200 "Review this diff."
-```
+There is no turnkey offline command yet. Driving the client by hand means owning four things the
+slash command otherwise handles:
 
-That also settles the range question. `/litertlm:review` reads `git diff HEAD` — uncommitted
-work — and its argument is a focus string, not a diff range, so on an already-committed branch
-it stops with nothing to read. Correct behaviour, but an empty pass and a clean pass look
-identical if you are not watching for the difference. Piping the range yourself avoids both.
+- **Finding it.** After a marketplace install the client lives under the plugin's cache
+  directory, not inside the repository you are reviewing.
+- **A valid range.** `git diff <base>...HEAD` fails into an *empty pipe* when the base is not a
+  local ref — the client then reviews nothing and can still answer. An empty pass and a clean
+  pass look identical if you are not watching for the difference.
+- **Your shell.** The examples in `commands/review.md` are Bash; PowerShell needs its own form.
+- **Size.** An oversized diff is only partially attended to, with no indication of what was
+  skipped. Narrow to a path.
 
-**Running the client directly means you do the screening.** Nothing sits between the model and
-you: verify every claim against the actual code before repeating it, and say plainly how many
-did not survive.
+**And the screening.** Nothing sits between the model and you: verify every claim against the
+actual code before repeating it, and say plainly how many did not survive.
 
 ### Deliberately out of scope
 
