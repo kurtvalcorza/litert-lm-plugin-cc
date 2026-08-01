@@ -10,7 +10,7 @@
  * Contract: specs/001-local-gemma-plugin/contracts/runtime-state.md
  *
  * Dependency-free by constitution (Principle III): Node standard library only.
- * Started detached by gemma-client.mjs; never invoked by a user directly.
+ * Started detached by litertlm-client.mjs; never invoked by a user directly.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -76,11 +76,11 @@ function pidAlive(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-/** When this host last booted. Computed once — see gemma-client.mjs. */
+/** When this host last booted. Computed once — see litertlm-client.mjs. */
 const BOOT_TIME_MS = Date.now() - uptime() * 1000;
 
 /**
- * Count live in-flight requests by marker file (see gemma-client.mjs).
+ * Count live in-flight requests by marker file (see litertlm-client.mjs).
  *
  * Each marker is named `<pid>-<timestamp>`. A dead owner means the marker is stale,
  * but that test alone is only sound WITHIN one boot session: pids are reused, so
@@ -123,7 +123,7 @@ async function serverReachable() {
 }
 
 /**
- * Find whatever process is listening on the port (mirrors gemma-client.mjs).
+ * Find whatever process is listening on the port (mirrors litertlm-client.mjs).
  *
  * litert-lm is a two-stage launcher: the pid we recorded is often not the process
  * holding the socket, so the recorded pid alone is not enough to stop it.

@@ -26,7 +26,7 @@ The interesting section is `tf_lite_prefill_decode`. If it carries no `backend_c
 key, that absence *is* the bug — the resolver falls back to `cpu`. Audio and vision adapter
 sections carry their own `backend_constraint = cpu`, which is genuine and must not be touched.
 
-Anything resolving to `cpu` that you want on the accelerator → `/gemma:setup` step 3 walks
+Anything resolving to `cpu` that you want on the accelerator → `/litertlm:setup` step 3 walks
 through the repair, which is dry-runnable, reversible, and leaves the payload untouched.
 
 ## Things worth telling the user
@@ -34,7 +34,7 @@ through the repair, which is dry-runnable, reversible, and leaves the payload un
 **One model is resident at a time.** Naming a different model in a request tears the engine
 down and re-initialises it — tens of seconds. **Never interleave models in a loop on the GPU
 backend**: repeated re-initialisation has been observed to hang the display driver (bugcheck
-`0x116`, VIDEO_TDR_ERROR, on an RTX 5070 Ti Laptop GPU). Run `/gemma:stop` between models
+`0x116`, VIDEO_TDR_ERROR, on an RTX 5070 Ti Laptop GPU). Run `/litertlm:stop` between models
 instead of switching in place.
 
 **Disk cost is roughly double the model size** once both backends have been exercised. Each

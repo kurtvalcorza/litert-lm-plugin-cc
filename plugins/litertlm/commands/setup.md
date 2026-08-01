@@ -128,7 +128,7 @@ python "${CLAUDE_PLUGIN_ROOT}/tools/payload_checksum.py" <path-to-model.litertlm
 ## 5. Server reachable
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/gemma-client.mjs" --check
+node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-client.mjs" --check
 ```
 
 `--check` never starts anything, so on a fresh machine the server is down and it can only
@@ -156,7 +156,7 @@ export LITERT_LM_PLUGIN_MODEL=<id>        # Linux / macOS, via your shell profil
 Then prove it end to end:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/gemma-client.mjs" "Reply with exactly: READY"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-client.mjs" "Reply with exactly: READY"
 ```
 
 ## 6. Memory headroom

@@ -1,5 +1,5 @@
 ---
-name: gemma-prompting
+name: litertlm-prompting
 description: How to prompt a small on-device model so it performs. Load this before composing a prompt for the local model — habits that work on frontier models actively hurt here.
 ---
 
@@ -12,7 +12,7 @@ X then do Y" — degrade its output sharply.
 Most "this model is useless" conclusions are prompt problems. Fix the prompt before concluding
 the model can't do it.
 
-*(For how to **report** what it returns, see the `gemma-usage` skill. This skill is about
+*(For how to **report** what it returns, see the `litertlm-usage` skill. This skill is about
 getting a good answer; that one is about not overselling it.)*
 
 ## The rules that matter most

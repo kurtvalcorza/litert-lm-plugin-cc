@@ -35,7 +35,7 @@ Licensed under the MIT License
     templates.
 
     None of this scaffolding ships in the installed plugin; only
-    `plugins/gemma/` is installed.
+    `plugins/litertlm/` is installed.
 
     MIT License
 
@@ -76,7 +76,7 @@ Licensed under the Apache License, Version 2.0
     (`uv tool install litert-lm`); this project starts its server and calls its
     OpenAI-compatible endpoint.
 
-    `plugins/gemma/tools/litertlm_backend.py` additionally imports modules from
+    `plugins/litertlm/tools/litertlm_backend.py` additionally imports modules from
     the user's own LiteRT-LM installation at run time (`litert_lm_cli.model`,
     `litert_lm_builder.litertlm_core`, `litert_lm_builder.litertlm_peek`) in
     order to read and rewrite the metadata header of a `.litertlm` file. No

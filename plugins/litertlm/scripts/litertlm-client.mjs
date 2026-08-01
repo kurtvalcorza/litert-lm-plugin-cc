@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * gemma-client — call a local LiteRT-LM model from Claude Code.
+ * litertlm-client — call a local LiteRT-LM model from Claude Code.
  *
  * `litert-lm serve` exposes an OpenAI-compatible API. This wraps it so a local
  * model can be invoked as a one-shot command, starting the server on demand and
@@ -27,7 +27,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULTS = {
   host: '127.0.0.1',
   port: 9379,
-  // Must match the id `/gemma:setup` tells a new user to import as. A default
+  // Must match the id `/litertlm:setup` tells a new user to import as. A default
   // naming some other id makes the very first call fail with "model not found",
   // so the SHIPPED value is not a preference — it is a contract with setup.md.
   //
@@ -294,7 +294,7 @@ async function probe(opts, timeoutMs = 2000) {
  */
 async function awaitNotStopping(opts) {
   if (readState(opts.port, 'stopping') === null) return false;
-  process.stderr.write('[gemma] server is shutting down; waiting for it to exit...\n');
+  process.stderr.write('[litertlm] server is shutting down; waiting for it to exit...\n');
   for (let i = 0; i < 40; i++) {
     await sleep(500);
     if (readState(opts.port, 'stopping') === null) return true;
@@ -319,7 +319,7 @@ function startWatchdog(opts) {
     );
     child.unref();
   } catch {
-    process.stderr.write('[gemma] warning: idle watchdog failed to start; the server will '
+    process.stderr.write('[litertlm] warning: idle watchdog failed to start; the server will '
       + 'stay resident until you run --stop.\n');
   }
 }
@@ -365,11 +365,11 @@ async function ensureServer(opts) {
       ? Math.max(1, Math.round((Date.now() - stoppedIdleAt) / 1000))
       : null;
     process.stderr.write(
-      '[gemma] the server had been stopped to free accelerator memory after going idle'
+      '[litertlm] the server had been stopped to free accelerator memory after going idle'
       + `${agoS === null ? '' : ` (${agoS}s ago)`}; restarting it, so this request pays engine `
       + 'initialisation and is slower than usual. Later calls will be fast.\n');
   } else {
-    process.stderr.write(`[gemma] starting litert-lm server on ${baseUrl(opts)} ...\n`);
+    process.stderr.write(`[litertlm] starting litert-lm server on ${baseUrl(opts)} ...\n`);
   }
 
   const exe = resolveLitertLm();
@@ -532,11 +532,11 @@ async function chat(opts) {
 // ---------------------------------------------------------------------------
 
 const HELP = `
-gemma-client — call a local LiteRT-LM model (OpenAI-compatible, offline)
+litertlm-client — call a local LiteRT-LM model (OpenAI-compatible, offline)
 
 Usage:
-  gemma-client [options] "<prompt>"
-  <stdin> | gemma-client [options] ["<prompt>"]
+  litertlm-client [options] "<prompt>"
+  <stdin> | litertlm-client [options] ["<prompt>"]
 
 Options:
   --model <id>        Imported model id (default: ${DEFAULTS.model})
@@ -582,7 +582,7 @@ async function main() {
       process.stdout.write('Server was not running; state cleared.\n');
       if (strangers.length) {
         process.stderr.write(
-          `[gemma] note: pid ${strangers.join(', ')} is listening on port ${opts.port} but did `
+          `[litertlm] note: pid ${strangers.join(', ')} is listening on port ${opts.port} but did `
           + 'not answer /v1/models, so it is not this plugin\'s server and was left alone.\n'
           + `  If you meant to free the port, stop that process yourself, or use --port <n>.\n`);
       }
@@ -651,9 +651,9 @@ async function main() {
   const loaded = readState(opts.port, 'loaded-model');
   if (loaded && loaded !== opts.model) {
     process.stderr.write(
-      `[gemma] '${opts.model}' is not the resident model ('${loaded}'). The engine holds one `
+      `[litertlm] '${opts.model}' is not the resident model ('${loaded}'). The engine holds one `
       + 'model at a time, so this forces a full teardown and re-init — expect tens of seconds.\n'
-      + '[gemma] Do NOT interleave models in a loop on the GPU backend: repeated re-init has '
+      + '[litertlm] Do NOT interleave models in a loop on the GPU backend: repeated re-init has '
       + 'been observed to hang the display driver (bugcheck 0x116, VIDEO_TDR_ERROR). Stop the '
       + 'server between models instead: --stop\n');
   }
@@ -696,6 +696,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  process.stderr.write(`[gemma] ${err.message}\n`);
+  process.stderr.write(`[litertlm] ${err.message}\n`);
   process.exit(err instanceof UsageError ? 2 : 1);
 });

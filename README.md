@@ -32,7 +32,7 @@ Measured here, same prompt, same model, warm server:
 *gemma4-e4b, RTX 5070 Ti Laptop GPU (12 GB), Windows 11, litert-lm 0.14.0. Warm server,
 steady state — a first call after idle is slower because it pays engine initialisation.*
 
-`/gemma:setup` finds affected models and offers to repair them. The repair rewrites **only the
+`/litertlm:setup` finds affected models and offers to repair them. The repair rewrites **only the
 16 KB metadata header**; the multi-gigabyte payload is never touched, which is verifiable, and
 the change is reversible.
 
@@ -49,7 +49,7 @@ the change is reversible.
 ### Hardware
 
 **A GPU is optional.** Without one everything works, just several times slower — that is the
-expected behaviour, not a fault, and `/gemma:setup` will say so rather than offering a repair
+expected behaviour, not a fault, and `/litertlm:setup` will say so rather than offering a repair
 that would make no sense.
 
 Verified on: **Windows 11 + NVIDIA RTX 5070 Ti Laptop GPU (12 GB)** end to end, and **Linux
@@ -58,7 +58,7 @@ Verified on: **Windows 11 + NVIDIA RTX 5070 Ti Laptop GPU (12 GB)** end to end, 
 | Setup | Expectation |
 |---|---|
 | NVIDIA, any recent card | should work; VRAM must exceed the model size with headroom |
-| **No GPU** | works on CPU; `/gemma:setup` skips the repair step entirely |
+| **No GPU** | works on CPU; `/litertlm:setup` skips the repair step entirely |
 | AMD / Intel GPU | LiteRT-LM's backend is cross-platform, but **untested here**. The plugin's checks use `nvidia-smi`, so it will report "no accelerator" and treat you as CPU-only — conservative, not wrong |
 | macOS / Apple Silicon | LiteRT-LM ships macOS arm64 builds; the plugin's tooling has **never been run there** |
 
@@ -69,7 +69,7 @@ reporting no accelerator rather than anything breaking.
 
 ```
 /plugin marketplace add kurtvalcorza/litert-lm-plugin-cc
-/plugin install gemma@litert-lm-local
+/plugin install litertlm@litert-lm-local
 ```
 
 This repository is its own marketplace — it is not listed in any vendor catalogue. Updates come
@@ -80,18 +80,18 @@ through the same mechanism.
 Then:
 
 ```
-/gemma:setup
+/litertlm:setup
 ```
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `/gemma:ask` | Ask the local model a question |
-| `/gemma:setup` | Check the stack; offer to repair CPU-fallback models |
-| `/gemma:models` | List models and the backend each will *actually* use |
-| `/gemma:review` | Offline second-opinion pass over your diff |
-| `/gemma:stop` | Stop the server, release accelerator memory now |
+| `/litertlm:ask` | Ask the local model a question |
+| `/litertlm:setup` | Check the stack; offer to repair CPU-fallback models |
+| `/litertlm:models` | List models and the backend each will *actually* use |
+| `/litertlm:review` | Offline second-opinion pass over your diff |
+| `/litertlm:stop` | Stop the server, release accelerator memory now |
 
 ## Skills
 
@@ -100,10 +100,10 @@ place and cannot drift.
 
 | Skill | Load it when |
 |---|---|
-| [`gemma-usage`](plugins/gemma/skills/gemma-usage/SKILL.md) | Reporting anything the model produced — the honesty policy |
-| [`gemma-prompting`](plugins/gemma/skills/gemma-prompting/SKILL.md) | Composing a prompt — a 4B model needs a different shape |
-| [`litert-lm-troubleshooting`](plugins/gemma/skills/litert-lm-troubleshooting/SKILL.md) | Something is wrong — failure catalogue by symptom |
-| [`litertlm-format`](plugins/gemma/skills/litertlm-format/SKILL.md) | Debugging or extending the repair tool — container internals |
+| [`litertlm-usage`](plugins/litertlm/skills/litertlm-usage/SKILL.md) | Reporting anything the model produced — the honesty policy |
+| [`litertlm-prompting`](plugins/litertlm/skills/litertlm-prompting/SKILL.md) | Composing a prompt — a 4B model needs a different shape |
+| [`litert-lm-troubleshooting`](plugins/litertlm/skills/litert-lm-troubleshooting/SKILL.md) | Something is wrong — failure catalogue by symptom |
+| [`litertlm-format`](plugins/litertlm/skills/litertlm-format/SKILL.md) | Debugging or extending the repair tool — container internals |
 
 ## What this is honest about
 
@@ -114,7 +114,7 @@ or piped in does not exist to it.
 The default is Gemma 4 E4B, roughly a 4B-class model. Treat its output as a cheap offline
 second opinion, never as authority. Fluent, confident prose is the *expected* failure mode of a
 small model, not evidence of correctness. That policy lives in one place —
-[`gemma-usage`](plugins/gemma/skills/gemma-usage/SKILL.md) — and every command references it
+[`litertlm-usage`](plugins/litertlm/skills/litertlm-usage/SKILL.md) — and every command references it
 rather than restating it, so the guidance cannot drift toward overclaiming.
 
 **Good for**: offline work, zero API spend, privacy-sensitive text, explaining a snippet or
@@ -136,7 +136,7 @@ calls but never executes them.
 - The server starts on demand and **stops itself after 15 minutes idle**, releasing VRAM. The
   next question restarts it transparently. `--idle-timeout 0` disables this.
 - **One model is resident at a time.** Naming another forces a full engine reload.
-- The default model is `gemma4-e4b`, matching what `/gemma:setup` imports. Set
+- The default model is `gemma4-e4b`, matching what `/litertlm:setup` imports. Set
   **`LITERT_LM_PLUGIN_MODEL`** to make a different id the standing default on your machine —
   editing the script instead would be overwritten by the next plugin update. `--check` shows
   when an override is active.
@@ -144,7 +144,7 @@ calls but never executes them.
   host (bugcheck `0x116`, VIDEO_TDR_ERROR, forced reboot) both happened while a model was
   resident and a request named a different one, forcing teardown and re-init. Causation is
   indicated, not proven — but the failure mode is severe enough to avoid entirely.
-  Use `/gemma:stop` between models. That mitigation has been **tested**: the same GPU
+  Use `/litertlm:stop` between models. That mitigation has been **tested**: the same GPU
   initialisation that preceded a crash ran clean as a cold start with nothing resident.
 - A model whose weights approach total VRAM may pass `litert-lm benchmark` and still fail in
   real use; benchmark does not exercise every section. `serve` cannot cap the context, so such
@@ -157,7 +157,10 @@ Inc.), whose scaffolding is redistributed here under `.specify/` and `.claude/sk
 — see [NOTICE](NOTICE). None of it ships in the installed plugin.
 
 The constitution, spec, plan, contracts, and task breakdown are this project's own and live in
-[`specs/001-local-gemma-plugin/`](specs/001-local-gemma-plugin/);
+[`specs/001-local-gemma-plugin/`](specs/001-local-gemma-plugin/). Those documents predate the
+0.2.0 rename and still say `gemma` — the plugin was originally named for its default model.
+They are left as written, because a specification is a record of what was decided at the time,
+not a document to retrofit;
 [`quickstart.md`](specs/001-local-gemma-plugin/quickstart.md) contains runnable verification
 scenarios for every claim above.
 

@@ -16,7 +16,7 @@ reporting nothing.
 Otherwise send it:
 
 ```bash
-git diff HEAD | node "${CLAUDE_PLUGIN_ROOT}/scripts/gemma-client.mjs" \
+git diff HEAD | node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-client.mjs" \
   --system "You are a concise code reviewer. Report only concrete defects: bugs, unhandled errors, security issues. Cite the line. If you find nothing, say so plainly." \
   --max-tokens 1200 \
   "Review this diff. Focus: $ARGUMENTS"
@@ -28,7 +28,7 @@ part of an oversized input.
 
 ## Screening the output — this is the work
 
-**Load the `gemma-usage` skill and follow it.** What follows is only the diff-specific part.
+**Load the `litertlm-usage` skill and follow it.** What follows is only the diff-specific part.
 
 This is a small on-device model reading a diff **with no repository context**. It cannot open
 another file, resolve an import, run a test, or check whether a function it suspects is called

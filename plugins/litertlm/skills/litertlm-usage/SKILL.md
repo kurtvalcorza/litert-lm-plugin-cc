@@ -1,5 +1,5 @@
 ---
-name: gemma-usage
+name: litertlm-usage
 description: How to present output from the local LiteRT-LM model honestly. Load this before relaying anything the local model produced.
 ---
 

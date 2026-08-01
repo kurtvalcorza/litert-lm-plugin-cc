@@ -5,7 +5,7 @@ description: Stop the local model server and release accelerator memory now
 Shut the server down and free the VRAM it is holding.
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/gemma-client.mjs" --stop
+node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-client.mjs" --stop
 ```
 
 This kills both the server and its idle watchdog, then clears the runtime state files. It

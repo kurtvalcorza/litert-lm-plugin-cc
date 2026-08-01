@@ -31,7 +31,7 @@ Compare sizes against a known-good run before concluding anything from cache fil
 **Rule**: never interleave models in a loop. Stop the server between models:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/gemma-client.mjs" --stop
+node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-client.mjs" --stop
 ```
 
 **This mitigation has been tested, not just asserted.** After the second crash, the identical
@@ -62,7 +62,7 @@ resolver falls back to CPU — and `serve` has no `--backend` flag to override i
 python "${CLAUDE_PLUGIN_ROOT}/tools/litertlm_backend.py" resolve
 ```
 
-Anything reporting `cpu` is affected. Fix via `/gemma:setup` step 3, or directly — dry run
+Anything reporting `cpu` is affected. Fix via `/litertlm:setup` step 3, or directly — dry run
 first, it writes nothing:
 
 ```bash
@@ -157,7 +157,7 @@ Expected: it stops itself after the idle period (default 900 s) and the next cal
 transparently. To reclaim immediately:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/gemma-client.mjs" --stop
+node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-client.mjs" --stop
 ```
 
 If memory is still held afterwards, something else owns the port — `--stop` verifies the port
