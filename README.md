@@ -139,11 +139,13 @@ Two consequences:
   was available.
 - **A same-family second opinion is not independent.** Run this alongside a frontier model of
   the same family and you have one perspective twice, reading as agreement it never earned.
-  Different weights are the whole point.
+  Different weights are the whole point — and that is a question of *which model answers*, not
+  of how you invoke it. The slash command is fine here, provided the configured local model
+  differs in family from your primary one.
 
-Both of those situations need something that runs **without Claude Code**. `/litertlm:review` is
-agent-interpreted — Claude Code assembles the pipeline and screens the output — so it is
-unavailable in precisely the conditions that make a local pass attractive.
+**The first case is the one that needs something running without Claude Code**, because
+`/litertlm:review` is agent-interpreted — Claude Code runs the pipeline and screens the output —
+so it is unavailable in precisely the conditions that make a local pass attractive.
 
 That is what `litertlm-review.mjs` is for. One command, no agent, no network. Run it from the
 repository you want the pass over:
@@ -172,9 +174,9 @@ Four things it owns that a hand-typed pipeline gets wrong:
   versioned path, not in the repository you are reviewing. The launcher resolves it from its
   own location rather than from yours.
 - **The range.** `git diff <base>...HEAD | client` puts the failure on the *left of a pipe*: git
-  exits 128, the pipe still opens, and the client answers from empty stdin. Bases are checked
-  with `rev-parse` and `merge-base` before anything is sent, and a bad one is reported alongside
-  the bases that would have worked.
+  exits 128, the pipe still opens, the client receives an empty diff, and the model can still
+  return a response. Bases are checked with `rev-parse` and `merge-base` before anything is sent,
+  and a bad one is reported alongside the bases that would have worked.
 - **Nothing to review.** An empty diff exits 3 without invoking the model, because an empty pass
   and a clean pass read identically.
 - **Size.** Past 32 KB it refuses and names the files responsible. `--allow-oversize` sends it
