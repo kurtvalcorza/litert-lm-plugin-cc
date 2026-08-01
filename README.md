@@ -156,14 +156,20 @@ if ($r) { node $r.FullName } else { Write-Error "litertlm-review.mjs not found �
 ```
 
 ```bash
-r=$(ls -1t ~/.claude/plugins/cache/litert-lm-local/litertlm/*/scripts/litertlm-review.mjs 2>/dev/null | head -1)
-node "${r:?litertlm-review.mjs not found — needs plugin 0.3.0 or later}"
+r=$(command ls -1t ~/.claude/plugins/cache/litert-lm-local/litertlm/*/scripts/litertlm-review.mjs 2>/dev/null | head -1)
+[ -f "$r" ] && node "$r" || echo "litertlm-review.mjs not found — needs plugin 0.3.0 or later" >&2
 ```
 
-**The guard on those is not decoration.** Written as a bare `node "$(...)"`, a glob that matches
+**Neither line is written defensively for show.** A bare `node "$(...)"` whose glob matches
 nothing expands to `node ""`, and Node then opens its REPL and waits on stdin — no output, no
-error, no exit. You would sit there believing it was thinking. Since the script first ships in
-**0.3.0**, that is exactly what an un-updated install would do.
+error, no exit, and you sit there believing it is thinking. Since the script first ships in
+**0.3.0**, that is what an un-updated install would do.
+
+`command ls` is load-bearing too. Git Bash ships `alias ls='ls -F …'`, and `-F` appends `*` to
+anything executable — which these scripts are — so a plain `ls` hands Node a path ending in an
+asterisk and it fails with `Cannot find module`. `command` bypasses the alias. The `-f` test
+then checks the result is a real file, which an emptiness check alone cannot do: a path that is
+wrong is still non-empty.
 
 It is Node rather than shell, so the invocation itself is the same under PowerShell, cmd and a
 POSIX shell — only the line that locates it differs. Any installed version from 0.3.0 will do,
