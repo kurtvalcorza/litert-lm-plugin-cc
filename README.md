@@ -148,8 +148,12 @@ calls but never executes them.
 
 ## Development
 
-Built specification-first. The constitution, spec, plan, contracts, and task breakdown are in
-[`specs/001-local-gemma-plugin/`](specs/001-local-gemma-plugin/), and
+Built specification-first with [Spec Kit](https://github.com/github/spec-kit) (MIT, © GitHub,
+Inc.), whose scaffolding is redistributed here under `.specify/` and `.claude/skills/speckit-*`
+— see [NOTICE](NOTICE). None of it ships in the installed plugin.
+
+The constitution, spec, plan, contracts, and task breakdown are this project's own and live in
+[`specs/001-local-gemma-plugin/`](specs/001-local-gemma-plugin/);
 [`quickstart.md`](specs/001-local-gemma-plugin/quickstart.md) contains runnable verification
 scenarios for every claim above.
 
