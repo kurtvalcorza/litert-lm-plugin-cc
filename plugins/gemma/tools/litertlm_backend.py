@@ -74,7 +74,26 @@ import os
 import struct
 import sys
 
-MAIN_TYPES = ("tf_lite_prefill_decode", "artisan_text_decoder")
+# Main-section model types, verbatim from litert_lm_builder.TfLiteModelType. An
+# earlier version wrote "artisan_text_decoder" without the "tf_lite_" prefix, which
+# matches nothing: the real value is below. That typo made every artisan model look
+# like it had no main section at all.
+PREFILL_DECODE = "tf_lite_prefill_decode"
+ARTISAN_TEXT_DECODER = "tf_lite_artisan_text_decoder"
+MAIN_TYPES = (PREFILL_DECODE, ARTISAN_TEXT_DECODER)
+
+# Artisan models are NOT patchable, and do not need to be.
+#
+# litert_lm_cli.model.model_default_backend() short-circuits on this type:
+#
+#     if model_type_lower == TfLiteModelType.ARTISAN_TEXT_DECODER.value:
+#         return "gpu"
+#
+# It returns before reading backend_constraint, so the key is never consulted for
+# these models — writing one changes nothing. They also cannot fall into the CPU
+# trap this tool exists for, because that branch always yields "gpu". A model of
+# this type carrying `backend_constraint = gpu_artisan` is therefore inert metadata,
+# not a setting: leave it alone.
 KEY = "backend_constraint"
 
 
@@ -237,6 +256,15 @@ def repack(buf, backend=None):
             if model_type not in MAIN_TYPES:
                 continue
 
+            if model_type == ARTISAN_TEXT_DECODER:
+                # The resolver hardcodes "gpu" for this type before it ever looks at
+                # backend_constraint, so a write here would be a no-op that merely
+                # looked like a fix. Say so instead of doing it.
+                changed.append(f"{model_type}: SKIPPED — the resolver returns 'gpu' for "
+                               "artisan models without reading backend_constraint, so "
+                               "there is nothing here to repair")
+                continue
+
             existing = next((it for it in sec.items if _text(it.key) == KEY), None)
             if existing is not None:
                 if _text(existing.value.value) == backend:
@@ -331,7 +359,26 @@ def _validate(path, backend):
 
 
 def cmd_check(args):
-    _validate(args.model, args.backend)
+    _, _, changed, fits = _validate(args.model, args.backend)
+
+    # A dry run that matched no section used to print "FITS" and exit 0, which reads
+    # as "ready to patch" — then the real patch aborts with "no main section found".
+    # A check that cannot fail is not a check. Exit non-zero and say which case it is.
+    if not changed:
+        raise SystemExit(
+            "\nNo section in this file can carry a backend_constraint that the resolver "
+            "would read.\n"
+            "  `patch` would refuse. This is a report, not a failure of the file:\n"
+            "  either it is not a main-model container, or its main section is a type\n"
+            "  whose backend is decided some other way.")
+    if all("SKIPPED" in c for c in changed):
+        # Not a failure. The model is correctly configured and needs no repair;
+        # exiting non-zero here would report a healthy file as a problem.
+        print("\nNothing to repair — this model does not use backend_constraint.")
+        return
+    if not fits:
+        raise SystemExit("\nThe patched header would overrun the first block; "
+                         "`patch` would refuse.")
 
 
 def _backup_path(model):
@@ -425,7 +472,10 @@ def cmd_patch(args):
         raise SystemExit("ABORT: no main section found to patch.")
     if not fits:
         raise SystemExit("ABORT: patched header would overrun the first block.")
-    if all("nothing to do" in c for c in changed):
+    if all("SKIPPED" in c for c in changed):
+        print("Nothing to write — see above.")
+        return
+    if all(("nothing to do" in c or "SKIPPED" in c) for c in changed):
         print("Already correct; no write performed.")
         return
 

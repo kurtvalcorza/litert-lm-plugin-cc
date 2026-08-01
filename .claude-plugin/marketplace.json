@@ -6,13 +6,13 @@
   },
   "metadata": {
     "description": "Unofficial plugin for calling a local on-device model served by LiteRT-LM (Gemma, Qwen, and others) from Claude Code. Not affiliated with Google or Anthropic.",
-    "version": "0.1.5"
+    "version": "0.1.6"
   },
   "plugins": [
     {
       "name": "gemma",
       "description": "Call a local on-device model served by LiteRT-LM from Claude Code — offline, no API tokens. Unofficial.",
-      "version": "0.1.5",
+      "version": "0.1.6",
       "author": {
         "name": "Kurt Valcorza"
       },

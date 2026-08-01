@@ -57,15 +57,29 @@ Section types seen on a multimodal model (~12 sections): `tf_lite_embedder`,
 
 ## How the backend is resolved
 
-`litert_lm_cli.model.model_default_backend()` walks the sections looking for a **main** type
-(`tf_lite_prefill_decode` or `artisan_text_decoder`):
+`litert_lm_cli.model.model_default_backend()` walks the sections looking for a **main** type.
+Both names carry the `tf_lite_` prefix — take them verbatim from
+`litert_lm_builder.TfLiteModelType`, because an abbreviated string silently matches nothing:
 
-1. `artisan_text_decoder` → **`gpu`**, unconditionally.
+| Constant | Value |
+|---|---|
+| `PREFILL_DECODE` | `tf_lite_prefill_decode` |
+| `ARTISAN_TEXT_DECODER` | `tf_lite_artisan_text_decoder` |
+
+1. `tf_lite_artisan_text_decoder` → **`gpu`**, unconditionally — it returns *before* reading
+   `backend_constraint`.
 2. Otherwise, if that section carries `backend_constraint` → its first comma-separated value.
 3. Otherwise → **`cpu`**.
 
 Step 3 is the whole problem. Absence is not neutral; it means CPU. And `litert-lm serve` has no
 `--backend` flag, so nothing downstream can override it.
+
+**Never patch an artisan model.** Step 1 short-circuits, so `backend_constraint` is never
+consulted for them — a write would be a no-op that merely looked like a fix, and they cannot
+fall into the CPU trap in the first place. Such a file may still *carry* a value (observed:
+`backend_constraint = gpu_artisan`, a real member of the backend enum). It is inert metadata
+for resolution purposes, not a setting to correct. `check` reports these as "nothing to repair"
+and `patch` writes nothing.
 
 **Only touch the main section.** Audio and vision adapters carry their own
 `backend_constraint = cpu`, which is genuine — those encoders really do run on CPU, and they
