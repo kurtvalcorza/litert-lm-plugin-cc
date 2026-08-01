@@ -16,25 +16,31 @@ Symptoms first, since that is what you have when you arrive.
 with parameter 3 `0xC000009A` (`STATUS_INSUFFICIENT_RESOURCES`). The display driver hung and
 could not be reset.
 
-**Three occurrences on this host**, all bugcheck `0x116` with `nvlddmkm.sys` named:
+**Four occurrences on this host**, all bugcheck `0x116` with `nvlddmkm.sys` named:
 
 | When | Condition at the time | Model |
 |---|---|---|
 | 2026-07-27 20:16 | in-place model switch | — |
 | 2026-07-31 20:34 | in-place model switch | — |
 | 2026-08-01 18:28 | **cold start, nothing resident** | `qwen3-4b-instruct` |
+| 2026-08-01 20:49 | **cold start, nothing resident** | `qwen3-4b-instruct` |
 
 **The shared condition is GPU engine initialisation, not the switch.** That is a correction: the
 first two crashes both involved a switch, and a switch forces an init, so the switch looked
-causal. The third had no switch and no resident model and hung the driver anyway. Causation
-remains indicated rather than proven in all three, but the condition common to them is the
+causal. The last two had no switch and no resident model and hung the driver anyway. Causation
+remains indicated rather than proven throughout, but the condition common to all four is the
 narrower one.
 
-Establishing the third as a genuine cold start matters, so here is the evidence rather than the
-assertion. A `--check` moments earlier reported the server down. The runtime directory left
-behind held `server.pid`, `watchdog.pid` and one in-flight marker — but **no `loaded-model`**.
-That file is written only after a completion returns, so no request had ever finished on that
-server: it was the first request against a freshly started engine.
+**Those last two were also the only two cold-start attempts made that day.** One cold-start
+crash reads as bad luck; two out of two does not. On this host the mitigated path is not
+"unproven" — it is failing, and the honest expectation for a GPU init here is that it takes the
+desktop with it.
+
+Establishing them as genuine cold starts matters, so here is the evidence rather than the
+assertion. In both cases a `--check` moments earlier reported the server down. The runtime
+directory left behind held `server.pid`, `watchdog.pid` and one in-flight marker — but **no
+`loaded-model`**. That file is written only after a completion returns, so no request had ever
+finished on that server: it was the first request against a freshly started engine.
 
 The second crash is still worth reading carefully, because it looks like a counter-example and
 is not. Reconstructed from file timestamps: the switch target's GPU caches were written seconds
@@ -53,10 +59,13 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-client.mjs" --stop
 **But do not read that as safe.** Earlier revisions of this skill called the mitigation tested,
 on the strength of re-running the identical initialisation as a cold start — same model, same
 backend — twice, cleanly, with memory released afterwards. Those runs happened and that result
-stands; what it does not do is generalise, as 2026-08-01 showed. Stop-then-load is **lower risk,
-not safe**. On this card, treat every GPU engine init as carrying a small chance of taking the
-desktop down: do not trigger one over unsaved work, and do not schedule one where a reboot would
-cost you something.
+stands; what it does not do is generalise, as both 2026-08-01 crashes showed. Stop-then-load is
+**lower risk, not safe**. Do not trigger a GPU init over unsaved work, and do not schedule one
+where a reboot would cost you something.
+
+If you need the model to work today rather than to diagnose the driver, **run it on CPU**. It is
+several times slower and has never done this. `/litertlm:setup` will offer to repair a model to
+GPU; on this host that offer is currently the wrong trade.
 
 **When this is expected to stop being true**: the hang is in the display driver, so the thing to
 watch is an NVIDIA driver release, not a `litert-lm` one. Re-test on a driver update before
@@ -69,9 +78,28 @@ something live and unrelated, which would make a meaningless marker look like a 
 forever and suppress idle shutdown. A marker written before the current boot is stale whatever
 its pid says. If you are inspecting by hand, do not trust what is in the runtime directory.
 
-That reconciliation was exercised again after the 2026-08-01 crash: the leftover `server.pid`,
-`watchdog.pid` and orphaned in-flight marker were all cleared by the next `--check`, with the
-port confirmed free. Recovery needs no manual cleanup.
+**That rule was only half-applied, and the 20:49 crash proved it.** Until 0.3.1 the boot-time
+test guarded in-flight markers only; `server.pid` and `watchdog.pid` were trusted on pid
+liveness alone. After the 18:28 crash reconciliation appeared to work perfectly — but only
+because those pids happened not to be reused. After 20:49 they were:
+
+| File | Written | Pid | What that pid was afterwards |
+|---|---|---|---|
+| `server.pid` | 20:47 | 30684 | a running **Discord** |
+| `watchdog.pid` | 20:47 | 35640 | a running **VS Code** |
+
+Both files predated the 20:48:58 boot, both pids were alive, so both were believed. The cost:
+`startWatchdog` saw a supervisor that did not exist and started none, leaving the server free to
+hold accelerator memory indefinitely — and `--stop` would have sent `SIGTERM` to Discord and VS
+Code, because the recorded pids were signalled without the scepticism applied to the port owner.
+
+Fixed in 0.3.1: `livePid` now requires both tests, and `stopProcesses` goes through it. **If you
+are on 0.3.0 or earlier and have just rebooted from a crash, delete `server.pid` and
+`watchdog.pid` by hand before running anything** — deleting them signals nobody, which is more
+than can be said for `--stop`.
+
+The general lesson is the one this file already stated and the code had not finished acting on:
+after a reboot, a pid in a state file is a number, not an identity.
 
 ---
 
