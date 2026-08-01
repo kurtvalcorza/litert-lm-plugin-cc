@@ -3,28 +3,29 @@ description: Offline second-opinion pass over your uncommitted diff — no API t
 argument-hint: "[optional focus, e.g. 'error handling']"
 ---
 
-Check there is something to review first:
+Run the launcher:
 
 ```bash
-git diff HEAD --stat
+node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-review.mjs" --focus "$ARGUMENTS"
 ```
 
-**If the diff is empty, stop and say so.** Do not fall back to reviewing the last commit or the
-working tree at large — a reviewer given nothing will invent findings, and that is worse than
-reporting nothing.
+It owns the mechanics — resolving the client, validating the range, refusing a diff too large
+to have been read whole, and stopping rather than asking the model about nothing. Do not
+reassemble that pipeline by hand here; the same script is what a user runs when Claude Code is
+unavailable, and two copies of the rules would drift.
 
-Otherwise send it:
+**Read its exit code before its output:**
 
-```bash
-git diff HEAD | node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-client.mjs" \
-  --system "You are a concise code reviewer. Report only concrete defects: bugs, unhandled errors, security issues. Cite the line. If you find nothing, say so plainly." \
-  --max-tokens 1200 \
-  "Review this diff. Focus: $ARGUMENTS"
-```
+| Code | What happened | What to do |
+|---|---|---|
+| 0 | A pass ran | Screen it — see below |
+| 3 | The range was empty | Say so and stop. **Do not** widen the range or review the last commit instead: a reviewer given nothing invents findings, and that is worse than reporting nothing |
+| 4 | Refused as oversized | Relay its narrowing advice. Prefer `--path <pathspec>` over `--allow-oversize`; a partial read that reads as a whole one is the failure being avoided |
+| 2 | Called wrong | Fix the invocation |
+| 1 | Environment failure | Relay the message; it names the missing prerequisite |
 
-Use `git diff --staged` for staged-only, or `git diff main...HEAD` for a whole branch. Narrow
-very large diffs to a path — the model has a finite context and will silently attend to only
-part of an oversized input.
+Other ranges: `--base main` for a whole branch, `--base auto` to let it pick, `--staged` for
+staged changes only. `--dry-run` reports what would be sent without starting anything.
 
 ## Screening the output — this is the work
 

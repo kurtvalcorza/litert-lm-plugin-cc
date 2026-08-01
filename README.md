@@ -93,6 +93,9 @@ Then:
 | `/litertlm:review` | Offline second-opinion pass over your diff |
 | `/litertlm:stop` | Stop the server, release accelerator memory now |
 
+`/litertlm:review` is a thin wrapper over `litertlm-review.mjs`, which also runs on its own when
+Claude Code is not available — see [When it earns its keep](#when-it-earns-its-keep).
+
 ## Skills
 
 Four skills ship with the plugin. Commands load them by reference, so the guidance lives in one
@@ -140,25 +143,56 @@ Two consequences:
   of how you invoke it. The slash command is fine here, provided the configured local model
   differs in family from your primary one.
 
-**The first case is the one that needs the client directly**, because `/litertlm:review` is
-agent-interpreted — Claude Code runs the pipeline and screens the output — so it is unavailable
-in precisely the conditions that make a local pass attractive. The client itself needs neither
-Claude nor a network: it reads a diff on stdin and writes the model's reply to stdout.
+**The first case is the one that needs something running without Claude Code**, because
+`/litertlm:review` is agent-interpreted — Claude Code runs the pipeline and screens the output —
+so it is unavailable in precisely the conditions that make a local pass attractive.
 
-There is no turnkey offline command yet. Driving the client by hand means owning four things the
-slash command otherwise handles:
+That is what `litertlm-review.mjs` is for. One command, no agent, no network. Run it from the
+repository you want the pass over:
 
-- **Finding it.** After a marketplace install the client lives under the plugin's cache
-  directory, not inside the repository you are reviewing.
-- **A valid range.** `git diff <base>...HEAD` fails into an *empty pipe* when the base is not a
-  local ref — the client then receives an empty diff, and the model can still return a response.
-  An empty pass and a clean pass look identical if you are not watching for the difference.
-- **Your shell.** The examples in `commands/review.md` are Bash; PowerShell needs its own form.
-- **Size.** An oversized diff is only partially attended to, with no indication of what was
-  skipped. Narrow to a path.
+```powershell
+$r = Get-ChildItem "$HOME\.claude\plugins\cache\litert-lm-local\litertlm\*\scripts\litertlm-review.mjs" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1
+if ($r) { node $r.FullName } else { Write-Error "litertlm-review.mjs not found — needs plugin 0.3.0 or later" }
+```
 
-**And the screening.** Nothing sits between the model and you: verify every claim against the
-actual code before repeating it, and say plainly how many did not survive.
+```bash
+r=$(ls -1t ~/.claude/plugins/cache/litert-lm-local/litertlm/*/scripts/litertlm-review.mjs 2>/dev/null | head -1)
+node "${r:?litertlm-review.mjs not found — needs plugin 0.3.0 or later}"
+```
+
+**The guard on those is not decoration.** Written as a bare `node "$(...)"`, a glob that matches
+nothing expands to `node ""`, and Node then opens its REPL and waits on stdin — no output, no
+error, no exit. You would sit there believing it was thinking. Since the script first ships in
+**0.3.0**, that is exactly what an un-updated install would do.
+
+It is Node rather than shell, so the invocation itself is the same under PowerShell, cmd and a
+POSIX shell — only the line that locates it differs. Any installed version from 0.3.0 will do,
+since each copy drives its own sibling client; the glob does not have to pick the newest. There
+is no stable path to hardcode, because plugin versions live side by side — if you reach for this
+often, wrap it in a shell function.
+
+It defaults to your uncommitted diff, and takes `--base main` (or `--base auto`) for a whole
+branch, `--staged`, `--path` to narrow, and `--dry-run` to see what would be sent without
+sending it. `--help` lists the rest.
+
+Four things it owns that a hand-typed pipeline gets wrong:
+
+- **Finding the client.** After a marketplace install it sits under the plugin cache at a
+  versioned path, not in the repository you are reviewing. The launcher resolves it from its
+  own location rather than from yours.
+- **The range.** `git diff <base>...HEAD | client` puts the failure on the *left of a pipe*: git
+  exits 128, the pipe still opens, the client receives an empty diff, and the model can still
+  return a response. Bases are checked with `rev-parse` and `merge-base` before anything is sent,
+  and a bad one is reported alongside the bases that would have worked.
+- **Nothing to review.** An empty diff exits 3 without invoking the model, because an empty pass
+  and a clean pass read identically.
+- **Size.** Past 32 KB it refuses and names the files responsible. `--allow-oversize` sends it
+  anyway and stamps the reply as partial coverage — a small model is truncated silently, and
+  neither it nor the launcher can tell you which part went unread.
+
+**What it cannot do is the screening.** Nothing sits between the model and you: verify every
+claim against the actual code before repeating it, and say plainly how many did not survive.
+The launcher prints that obligation after every reply. It cannot discharge it.
 
 ### Deliberately out of scope
 
@@ -178,12 +212,18 @@ calls but never executes them.
   **`LITERT_LM_PLUGIN_MODEL`** to make a different id the standing default on your machine —
   editing the script instead would be overwritten by the next plugin update. `--check` shows
   when an override is active.
-- ⚠️ **Never switch models in place on the GPU backend.** Two hard crashes on the development
-  host (bugcheck `0x116`, VIDEO_TDR_ERROR, forced reboot) both happened while a model was
-  resident and a request named a different one, forcing teardown and re-init. Causation is
-  indicated, not proven — but the failure mode is severe enough to avoid entirely.
-  Use `/litertlm:stop` between models. That mitigation has been **tested**: the same GPU
-  initialisation that preceded a crash ran clean as a cold start with nothing resident.
+- ⚠️ **GPU engine initialisation has hard-crashed the development host three times.** Bugcheck
+  `0x116` (VIDEO_TDR_ERROR, driver `nvlddmkm.sys`, forced reboot), on 2026-07-27, 2026-07-31 and
+  2026-08-01. The first two happened during an **in-place model switch** — a model resident, a
+  request naming a different one. The third did not: it was a **cold start with nothing
+  resident**, which earlier revisions of this file described as the tested-safe mitigation.
+  Causation is indicated, not proven, in all three.
+  What survives: a switch forces the same initialisation and stacks a teardown on top of it, so
+  still stop the server between models with `/litertlm:stop`. What does not: stopping first makes
+  a crash **less likely, not impossible**. On this card, treat every GPU engine init as carrying
+  a small chance of taking the desktop with it, and do not trigger one over unsaved work. The
+  full record is in the [`litert-lm-troubleshooting`](plugins/litertlm/skills/litert-lm-troubleshooting/SKILL.md)
+  skill.
 - A model whose weights approach total VRAM may pass `litert-lm benchmark` and still fail in
   real use; benchmark does not exercise every section. `serve` cannot cap the context, so such
   a model cannot be served at all.
