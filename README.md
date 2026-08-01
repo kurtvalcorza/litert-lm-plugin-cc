@@ -151,12 +151,13 @@ That is what `litertlm-review.mjs` is for. One command, no agent, no network. Ru
 repository you want the pass over:
 
 ```powershell
-$r = Get-ChildItem "$HOME\.claude\plugins\cache\litert-lm-local\litertlm\*\scripts\litertlm-review.mjs" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1
+$r = Get-ChildItem "$HOME\.claude\plugins\cache\litert-lm-local\litertlm\*\scripts\litertlm-review.mjs" -ErrorAction SilentlyContinue | Sort-Object { [version]$_.Directory.Parent.Name } | Select-Object -Last 1
 if ($r) { node $r.FullName } else { Write-Error "litertlm-review.mjs not found — needs plugin 0.3.0 or later" }
 ```
 
 ```bash
-r=$(command ls -1t ~/.claude/plugins/cache/litert-lm-local/litertlm/*/scripts/litertlm-review.mjs 2>/dev/null | head -1)
+d=$(command ls -1 ~/.claude/plugins/cache/litert-lm-local/litertlm 2>/dev/null | sort -V | tail -1)
+r=~/.claude/plugins/cache/litert-lm-local/litertlm/$d/scripts/litertlm-review.mjs
 [ -f "$r" ] && node "$r" || echo "litertlm-review.mjs not found — needs plugin 0.3.0 or later" >&2
 ```
 
@@ -171,11 +172,20 @@ asterisk and it fails with `Cannot find module`. `command` bypasses the alias. T
 then checks the result is a real file, which an emptiness check alone cannot do: a path that is
 wrong is still non-empty.
 
+**Sorting by version, rather than by date, is the third such detail.** Every version installed
+stays in the cache, and the installer preserves file timestamps — so each copy of the launcher
+carries an *identical* mtime and a most-recently-modified sort has nothing to sort on. It does
+not pick badly; it picks arbitrarily. `sort -V` and the `[version]` cast order the directory
+names as versions, which also gets 0.3.10 above 0.3.9 where a plain sort would not.
+
+**Take the newest deliberately.** Each copy does drive its own sibling client, so an old one
+runs — but it runs against that version's client, bugs included. Landing on a stale copy is how
+you end up running a fix you already installed past. There is no stable path to hardcode,
+because the versions live side by side; if you reach for this often, wrap it in a shell
+function.
+
 It is Node rather than shell, so the invocation itself is the same under PowerShell, cmd and a
-POSIX shell — only the line that locates it differs. Any installed version from 0.3.0 will do,
-since each copy drives its own sibling client; the glob does not have to pick the newest. There
-is no stable path to hardcode, because plugin versions live side by side — if you reach for this
-often, wrap it in a shell function.
+POSIX shell — only the line that locates it differs.
 
 It defaults to your uncommitted diff, and takes `--base main` (or `--base auto`) for a whole
 branch, `--staged`, `--path` to narrow, and `--dry-run` to see what would be sent without
@@ -223,13 +233,13 @@ calls but never executes them.
   twice on 2026-08-01. The first two happened during an **in-place model switch** — a model
   resident, a request naming a different one. The last two did not: both were **cold starts with
   nothing resident**, the path earlier revisions of this file called the tested-safe mitigation.
-  They were also **the only two cold-start attempts made that day**, so on this host the
-  mitigated path is currently two for two at crashing, not merely "not proven safe".
-  Causation is indicated, not proven, throughout.
+  Of the **three** cold-start attempts made that day, two crashed and the third completed
+  normally — so a cold start is neither safe nor reliably fatal, and a single clean run proves
+  nothing either way. Causation is indicated, not proven, throughout.
   What survives: a switch forces the same initialisation and stacks a teardown on top of it, so
   still stop the server between models with `/litertlm:stop`. What does not: any claim that
-  stopping first makes this safe. On this card, treat a GPU engine init as likely to take the
-  desktop with it, and do not trigger one over unsaved work. **A GPU is optional here** — CPU is
+  stopping first makes this safe. On this card a GPU engine init carries a real chance of taking
+  the desktop with it — do not trigger one over unsaved work. **A GPU is optional here** — CPU is
   several times slower and has never done this. The full record, including what a crash leaves
   behind, is in the [`litert-lm-troubleshooting`](plugins/litertlm/skills/litert-lm-troubleshooting/SKILL.md)
   skill.
