@@ -136,13 +136,14 @@ Two consequences:
   was available.
 - **A same-family second opinion is not independent.** Run this alongside a frontier model of
   the same family and you have one perspective twice, reading as agreement it never earned.
-  Different weights are the whole point.
+  Different weights are the whole point — and that is a question of *which model answers*, not
+  of how you invoke it. The slash command is fine here, provided the configured local model
+  differs in family from your primary one.
 
-Both of those situations need the **client directly**, not the slash command.
-`/litertlm:review` is agent-interpreted — Claude Code runs the pipeline and screens the output —
-so it is unavailable in precisely the conditions that make a local pass attractive. The client
-itself needs neither Claude nor a network: it reads a diff on stdin and writes the model's reply
-to stdout.
+**The first case is the one that needs the client directly**, because `/litertlm:review` is
+agent-interpreted — Claude Code runs the pipeline and screens the output — so it is unavailable
+in precisely the conditions that make a local pass attractive. The client itself needs neither
+Claude nor a network: it reads a diff on stdin and writes the model's reply to stdout.
 
 There is no turnkey offline command yet. Driving the client by hand means owning four things the
 slash command otherwise handles:
@@ -150,8 +151,8 @@ slash command otherwise handles:
 - **Finding it.** After a marketplace install the client lives under the plugin's cache
   directory, not inside the repository you are reviewing.
 - **A valid range.** `git diff <base>...HEAD` fails into an *empty pipe* when the base is not a
-  local ref — the client then reviews nothing and can still answer. An empty pass and a clean
-  pass look identical if you are not watching for the difference.
+  local ref — the client then receives an empty diff, and the model can still return a response.
+  An empty pass and a clean pass look identical if you are not watching for the difference.
 - **Your shell.** The examples in `commands/review.md` are Bash; PowerShell needs its own form.
 - **Size.** An oversized diff is only partially attended to, with no indication of what was
   skipped. Narrow to a path.
