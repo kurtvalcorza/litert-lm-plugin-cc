@@ -14,10 +14,13 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir, uptime } from 'node:os';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
+
+// The marker rule lives in one file so this and the client cannot drift apart.
+import { pidAlive, reapMarkers } from './marker-state.mjs';
 
 const POLL_INTERVAL_MS = 5000;
 
@@ -71,45 +74,16 @@ function clearState(name) {
   try { rmSync(statePath(name), { force: true }); } catch { /* ignore */ }
 }
 
-function pidAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; } catch { return false; }
-}
-
-/** When this host last booted. Computed once — see litertlm-client.mjs. */
-const BOOT_TIME_MS = Date.now() - uptime() * 1000;
-
 /**
- * Count live in-flight requests by marker file (see litertlm-client.mjs).
+ * Count live in-flight requests, reaping stale markers on the way.
  *
- * Each marker is named `<pid>-<timestamp>`. A dead owner means the marker is stale,
- * but that test alone is only sound WITHIN one boot session: pids are reused, so
- * after a reboot a crashed client's pid can belong to something unrelated and alive.
- * This watchdog would then count a request that does not exist, never reach its idle
- * condition, and hold accelerator memory until someone intervened — the precise
- * outcome it exists to prevent. A marker older than the current boot is therefore
- * stale whatever its pid says.
- *
- * Stale markers are removed here, which is what stops a crashed client pinning
+ * Both the predicate and the traversal come from marker-state.mjs, so this cannot
+ * disagree with the client about which markers are real — the count and the pruning
+ * are one pass under one rule. Reaping here is what stops a crashed client pinning
  * accelerator memory forever.
  */
 function countInFlight() {
-  const dir = join(stateDir(opts.port), 'in-flight.d');
-  let entries;
-  try { entries = readdirSync(dir); } catch { return 0; }
-
-  let live = 0;
-  for (const name of entries) {
-    const [pidPart, tsPart] = name.split('-');
-    const ts = Number.parseInt(tsPart, 10);
-    const preBoot = Number.isFinite(ts) && ts < BOOT_TIME_MS;
-    if (!preBoot && pidAlive(Number.parseInt(pidPart, 10))) {
-      live += 1;
-    } else {
-      try { rmSync(join(dir, name), { force: true }); } catch { /* ignore */ }
-    }
-  }
-  return live;
+  return reapMarkers(join(stateDir(opts.port), 'in-flight.d'));
 }
 
 async function serverReachable() {

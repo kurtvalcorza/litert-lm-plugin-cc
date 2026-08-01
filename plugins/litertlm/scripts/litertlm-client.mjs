@@ -16,11 +16,14 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir, uptime } from 'node:os';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
+
+// The marker rule lives in one file so this and the watchdog cannot drift apart.
+import { pidAlive, reapMarkers } from './marker-state.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -119,39 +122,7 @@ function clearInFlight(port) {
 }
 
 /**
- * When this host last booted, as an epoch millisecond stamp.
- *
- * Computed once: `uptime()` advances while we run, so recomputing would make the
- * boundary drift and two calls could disagree about the same marker.
- */
-const BOOT_TIME_MS = Date.now() - uptime() * 1000;
-
-/**
- * Is this marker dead wood?
- *
- * Pid liveness is exact only WITHIN one boot session. The OS reuses pids, so after
- * a reboot the pid of a client that died in a crash can belong to something
- * unrelated and very much alive — at which point a marker that describes nothing
- * looks live forever, idle shutdown never fires, and the accelerator memory is
- * pinned until someone runs --stop by hand. That is the exact failure this whole
- * mechanism exists to prevent, so "the pid is alive" cannot be the only test.
- *
- * A marker written before the current boot cannot describe a request happening now,
- * whatever its pid says. Observed after a real 0x116 bugcheck: the marker predated
- * boot by two minutes and survived only because the pid happened not to be reused.
- *
- * The timestamp is already in the name, so this costs nothing. If it is unparseable
- * (a marker from some older layout), fall back to the pid test rather than guessing.
- */
-function markerIsStale(name) {
-  const [pidPart, tsPart] = name.split('-');
-  const ts = Number.parseInt(tsPart, 10);
-  if (Number.isFinite(ts) && ts < BOOT_TIME_MS) return true;
-  return !pidAlive(Number.parseInt(pidPart, 10));
-}
-
-/**
- * Drop only markers whose owning process is dead.
+ * Drop stale markers. What counts as stale is defined once, in marker-state.mjs.
  *
  * Never prune by server reachability. A model switch tears the engine down and
  * rebuilds it, so the server is legitimately unreachable for tens of seconds
@@ -161,26 +132,12 @@ function markerIsStale(name) {
  * live client's marker, the watchdog would then count zero in flight, and it would
  * be free to kill the server mid-generation. That is the failure the marker files
  * replaced the in-flight counter to prevent; pruning on reachability reintroduces it.
- *
- * The owning pid is in the name, so liveness is exact and needs no timeout.
  */
 function pruneInFlight(port) {
-  const dir = join(stateDir(port), IN_FLIGHT_DIR);
-  let entries;
-  try { entries = readdirSync(dir); } catch { return; }
-  for (const name of entries) {
-    if (markerIsStale(name)) {
-      try { rmSync(join(dir, name), { force: true }); } catch { /* ignore */ }
-    }
-  }
+  reapMarkers(join(stateDir(port), IN_FLIGHT_DIR));   // live count is the watchdog's concern
 }
 
 const touchActivity = (port) => writeState(port, 'last-activity', Date.now());
-
-function pidAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; } catch { return false; }
-}
 
 const livePid = (port, name) => {
   const pid = Number.parseInt(readState(port, name, ''), 10);

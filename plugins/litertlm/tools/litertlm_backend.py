@@ -241,8 +241,28 @@ def _text(v):
     return v.decode() if isinstance(v, bytes) else v
 
 
+# Outcomes for one main section, as data rather than prose.
+#
+# Callers branch on these. An earlier version branched on substrings of the
+# human-readable message instead ("SKIPPED" in c, "nothing to do" in c), which made
+# behaviour depend on wording — rephrasing a sentence for clarity would silently
+# change control flow. This file has already been bitten once by a string that did
+# not match what it was compared against (MAIN_TYPES, above); prose is for readers.
+ADDED = "added"
+REPLACED = "replaced"
+NOOP = "noop"          # the key is already the requested value
+SKIPPED = "skipped"    # the resolver ignores the key for this section type
+
+# Statuses that mean "no write is required", as opposed to "no write is possible".
+NO_WRITE_NEEDED = (NOOP, SKIPPED)
+
+
 def repack(buf, backend=None):
-    """Unpack -> optionally set backend_constraint on the main section -> repack."""
+    """Unpack -> optionally set backend_constraint on the main section -> repack.
+
+    Returns (bytes, changes) where each change is a (status, message) pair; status
+    is one of ADDED / REPLACED / NOOP / SKIPPED.
+    """
     meta = SCHEMA.LiteRTLMMetaData.GetRootAs(buf, 0)
     metaT = SCHEMA.LiteRTLMMetaDataT.InitFromObj(meta)
     changed = []
@@ -260,18 +280,19 @@ def repack(buf, backend=None):
                 # The resolver hardcodes "gpu" for this type before it ever looks at
                 # backend_constraint, so a write here would be a no-op that merely
                 # looked like a fix. Say so instead of doing it.
-                changed.append(f"{model_type}: SKIPPED — the resolver returns 'gpu' for "
-                               "artisan models without reading backend_constraint, so "
-                               "there is nothing here to repair")
+                changed.append((SKIPPED,
+                                f"{model_type}: skipped — the resolver returns 'gpu' for "
+                                "artisan models without reading backend_constraint, so "
+                                "there is nothing here to repair"))
                 continue
 
             existing = next((it for it in sec.items if _text(it.key) == KEY), None)
             if existing is not None:
                 if _text(existing.value.value) == backend:
-                    changed.append(f"{model_type}: already {backend}, nothing to do")
+                    changed.append((NOOP, f"{model_type}: already {backend}, nothing to do"))
                     continue
                 existing.value.value = backend
-                changed.append(f"{model_type}: replaced -> {backend}")
+                changed.append((REPLACED, f"{model_type}: replaced -> {backend}"))
             else:
                 sv = SCHEMA.StringValueT()
                 sv.value = backend
@@ -280,7 +301,7 @@ def repack(buf, backend=None):
                 kv.valueType = SCHEMA.VData.StringValue
                 kv.value = sv
                 sec.items.append(kv)
-                changed.append(f"{model_type}: added -> {backend}")
+                changed.append((ADDED, f"{model_type}: added -> {backend}"))
 
     builder = flatbuffers.Builder(0)
     builder.Finish(metaT.Pack(builder))
@@ -353,8 +374,8 @@ def _validate(path, backend):
     fits = len(new) <= limit
     print(f"with {KEY}={backend}: {len(new)} bytes (limit {limit}) -> "
           f"{'FITS' if fits else 'TOO BIG'}")
-    for c in changed:
-        print(f"  {c}")
+    for _status, message in changed:
+        print(f"  {message}")
     return header_end, new, changed, fits
 
 
@@ -371,7 +392,7 @@ def cmd_check(args):
             "  `patch` would refuse. This is a report, not a failure of the file:\n"
             "  either it is not a main-model container, or its main section is a type\n"
             "  whose backend is decided some other way.")
-    if all("SKIPPED" in c for c in changed):
+    if all(status == SKIPPED for status, _ in changed):
         # Not a failure. The model is correctly configured and needs no repair;
         # exiting non-zero here would report a healthy file as a problem.
         print("\nNothing to repair — this model does not use backend_constraint.")
@@ -472,11 +493,13 @@ def cmd_patch(args):
         raise SystemExit("ABORT: no main section found to patch.")
     if not fits:
         raise SystemExit("ABORT: patched header would overrun the first block.")
-    if all("SKIPPED" in c for c in changed):
-        print("Nothing to write — see above.")
-        return
-    if all(("nothing to do" in c or "SKIPPED" in c) for c in changed):
-        print("Already correct; no write performed.")
+    if all(status in NO_WRITE_NEEDED for status, _ in changed):
+        # Either already correct, or a type whose constraint the resolver ignores.
+        # Both mean the same thing to the caller: do not write.
+        if any(status == SKIPPED for status, _ in changed):
+            print("Nothing to write — see above.")
+        else:
+            print("Already correct; no write performed.")
         return
 
     # Consent gate (FR-019). Another command driving this tool must assert that it
