@@ -31,10 +31,13 @@ causal. The last two had no switch and no resident model and hung the driver any
 remains indicated rather than proven throughout, but the condition common to all four is the
 narrower one.
 
-**Those last two were also the only two cold-start attempts made that day.** One cold-start
-crash reads as bad luck; two out of two does not. On this host the mitigated path is not
-"unproven" — it is failing, and the honest expectation for a GPU init here is that it takes the
-desktop with it.
+**Cold starts on 2026-08-01: three attempted, two crashed, one completed normally** (22:37, same
+model, same backend, reply returned and accelerator memory released to the watchdog afterwards).
+
+That third run is why this section does not say "cold start is broken". It also is not evidence
+that it is fixed. A path that fails two times in three is not diagnosable from three samples,
+and a clean run tells you nothing about the next one — which is the whole difficulty with an
+intermittent driver hang. Plan for the crash; be pleasantly surprised by the answer.
 
 Establishing them as genuine cold starts matters, so here is the evidence rather than the
 assertion. In both cases a `--check` moments earlier reported the server down. The runtime
@@ -59,9 +62,10 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-client.mjs" --stop
 **But do not read that as safe.** Earlier revisions of this skill called the mitigation tested,
 on the strength of re-running the identical initialisation as a cold start — same model, same
 backend — twice, cleanly, with memory released afterwards. Those runs happened and that result
-stands; what it does not do is generalise, as both 2026-08-01 crashes showed. Stop-then-load is
-**lower risk, not safe**. Do not trigger a GPU init over unsaved work, and do not schedule one
-where a reboot would cost you something.
+stands; what it does not do is generalise, as both 2026-08-01 crashes showed — and the clean run
+later that evening does not generalise either. Stop-then-load is **lower risk, not safe**. Do not
+trigger a GPU init over unsaved work, and do not schedule one where a reboot would cost you
+something.
 
 If you need the model to work today rather than to diagnose the driver, **run it on CPU**. It is
 several times slower and has never done this. `/litertlm:setup` will offer to repair a model to
