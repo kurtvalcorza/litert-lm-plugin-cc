@@ -123,6 +123,25 @@ regex, drafting and rephrasing, smoke-testing local inference.
 
 **Not for**: anything needing real codebase reasoning. Use Claude directly.
 
+### When it earns its keep
+
+Its value is **independent weights, not quality**. Most of what it raises will not survive
+verification; the few that do are things a different model family noticed and yours did not.
+Judge it on that, not on hit rate.
+
+Two consequences:
+
+- **Reach for it when your usual reviewer is unavailable** — rate-limited, out of quota,
+  offline. That is when a free second opinion is worth its false-positive rate.
+- **It substitutes for a *different*-family reviewer, not a same-family one.** A second
+  Claude-shaped opinion running alongside Claude is one voice twice, and reads as agreement
+  it never earned. A Gemma-shaped one is genuinely another.
+
+Reviewing a pushed branch, point it at the branch range. `/litertlm:review` reads
+`git diff HEAD` — uncommitted work — which on an already-committed branch is empty. It stops
+rather than invent findings, which is correct, but an empty pass and a clean pass look
+identical if you are not watching for the difference.
+
 ### Deliberately out of scope
 
 No background job management, no session transfer, no agentic tool-execution loop. Those depend
