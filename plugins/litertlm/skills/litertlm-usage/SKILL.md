@@ -11,9 +11,19 @@ drift, and they drift toward overclaiming.
 
 ## What this model is
 
-A small on-device model, served locally by LiteRT-LM. The default is Gemma 4 E4B, roughly a
-4B-class model. It runs on the user's own hardware, costs nothing per request, and sends
-nothing off the machine.
+A small on-device model, served locally by LiteRT-LM. It runs on the user's own hardware, costs
+nothing per request, and sends nothing off the machine.
+
+**Do not assume which model.** The shipped default is Gemma 4 E4B, but any litert-lm model can
+be served, `LITERT_LM_PLUGIN_MODEL` changes the default per machine, and `--model` changes it
+per call. Check rather than state:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-client.mjs" --check
+```
+
+Everything below applies to **whatever small model is loaded** — the guidance is about the size
+class, roughly 0.5B–4B, not about any one family.
 
 ## What it cannot do
 

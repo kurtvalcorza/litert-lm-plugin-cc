@@ -111,7 +111,8 @@ The model is **an endpoint, not an agent**. It has no file access, no shell, no 
 awareness, and no iteration. It answers only from the text in its prompt — anything not pasted
 or piped in does not exist to it.
 
-The default is Gemma 4 E4B, roughly a 4B-class model. Treat its output as a cheap offline
+The shipped default is Gemma 4 E4B — roughly a 4B-class model — though any litert-lm model can
+be served and `LITERT_LM_PLUGIN_MODEL` changes the default. Treat its output as a cheap offline
 second opinion, never as authority. Fluent, confident prose is the *expected* failure mode of a
 small model, not evidence of correctness. That policy lives in one place —
 [`litertlm-usage`](plugins/litertlm/skills/litertlm-usage/SKILL.md) — and every command references it

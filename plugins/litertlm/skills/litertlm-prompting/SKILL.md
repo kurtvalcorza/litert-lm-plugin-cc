@@ -5,9 +5,16 @@ description: How to prompt a small on-device model so it performs. Load this bef
 
 # Prompting a small local model
 
-The default is Gemma 4 E4B, roughly a 4B-class model. It is not a small Claude. Prompting
-habits that work on a frontier model — layered instructions, implied reasoning, "think about
-X then do Y" — degrade its output sharply.
+Whatever is loaded here is a **0.5B–4B class model** — the shipped default is Gemma 4 E4B, but
+`LITERT_LM_PLUGIN_MODEL` and `--model` both change that, so check with `--check` rather than
+assuming. It is not a small Claude. Prompting habits that work on a frontier model — layered
+instructions, implied reasoning, "think about X then do Y" — degrade its output sharply.
+
+One family-specific trap worth knowing: some models in this range are **reasoning** variants
+(names carrying `Thinking`, `R1`, `VibeThinker`, and Qwen3 base models) and emit a
+`<think>…</think>` block before answering. That burns your token budget before a single useful
+word. Prefer an `Instruct` variant when one exists, and raise `--max-tokens` if you must use a
+thinking model, or the answer gets truncated mid-reasoning.
 
 Most "this model is useless" conclusions are prompt problems. Fix the prompt before concluding
 the model can't do it.
