@@ -93,6 +93,9 @@ Then:
 | `/litertlm:review` | Offline second-opinion pass over your diff |
 | `/litertlm:stop` | Stop the server, release accelerator memory now |
 
+`/litertlm:review` is a thin wrapper over `litertlm-review.mjs`, which also runs on its own when
+Claude Code is not available — see [When it earns its keep](#when-it-earns-its-keep).
+
 ## Skills
 
 Four skills ship with the plugin. Commands load them by reference, so the guidance lives in one
@@ -138,26 +141,49 @@ Two consequences:
   the same family and you have one perspective twice, reading as agreement it never earned.
   Different weights are the whole point.
 
-Both of those situations need the **client directly**, not the slash command.
-`/litertlm:review` is agent-interpreted — Claude Code runs the pipeline and screens the output —
-so it is unavailable in precisely the conditions that make a local pass attractive. The client
-itself needs neither Claude nor a network: it reads a diff on stdin and writes the model's reply
-to stdout.
+Both of those situations need something that runs **without Claude Code**. `/litertlm:review` is
+agent-interpreted — Claude Code assembles the pipeline and screens the output — so it is
+unavailable in precisely the conditions that make a local pass attractive.
 
-There is no turnkey offline command yet. Driving the client by hand means owning four things the
-slash command otherwise handles:
+That is what `litertlm-review.mjs` is for. One command, no agent, no network. Run it from the
+repository you want the pass over:
 
-- **Finding it.** After a marketplace install the client lives under the plugin's cache
-  directory, not inside the repository you are reviewing.
-- **A valid range.** `git diff <base>...HEAD` fails into an *empty pipe* when the base is not a
-  local ref — the client then reviews nothing and can still answer. An empty pass and a clean
-  pass look identical if you are not watching for the difference.
-- **Your shell.** The examples in `commands/review.md` are Bash; PowerShell needs its own form.
-- **Size.** An oversized diff is only partially attended to, with no indication of what was
-  skipped. Narrow to a path.
+```powershell
+node (Get-ChildItem "$HOME\.claude\plugins\cache\litert-lm-local\litertlm\*\scripts\litertlm-review.mjs" | Sort-Object LastWriteTime | Select-Object -Last 1).FullName
+```
 
-**And the screening.** Nothing sits between the model and you: verify every claim against the
-actual code before repeating it, and say plainly how many did not survive.
+```bash
+node "$(ls -1t ~/.claude/plugins/cache/litert-lm-local/litertlm/*/scripts/litertlm-review.mjs | head -1)"
+```
+
+It is Node rather than shell, so the invocation itself is the same under PowerShell, cmd and a
+POSIX shell — only the line that locates it differs. Any installed version will do, since each
+copy drives its own sibling client; the glob does not have to pick the newest. There is no
+stable path to hardcode, because plugin versions live side by side — if you reach for this
+often, wrap it in a shell function.
+
+It defaults to your uncommitted diff, and takes `--base main` (or `--base auto`) for a whole
+branch, `--staged`, `--path` to narrow, and `--dry-run` to see what would be sent without
+sending it. `--help` lists the rest.
+
+Four things it owns that a hand-typed pipeline gets wrong:
+
+- **Finding the client.** After a marketplace install it sits under the plugin cache at a
+  versioned path, not in the repository you are reviewing. The launcher resolves it from its
+  own location rather than from yours.
+- **The range.** `git diff <base>...HEAD | client` puts the failure on the *left of a pipe*: git
+  exits 128, the pipe still opens, and the client answers from empty stdin. Bases are checked
+  with `rev-parse` and `merge-base` before anything is sent, and a bad one is reported alongside
+  the bases that would have worked.
+- **Nothing to review.** An empty diff exits 3 without invoking the model, because an empty pass
+  and a clean pass read identically.
+- **Size.** Past 32 KB it refuses and names the files responsible. `--allow-oversize` sends it
+  anyway and stamps the reply as partial coverage — a small model is truncated silently, and
+  neither it nor the launcher can tell you which part went unread.
+
+**What it cannot do is the screening.** Nothing sits between the model and you: verify every
+claim against the actual code before repeating it, and say plainly how many did not survive.
+The launcher prints that obligation after every reply. It cannot discharge it.
 
 ### Deliberately out of scope
 
