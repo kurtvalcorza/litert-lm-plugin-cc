@@ -28,8 +28,13 @@ const DEFAULTS = {
   host: '127.0.0.1',
   port: 9379,
   // Must match the id `/gemma:setup` tells a new user to import as. A default
-  // naming some other id makes the very first call fail with "model not found".
-  model: 'gemma4-e4b',
+  // naming some other id makes the very first call fail with "model not found",
+  // so the SHIPPED value is not a preference — it is a contract with setup.md.
+  //
+  // LITERT_LM_PLUGIN_MODEL overrides it per machine, which is where a personal
+  // preference belongs: changing the shipped constant would break every fresh
+  // install that followed the documented import.
+  model: process.env.LITERT_LM_PLUGIN_MODEL || 'gemma4-e4b',
   maxTokens: 800,
   idleTimeout: 900,          // seconds; 0 disables idle shutdown
   requestTimeoutMs: 15 * 60 * 1000,
@@ -227,6 +232,7 @@ function reconcileState(port, serverUp) {
 function parseArgs(argv) {
   const opts = {
     ...DEFAULTS, prompt: '', system: null, json: false, action: 'chat',
+    modelExplicit: false,
   };
   const rest = [];
 
@@ -245,7 +251,9 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     switch (a) {
-      case '--model': opts.model = needValue(a, argv[++i]); break;
+      // modelExplicit records that the flag decided this, not the environment —
+      // reporting the wrong source is worse than reporting none.
+      case '--model': opts.model = needValue(a, argv[++i]); opts.modelExplicit = true; break;
       case '--system': opts.system = needValue(a, argv[++i]); break;
       case '--max-tokens': opts.maxTokens = needInt(a, argv[++i], 1); break;
       case '--port': opts.port = needInt(a, argv[++i], 1); break;
@@ -542,6 +550,10 @@ Options:
   --stop              Stop server and watchdog, release memory
   -h, --help          This message
 
+Environment:
+  LITERT_LM_PLUGIN_MODEL   Override the default model id for this machine
+  LITERT_LM_PLUGIN_RUNTIME Override the runtime state directory
+
 Notes:
   One model is resident at a time; naming another forces a full reload.
   First call after idle pays engine init. Warm calls are fast.
@@ -586,11 +598,15 @@ async function main() {
   if (opts.action === 'check') {
     const up = await probe(opts);          // must not start anything (T033)
     reconcileState(opts.port, Boolean(up));
+    // Name the source of the default. An override that cannot be seen is one the
+    // user cannot debug — "why is it loading that model?" has to be answerable here.
+    const via = (process.env.LITERT_LM_PLUGIN_MODEL && !opts.modelExplicit)
+      ? '  (via LITERT_LM_PLUGIN_MODEL)' : '';
     const lines = [`server   : ${up ? `up at ${baseUrl(opts)}` : 'not running (starts on demand)'}`];
     if (up) {
       const ids = (up.data ?? []).map((m) => m.id);
       lines.push(`models   : ${ids.length ? ids.join(', ') : '(none imported)'}`);
-      lines.push(`default  : ${opts.model}${ids.includes(opts.model) ? '' : '  <-- NOT IMPORTED'}`);
+      lines.push(`default  : ${opts.model}${via}${ids.includes(opts.model) ? '' : '  <-- NOT IMPORTED'}`);
       if (!ids.includes(opts.model) && ids.length) {
         lines.push(`           pass --model <id> to use one of the above, `
           + `or import it as '${opts.model}'`);
@@ -598,7 +614,7 @@ async function main() {
       const loaded = readState(opts.port, 'loaded-model');
       if (loaded) lines.push(`resident : ${loaded}`);
     } else {
-      lines.push(`default  : ${opts.model} (unverified — server is down)`);
+      lines.push(`default  : ${opts.model}${via} (unverified — server is down)`);
     }
     lines.push(`idle     : ${opts.idleTimeout === 0 ? 'disabled' : `${opts.idleTimeout}s`}`);
     process.stdout.write(lines.join('\n') + '\n');

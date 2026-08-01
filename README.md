@@ -136,6 +136,10 @@ calls but never executes them.
 - The server starts on demand and **stops itself after 15 minutes idle**, releasing VRAM. The
   next question restarts it transparently. `--idle-timeout 0` disables this.
 - **One model is resident at a time.** Naming another forces a full engine reload.
+- The default model is `gemma4-e4b`, matching what `/gemma:setup` imports. Set
+  **`LITERT_LM_PLUGIN_MODEL`** to make a different id the standing default on your machine —
+  editing the script instead would be overwritten by the next plugin update. `--check` shows
+  when an override is active.
 - ⚠️ **Never switch models in place on the GPU backend.** Two hard crashes on the development
   host (bugcheck `0x116`, VIDEO_TDR_ERROR, forced reboot) both happened while a model was
   resident and a request named a different one, forcing teardown and re-init. Causation is

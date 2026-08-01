@@ -140,6 +140,19 @@ Compare against step 2 instead: the default is `gemma4-e4b`, and `litert-lm list
 you what exists. If the user imported under a different id, either re-import under the default
 or pass `--model <id>` on every call.
 
+To make a different model the standing default on this machine, set
+`LITERT_LM_PLUGIN_MODEL` rather than editing the script — an edit is lost on the next plugin
+update, and the shipped default has to keep matching step 2's import for everyone else.
+`--check` prints `(via LITERT_LM_PLUGIN_MODEL)` when an override is in effect.
+
+```powershell
+[Environment]::SetEnvironmentVariable('LITERT_LM_PLUGIN_MODEL', '<id>', 'User')   # Windows
+```
+
+```bash
+export LITERT_LM_PLUGIN_MODEL=<id>        # Linux / macOS, via your shell profile
+```
+
 Then prove it end to end:
 
 ```bash
