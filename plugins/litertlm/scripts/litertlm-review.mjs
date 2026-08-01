@@ -214,6 +214,24 @@ function parseArgs(argv) {
     if (value === undefined) throw usage(`${flag} requires a value`);
     return value;
   };
+  /**
+   * Reject an empty value for the flags that decide WHAT gets sent.
+   *
+   * `--base "$SOMEVAR"` with the variable unset arrives here as an empty string, which
+   * is falsy — so `if (opts.base)` would skip the range entirely and quietly review the
+   * working tree instead. The caller asked for a branch and would have got something
+   * else with no error, which is the silently-wrong-range failure this script exists to
+   * prevent. --focus is deliberately NOT in this set: review.md passes `--focus
+   * "$ARGUMENTS"`, and an empty focus legitimately means "no focus".
+   */
+  const needNonEmpty = (flag, value) => {
+    const v = needValue(flag, value);
+    if (!v.trim()) {
+      throw usage(`${flag} was given an empty value — an unset shell variable, most likely.\n`
+        + '  Refusing rather than silently ignoring it and sending something you did not ask for.');
+    }
+    return v;
+  };
   const needInt = (flag, value, min) => {
     const n = Number(needValue(flag, value));
     if (!Number.isInteger(n) || n < min) {
@@ -225,14 +243,14 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     switch (a) {
-      case '--base': opts.base = needValue(a, argv[++i]); break;
+      case '--base': opts.base = needNonEmpty(a, argv[++i]); break;
       case '--staged': opts.staged = true; break;
-      case '--path': opts.paths.push(needValue(a, argv[++i])); break;
+      case '--path': opts.paths.push(needNonEmpty(a, argv[++i])); break;
       case '--focus': opts.focus = needValue(a, argv[++i]); break;
       case '--max-bytes': opts.maxBytes = needInt(a, argv[++i], 1); break;
       case '--allow-oversize': opts.allowOversize = true; break;
       case '--dry-run': opts.dryRun = true; break;
-      case '--model': opts.model = needValue(a, argv[++i]); break;
+      case '--model': opts.model = needNonEmpty(a, argv[++i]); break;
       case '--max-tokens': opts.maxTokens = needInt(a, argv[++i], 1); break;
       case '--port': opts.port = needInt(a, argv[++i], 1); break;
       case '-h': case '--help': opts.action = 'help'; break;
@@ -272,6 +290,25 @@ function collectDiff(opts) {
     return { range: `${expr}${opts.base === 'auto' ? '  (--base auto chose this)' : ''}`, buf: git(['diff', expr, ...pathspec]).stdout };
   }
   return { range: 'uncommitted changes (git diff HEAD)', buf: git(['diff', 'HEAD', ...pathspec]).stdout };
+}
+
+/**
+ * Files git can see but a diff against HEAD cannot.
+ *
+ * `git diff HEAD` compares tracked content only, so a brand-new file is invisible to it
+ * — frequently the most review-worthy thing in the tree. Left unsaid, an untracked-only
+ * working tree reports "nothing to review" while the new file sits there, and a mixed
+ * tree produces a confident pass over everything except the new file. Both read as
+ * fuller coverage than they are, which is the same defect as an unflagged oversized
+ * diff, so it gets the same treatment: said out loud.
+ *
+ * Only meaningful for the working-tree range. Untracked files are by definition neither
+ * staged nor in a committed range.
+ */
+function untrackedFiles(paths) {
+  const args = ['ls-files', '--others', '--exclude-standard'];
+  if (paths.length) args.push('--', ...paths);
+  return git(args).text.split('\n').map((s) => s.trim()).filter(Boolean);
 }
 
 /**
@@ -409,12 +446,24 @@ function main() {
   const text = buf.toString('utf8');
   const bytes = buf.length;
 
+  // Only the working-tree range can have a blind spot here; see untrackedFiles.
+  const untracked = (!opts.staged && !opts.base) ? untrackedFiles(opts.paths) : [];
+  const untrackedNote = untracked.length
+    ? `${untracked.length} untracked file${untracked.length === 1 ? '' : 's'} `
+      + `(${untracked.slice(0, 3).join(', ')}${untracked.length > 3 ? ', …' : ''})`
+    : null;
+
   if (!text.trim()) {
     throw new ExitError(EXIT.NOTHING,
       `nothing to review — ${range} is empty.\n`
       + '  Stopping rather than asking the model about nothing: given an empty diff it will\n'
       + '  still answer, and that answer is indistinguishable from a clean pass.'
-      + (opts.paths.length ? `\n  Your --path filter was: ${opts.paths.join(', ')}` : ''));
+      + (opts.paths.length ? `\n  Your --path filter was: ${opts.paths.join(', ')}` : '')
+      + (untrackedNote
+        ? `\n\n  Not empty in the sense you may mean — here it found ${untrackedNote}.\n`
+          + '  A diff against HEAD compares tracked content, so git cannot see them yet.\n'
+          + '  Include them without committing:  git add -N <path>'
+        : ''));
   }
 
   const files = fileSizes(text);
@@ -426,6 +475,7 @@ function main() {
     if (opts.paths.length) out.write(`paths    : ${opts.paths.join(', ')}\n`);
     out.write(`files    : ${files.length}\n`);
     out.write(`size     : ${kb(bytes)} against a ${kb(opts.maxBytes)} guard\n`);
+    if (untrackedNote) out.write(`excluded : ${untrackedNote} — invisible to a diff against HEAD\n`);
     for (const f of files.slice(0, 10)) out.write(`  ${kb(f.bytes).padStart(9)}  ${f.name}\n`);
     if (files.length > 10) out.write(`  ${' '.repeat(9)}  ... and ${files.length - 10} more\n`);
     out.write(`${RULE}\n`);
@@ -456,6 +506,10 @@ function main() {
   out.write(`local pass over ${range}\n`);
   out.write(`${files.length} file${files.length === 1 ? '' : 's'}, ${kb(bytes)}`);
   out.write(opts.focus ? `, focus: ${opts.focus}\n` : '\n');
+  if (untrackedNote) {
+    out.write(`NOT COVERED: ${untrackedNote} — untracked, so a diff against HEAD cannot see\n`);
+    out.write('them. Silence about a new file below means it was never sent. git add -N to include.\n');
+  }
   if (oversize) out.write(`\n${OVERSIZE_STAMP(bytes, opts.maxBytes)}\n`);
   out.write(`${RULE}\n\n`);
 

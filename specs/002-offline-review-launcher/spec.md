@@ -122,6 +122,13 @@ starts no server, and produces no model output.
   the launcher must fail with that reason rather than an empty prompt.
 - **Binary and generated files.** These inflate size without being reviewable text; the size
   report must reflect what is actually sent.
+- **A brand-new file.** A working-tree comparison sees tracked content only, so a file the
+  project does not yet track is invisible to it — frequently the most review-worthy thing
+  present. Reporting "nothing to review" while one sits there, or passing over everything
+  except it, both overstate coverage.
+- **An option given an empty value.** A caller interpolating an unset variable supplies an
+  empty string. Treating that as "not supplied" silently substitutes a different range for the
+  one asked for.
 - **Interruption.** The user aborts mid-call. The launcher must not leave state that keeps the
   server pinned alive.
 - **A response that is empty or only a tool call.** Must be reported as such, not as a clean
@@ -182,6 +189,13 @@ starts no server, and produces no model output.
   paths share one implementation of range validation and size guarding.
 - **FR-026**: The README MUST document the offline invocation for both a POSIX shell and
   PowerShell, and MUST NOT claim a turnkey command does not exist once one does.
+- **FR-027**: An option that selects what gets sent MUST reject an empty value rather than
+  treating it as absent, and MUST say that an unset variable is the likely cause.
+- **FR-028**: When the range cannot see files that are present but untracked, the launcher MUST
+  say so — in the nothing-to-review message when the range is empty, and alongside the response
+  when it is not — and MUST name how to include them without committing.
+- **FR-029**: The documented invocations MUST fail with a named cause when the launcher cannot
+  be located, and MUST NOT stall waiting for input.
 
 ### Key Entities
 

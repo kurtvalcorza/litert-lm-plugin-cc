@@ -13,7 +13,8 @@ node litertlm-review.mjs [options] ["<focus>"]
 
 Nothing is piped. Every step's exit status is checked before the next, which is the difference
 between this and a hand-typed `git diff … | client` — there, git's failure sits on the left of
-a pipe that still opens, and the client answers from empty stdin.
+a pipe that still opens, the client receives an empty diff, and the model still returns a
+response.
 
 ## Options
 
@@ -40,7 +41,7 @@ Default range when none is given: the uncommitted working tree (`git diff HEAD`)
 |---|---|
 | 0 | A pass ran |
 | 1 | Environment failure — git missing, not a repository, no commits, client absent, model call failed |
-| 2 | Usage error — unknown flag, unresolvable base, base sharing no history with `HEAD` |
+| 2 | Usage error — unknown flag, empty value for a range-selecting option, unresolvable base, base sharing no history with `HEAD` |
 | 3 | Nothing to review — the range resolved and its diff is empty |
 | 4 | Refused as oversized |
 
@@ -67,16 +68,24 @@ guards against.
    A failed git call aborts the run; it cannot arrive as empty input.
 3. **Refs validated first** — `--base` is checked with `rev-parse --verify` and `merge-base`
    before anything is sent, and a failure names the bases that *do* resolve here.
-4. **Oversize refused by default** — the guard is a heuristic about where a 4B-class model's
+4. **Empty values rejected** — `--base`, `--path` and `--model` refuse an empty string rather
+   than treating it as absent. `--base "$VAR"` with `VAR` unset would otherwise be falsy, skip
+   the range, and quietly review the working tree instead. `--focus` is exempt: `review.md`
+   passes `--focus "$ARGUMENTS"`, where empty legitimately means no focus.
+5. **Untracked files declared** — the working-tree range compares tracked content, so a
+   brand-new file is invisible to it. Their count and names appear in the nothing-to-review
+   message, in `--dry-run`, and above the response, with `git add -N` named as the way to
+   include them. Not applicable to `--staged` or a committed range.
+6. **Oversize refused by default** — the guard is a heuristic about where a 4B-class model's
    attention thins, not a measured context limit. Overriding it stamps the partial-coverage
    warning both above and below the reply.
-5. **Shell-agnostic** — a single Node invocation with no continuations, identical under
+7. **Shell-agnostic** — a single Node invocation with no continuations, identical under
    PowerShell, cmd and POSIX shells (Principle VI).
-6. **Standard library only** — no manifest, no install step (Principle III). Missing
+8. **Standard library only** — no manifest, no install step (Principle III). Missing
    prerequisites are named: `git`, and the sibling client.
-7. **Local only** — the only network traffic is the client's existing calls to the local server
+9. **Local only** — the only network traffic is the client's existing calls to the local server
    (Principle II).
-8. **Framed, never authoritative** — every reply is followed by the verification obligation and
+10. **Framed, never authoritative** — every reply is followed by the verification obligation and
    a pointer to the stronger tool (Principle I). On this path no agent exists to do it.
 
 ## Non-goals

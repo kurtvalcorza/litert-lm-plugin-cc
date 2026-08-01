@@ -151,17 +151,24 @@ That is what `litertlm-review.mjs` is for. One command, no agent, no network. Ru
 repository you want the pass over:
 
 ```powershell
-node (Get-ChildItem "$HOME\.claude\plugins\cache\litert-lm-local\litertlm\*\scripts\litertlm-review.mjs" | Sort-Object LastWriteTime | Select-Object -Last 1).FullName
+$r = Get-ChildItem "$HOME\.claude\plugins\cache\litert-lm-local\litertlm\*\scripts\litertlm-review.mjs" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1
+if ($r) { node $r.FullName } else { Write-Error "litertlm-review.mjs not found — needs plugin 0.3.0 or later" }
 ```
 
 ```bash
-node "$(ls -1t ~/.claude/plugins/cache/litert-lm-local/litertlm/*/scripts/litertlm-review.mjs | head -1)"
+r=$(ls -1t ~/.claude/plugins/cache/litert-lm-local/litertlm/*/scripts/litertlm-review.mjs 2>/dev/null | head -1)
+node "${r:?litertlm-review.mjs not found — needs plugin 0.3.0 or later}"
 ```
 
+**The guard on those is not decoration.** Written as a bare `node "$(...)"`, a glob that matches
+nothing expands to `node ""`, and Node then opens its REPL and waits on stdin — no output, no
+error, no exit. You would sit there believing it was thinking. Since the script first ships in
+**0.3.0**, that is exactly what an un-updated install would do.
+
 It is Node rather than shell, so the invocation itself is the same under PowerShell, cmd and a
-POSIX shell — only the line that locates it differs. Any installed version will do, since each
-copy drives its own sibling client; the glob does not have to pick the newest. There is no
-stable path to hardcode, because plugin versions live side by side — if you reach for this
+POSIX shell — only the line that locates it differs. Any installed version from 0.3.0 will do,
+since each copy drives its own sibling client; the glob does not have to pick the newest. There
+is no stable path to hardcode, because plugin versions live side by side — if you reach for this
 often, wrap it in a shell function.
 
 It defaults to your uncommitted diff, and takes `--base main` (or `--base auto`) for a whole
