@@ -202,9 +202,15 @@ Four things it owns that a hand-typed pipeline gets wrong:
   and a bad one is reported alongside the bases that would have worked.
 - **Nothing to review.** An empty diff exits 3 without invoking the model, because an empty pass
   and a clean pass read identically.
-- **Size.** Past 32 KB it refuses and names the files responsible. `--allow-oversize` sends it
-  anyway and stamps the reply as partial coverage — a small model is truncated silently, and
-  neither it nor the launcher can tell you which part went unread.
+- **Size.** Past 6 KB it refuses and names the files responsible. That figure was bisected
+  against the server rather than estimated: serving `qwen3-4b-instruct` on LiteRT-LM 0.14.0
+  (GPU backend, RTX 5070 Ti Laptop 12 GB), three real diffs were accepted up to 6,656, 7,168 and
+  8,256 bytes respectively — the limit is on tokens, so it moves with how the text tokenises, and
+  6 KB is what cleared all three. Expect a different number on another model or runtime version.
+  `--allow-oversize` sends it anyway and stamps the reply as partial coverage, but past that
+  ceiling an oversized request usually does not come back partial at all: the server breaks the
+  HTTP response and the run fails. The flag finds the ceiling; it does not get a large diff under
+  it.
 
 **What it cannot do is the screening.** Nothing sits between the model and you: verify every
 claim against the actual code before repeating it, and say plainly how many did not survive.

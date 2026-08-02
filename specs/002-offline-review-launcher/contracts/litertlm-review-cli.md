@@ -24,7 +24,7 @@ response.
 | `--staged` | — | Review staged changes only. Mutually exclusive with `--base`. |
 | `--path <pathspec>` | — | Narrow the diff. Repeatable. |
 | `--focus <text>` | — | Emphasis for the prompt. May also be given positionally; giving both is a usage error. |
-| `--max-bytes <n>` | 32768 | Refuse a diff larger than this. |
+| `--max-bytes <n>` | 6144 | Refuse a diff larger than this. Bisected against the server, not chosen: serving `qwen3-4b-instruct` on litert-lm 0.14.0, the largest diff accepted in this script's framing was 6,656–8,256 B depending on how the text tokenises. |
 | `--allow-oversize` | off | Send an oversized diff; the reply is stamped as partial coverage. |
 | `--dry-run` | off | Report range and size; start nothing, send nothing. |
 | `--model <id>` | client's | Passed through. |

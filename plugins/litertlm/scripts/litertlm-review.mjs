@@ -54,12 +54,27 @@ const EXIT = {
 };
 
 const DEFAULTS = {
-  // A heuristic about where a 4B-class model's attention thins out, NOT a measured
-  // context limit — `serve` exposes no way to ask for one. 32 KiB is roughly 8k
-  // tokens. Deliberately conservative: the cost of being wrong high is a confident
-  // reply about a diff the model only partly saw, which is the failure this whole
-  // script exists to prevent. --max-bytes moves it.
-  maxBytes: 32 * 1024,
+  // MEASURED, not guessed — see the conditions below, because this figure does not
+  // travel. It compensates for an upstream gap: litert-lm 0.14.0's `serve` runs at a
+  // fixed max_num_tokens=4096 and offers no flag to raise it and no way to ask what it
+  // is, so the only way to learn the ceiling is to walk into it.
+  //
+  // Measured 2026-08-02 against litert-lm 0.14.0 serving qwen3-4b-instruct (GPU backend,
+  // RTX 5070 Ti Laptop 12 GB), sending real git diffs to /v1/chat/completions in this
+  // script's exact framing — SYSTEM above, the prompt in callModel, max_tokens 1200. The
+  // largest diff accepted was 8,256 B for one, 7,168 B for a second, 6,656 B for a third.
+  // The cap is on TOKENS, so the byte figure moves with how densely a diff tokenises;
+  // 6 KiB is the largest value that cleared all three. An earlier 32 KiB here reasoned
+  // about where a 4B model's *attention* thins out, which sat ~4x above the point where
+  // the request fails outright.
+  //
+  // Lowering --max-tokens does not buy room (1200 -> 100 moved the ceiling ~256 B), so
+  // treat max_num_tokens as a prompt budget with the reply on top, not a shared pool.
+  //
+  // Obsolete when `serve` can be told a token budget, or reports the one it has. The
+  // unreleased 0.15.0 config (~/.litert-lm/config.json) carries a per-model
+  // max_num_tokens; once that ships, re-measure rather than assuming this number rose.
+  maxBytes: 6 * 1024,
   maxTokens: 1200,
 };
 
@@ -338,9 +353,11 @@ const RULE = '─'.repeat(76);
 
 const OVERSIZE_STAMP = (bytes, limit) =>
   `!! PARTIAL COVERAGE: ${kb(bytes)} against a ${kb(limit)} guard, sent under\n`
-  + '!! --allow-oversize. The model attends to as much as fits and reports nothing about\n'
-  + '!! the rest, so parts of this diff go unread — and neither the reply nor this script\n'
-  + '!! can tell you which. Treat silence about a file as no information.';
+  + '!! --allow-oversize. If a reply comes back, the model attended to as much as fit and\n'
+  + '!! reports nothing about the rest — and neither the reply nor this script can tell you\n'
+  + '!! which part. Treat silence about a file as no information.\n'
+  + '!! Measured on LiteRT-LM 0.14.0, the likelier outcome is no reply at all: past its\n'
+  + '!! limit the server breaks the HTTP response rather than answering from what it read.';
 
 const FOOTER = [
   'What you just read came from a small on-device model given nothing but the diff text.',
