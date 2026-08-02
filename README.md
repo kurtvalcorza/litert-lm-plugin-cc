@@ -203,15 +203,16 @@ Four things it owns that a hand-typed pipeline gets wrong:
 - **Nothing to review.** An empty diff exits 3 without invoking the model, because an empty pass
   and a clean pass read identically.
 - **Size.** Past 6 KB it refuses and names the files responsible. That figure was bisected
-  against the server rather than estimated: serving `qwen3-4b-instruct` on LiteRT-LM 0.14.0
-  (GPU backend, RTX 5070 Ti Laptop 12 GB), three real diffs were accepted up to 6,656, 7,168 and
-  8,256 bytes respectively — the limit is on tokens, so it moves with how the text tokenises. 6 KB
-  sits below the tightest of the three rather than at it, because three diffs do not bound the
-  fourth. Expect a different number again on another model or runtime version.
-  `--allow-oversize` sends it anyway and stamps the reply as partial coverage, but past that
-  ceiling an oversized request usually does not come back partial at all: the server breaks the
-  HTTP response and the run fails. The flag finds the ceiling; it does not get a large diff under
-  it.
+  against the server rather than estimated — three real diffs, both models this plugin ships
+  against, on LiteRT-LM 0.14.0 (RTX 5070 Ti Laptop 12 GB). The largest accepted was 6,656 B for
+  `qwen3-4b-instruct` and 12,288 B for `gemma4-e4b`. Both run at the same fixed token budget, so
+  that spread is tokenisation rather than capacity, and the guard is set by the tighter model.
+  6 KB sits below it rather than at it, because three diffs do not bound a fourth and denser text
+  will tokenise worse. Expect different numbers again on another model or runtime version.
+  `--allow-oversize` sends it anyway, marked coverage-unverified: the guard is conservative, so a
+  diff slightly over it is often read in full, and nothing here can tell a whole reply from a
+  partial one. Well past the ceiling there is no reply at all — the server breaks the HTTP
+  response and the run fails. The flag finds the ceiling; it does not get a large diff under it.
 
 **What it cannot do is the screening.** Nothing sits between the model and you: verify every
 claim against the actual code before repeating it, and say plainly how many did not survive.

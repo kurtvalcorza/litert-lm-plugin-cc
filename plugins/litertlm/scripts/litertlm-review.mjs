@@ -61,16 +61,25 @@ const DEFAULTS = {
   // fixed max_num_tokens=4096 and offers no flag to raise it and no way to ask what it
   // is, so the only way to learn the ceiling is to walk into it.
   //
-  // Measured 2026-08-02 against litert-lm 0.14.0 serving qwen3-4b-instruct (GPU backend,
-  // RTX 5070 Ti Laptop 12 GB), sending real git diffs to /v1/chat/completions in this
-  // script's exact framing — SYSTEM above, the prompt in callModel, max_tokens 1200. The
-  // largest diff accepted was 8,256 B for one, 7,168 B for a second, 6,656 B for a third.
-  // The cap is on TOKENS, so the byte figure moves with how densely a diff tokenises;
-  // 6 KiB is a round number below the tightest of those three, not the largest that
-  // would have cleared them — 6,656 B also cleared all three, and the margin is
-  // deliberate, since three diffs do not bound the fourth. An earlier 32 KiB here reasoned
-  // about where a 4B model's *attention* thins out, which sat ~4x above the point where
-  // the request fails outright.
+  // Measured 2026-08-02 against litert-lm 0.14.0 on an RTX 5070 Ti Laptop (12 GB),
+  // sending real git diffs to /v1/chat/completions in this script's exact framing —
+  // SYSTEM above, the prompt in callModel, max_tokens 1200. Three diffs, both models
+  // this plugin ships against, largest accepted / smallest refused in bytes:
+  //
+  //   qwen3-4b-instruct (gpu)   8256/8288   7168/8192   6656/7168
+  //   gemma4-e4b (cpu default) 15360/16384 12288/14336 12288/14336
+  //
+  // Both run at the same fixed max_num_tokens, so the ~2x spread is tokenisation, not
+  // capacity — which is exactly why this is a byte guard standing in for a token limit,
+  // and why it must be set by the TIGHTEST model rather than the default one. qwen is
+  // that model at 6,656 B; gemma, the client's shipped default, has roughly twice the
+  // headroom and is not the binding constraint.
+  //
+  // 6 KiB is a round number below 6,656 rather than at it. Three diffs do not bound a
+  // fourth, and a denser one — minified output, a lockfile, CJK — will tokenise worse
+  // than anything measured here. An earlier 32 KiB reasoned about where a 4B model's
+  // *attention* thins out, which sat ~4x above the point where the request fails
+  // outright, so the guard passed diffs the server would refuse.
   //
   // Lowering --max-tokens does not buy room (1200 -> 100 moved the ceiling ~256 B), so
   // treat max_num_tokens as a prompt budget with the reply on top, not a shared pool.
@@ -355,13 +364,17 @@ function fileSizes(text) {
 
 const RULE = '─'.repeat(76);
 
+// Deliberately not stamped "PARTIAL COVERAGE" any more. The guard sits BELOW the measured
+// server ceiling, so a diff a little over it is frequently accepted whole — asserting the
+// reply was partial would be a specific claim this script cannot check, which is the same
+// defect as the silent-truncation claim it replaced.
 const OVERSIZE_STAMP = (bytes, limit) =>
-  `!! PARTIAL COVERAGE: ${kb(bytes)} against a ${kb(limit)} guard, sent under\n`
-  + '!! --allow-oversize. If a reply comes back, the model attended to as much as fit and\n'
-  + '!! reports nothing about the rest — and neither the reply nor this script can tell you\n'
-  + '!! which part. Treat silence about a file as no information.\n'
-  + '!! Measured on LiteRT-LM 0.14.0, the likelier outcome is no reply at all: past its\n'
-  + '!! limit the server breaks the HTTP response rather than answering from what it read.';
+  `!! COVERAGE UNVERIFIED: ${kb(bytes)} against a ${kb(limit)} guard, sent under\n`
+  + '!! --allow-oversize. The guard sits below the measured server ceiling, so a diff a\n'
+  + '!! little over it is often read in full — but nothing here can tell a whole reply from\n'
+  + '!! a partial one, so treat silence about a file as no information either way.\n'
+  + '!! Well past the ceiling there is usually no reply at all: on litert-lm 0.14.0 the\n'
+  + '!! server breaks the HTTP response rather than answering from the part it read.';
 
 const FOOTER = [
   'What you just read came from a small on-device model given nothing but the diff text.',
@@ -393,7 +406,7 @@ Range (default: uncommitted changes, matching /litertlm:review):
 
 Guards:
   --max-bytes <n>     Refuse a diff larger than this (default: ${DEFAULTS.maxBytes}).
-  --allow-oversize    Send it anyway; the reply is stamped as partial coverage.
+  --allow-oversize    Send it anyway; the reply is stamped coverage-unverified.
   --dry-run           Report the range and size, send nothing, start nothing.
 
 Passed to the client:

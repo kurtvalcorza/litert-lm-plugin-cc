@@ -75,7 +75,9 @@ it ships with P1.
 
 The user points the launcher at a large branch diff. Rather than silently sending more than the
 model can attend to, the launcher refuses and tells them how to narrow it. If they choose to
-proceed anyway, the partial-coverage warning is attached to the output itself.
+proceed anyway, a coverage-unverified warning is attached to the output itself — the launcher
+cannot tell a whole reply from a truncated one, so it says coverage is unchecked rather than
+asserting the read was partial.
 
 **Why this priority**: The failure is silent and the output looks identical to a complete pass,
 so it cannot be left to the user to notice. It is P2 only because it needs the P1 path first.
@@ -231,9 +233,12 @@ starts no server, and produces no model output.
   stack itself remains the job of the readiness command and is out of scope here.
 - A runtime for the launcher and the version-control tool are already present; the launcher
   detects and names them rather than installing them.
-- The size limit is a heuristic about where a small model's attention degrades, not a hard
-  context boundary. It is stated as a heuristic and made adjustable rather than presented as an
-  exact capacity.
+- ~~The size limit is a heuristic about where a small model's attention degrades, not a hard
+  context boundary.~~ **Falsified 2026-08-02.** There is a hard boundary, and it is far lower
+  than this assumed: `serve` runs at a fixed `max_num_tokens` and stops answering past it. The
+  limit is now bisected per model rather than estimated, and the default is set below the
+  measured ceiling. It stays adjustable, and is still not presented as an exact capacity —
+  the boundary is on tokens, so no byte figure is exact for an arbitrary diff.
 - Chunking an oversized diff into several passes is out of scope: multiple passes over a
   fragmented diff would compound the false-positive rate the honesty policy already warns about.
 - The offline path has no agent to screen output. The launcher therefore states the obligation
