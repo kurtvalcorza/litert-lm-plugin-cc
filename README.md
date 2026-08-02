@@ -202,9 +202,18 @@ Four things it owns that a hand-typed pipeline gets wrong:
   and a bad one is reported alongside the bases that would have worked.
 - **Nothing to review.** An empty diff exits 3 without invoking the model, because an empty pass
   and a clean pass read identically.
-- **Size.** Past 32 KB it refuses and names the files responsible. `--allow-oversize` sends it
-  anyway and stamps the reply as partial coverage — a small model is truncated silently, and
-  neither it nor the launcher can tell you which part went unread.
+- **Size.** Past 6 KB it refuses and names the files responsible, counting `--focus` along with
+  the diff since both travel in the same request. The *ceiling* was bisected against the server —
+  three real diffs, both models this plugin ships against, on LiteRT-LM 0.14.0 (RTX 5070 Ti Laptop
+  12 GB) — and the largest accepted was 6,656 B for `qwen3-4b-instruct` and 12,288 B for
+  `gemma4-e4b`. Both run at the same fixed token budget, so that spread is tokenisation rather
+  than capacity, and the guard follows the tighter model. **6 KB itself is a chosen margin, not a
+  measured boundary**: nothing was found to break at 6,144, and three diffs do not bound a fourth
+  that tokenises worse. Expect different numbers again on another model or runtime version.
+  `--allow-oversize` sends it anyway, marked coverage-unverified: the guard is conservative, so a
+  diff slightly over it is often read in full, and nothing here can tell a whole reply from a
+  partial one. Well past the ceiling there is no reply at all — the server breaks the HTTP
+  response and the run fails. The flag finds the ceiling; it does not get a large diff under it.
 
 **What it cannot do is the screening.** Nothing sits between the model and you: verify every
 claim against the actual code before repeating it, and say plainly how many did not survive.

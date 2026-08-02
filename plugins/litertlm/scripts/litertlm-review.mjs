@@ -24,9 +24,11 @@
  *   3. THE SHELL. This is Node, not shell, so PowerShell, cmd and POSIX all invoke it
  *      the same way. No backslash continuations, which are Bash-only (Principle VI).
  *
- *   4. SIZE. A small model is silently truncated at its context limit and reports
- *      nothing — see the `litertlm-prompting` skill, rule 7. A partial read produces a
- *      reply indistinguishable from a whole one, so oversize is refused by default.
+ *   4. SIZE. Past its limit the runtime does not answer at all — measured on litert-lm
+ *      0.14.0, it breaks the HTTP response rather than replying from the part it read.
+ *      Where a model does truncate instead, the reply is indistinguishable from a whole
+ *      one (`litertlm-prompting`, rule 7). Oversize is refused by default either way:
+ *      one failure mode is confusing, the other is invisible.
  *
  * Dependency-free by constitution (Principle III): Node standard library only.
  *
@@ -54,14 +56,47 @@ const EXIT = {
 };
 
 const DEFAULTS = {
-  // A heuristic about where a 4B-class model's attention thins out, NOT a measured
-  // context limit — `serve` exposes no way to ask for one. 32 KiB is roughly 8k
-  // tokens. Deliberately conservative: the cost of being wrong high is a confident
-  // reply about a diff the model only partly saw, which is the failure this whole
-  // script exists to prevent. --max-bytes moves it.
-  maxBytes: 32 * 1024,
+  // MEASURED, not guessed — see the conditions below, because this figure does not
+  // travel. It compensates for an upstream gap: litert-lm 0.14.0's `serve` runs at a
+  // fixed max_num_tokens=4096 and offers no flag to raise it and no way to ask what it
+  // is, so the only way to learn the ceiling is to walk into it.
+  //
+  // Measured 2026-08-02 against litert-lm 0.14.0 on an RTX 5070 Ti Laptop (12 GB),
+  // sending real git diffs to /v1/chat/completions in this script's exact framing —
+  // SYSTEM above, the prompt in callModel, max_tokens 1200. Three diffs, both models
+  // this plugin ships against, largest accepted / smallest refused in bytes:
+  //
+  //   qwen3-4b-instruct (gpu)   8256/8288   7168/8192   6656/7168
+  //   gemma4-e4b (cpu default) 15360/16384 12288/14336 12288/14336
+  //
+  // Both run at the same fixed max_num_tokens, so the ~2x spread is tokenisation, not
+  // capacity — which is exactly why this is a byte guard standing in for a token limit,
+  // and why it must be set by the TIGHTEST model rather than the default one. qwen is
+  // that model at 6,656 B; gemma, the client's shipped default, has roughly twice the
+  // headroom and is not the binding constraint.
+  //
+  // 6 KiB is a round number below 6,656 rather than at it. Three diffs do not bound a
+  // fourth, and a denser one — minified output, a lockfile, CJK — will tokenise worse
+  // than anything measured here. An earlier 32 KiB reasoned about where a 4B model's
+  // *attention* thins out, which sat ~4x above the point where the request fails
+  // outright, so the guard passed diffs the server would refuse.
+  //
+  // Lowering --max-tokens does not buy room (1200 -> 100 moved the ceiling ~256 B), so
+  // treat max_num_tokens as a prompt budget with the reply on top, not a shared pool.
+  //
+  // Obsolete when `serve` can be told a token budget, or reports the one it has. The
+  // unreleased 0.15.0 config (~/.litert-lm/config.json) carries a per-model
+  // max_num_tokens; once that ships, re-measure rather than assuming this number rose.
+  maxBytes: 6 * 1024,
   maxTokens: 1200,
 };
+
+/**
+ * What wraps --focus when it reaches the prompt. A constant, not a literal at the point of
+ * use, because the size guard must weigh exactly what callModel sends: inlining it there
+ * let the guard under-count by this string's length every time focus was set.
+ */
+const FOCUS_FRAMING = ' Attend to this above all: ';
 
 /** Role stays stable; the task goes in the prompt (`litertlm-prompting`, rule 6). */
 const SYSTEM = 'You are a concise code reviewer. Report only concrete defects: bugs, '
@@ -336,11 +371,17 @@ function fileSizes(text) {
 
 const RULE = '─'.repeat(76);
 
+// Deliberately not stamped "PARTIAL COVERAGE" any more. The guard sits BELOW the measured
+// server ceiling, so a diff a little over it is frequently accepted whole — asserting the
+// reply was partial would be a specific claim this script cannot check, which is the same
+// defect as the silent-truncation claim it replaced.
 const OVERSIZE_STAMP = (bytes, limit) =>
-  `!! PARTIAL COVERAGE: ${kb(bytes)} against a ${kb(limit)} guard, sent under\n`
-  + '!! --allow-oversize. The model attends to as much as fits and reports nothing about\n'
-  + '!! the rest, so parts of this diff go unread — and neither the reply nor this script\n'
-  + '!! can tell you which. Treat silence about a file as no information.';
+  `!! COVERAGE UNVERIFIED: ${kb(bytes)} against a ${kb(limit)} guard, sent under\n`
+  + '!! --allow-oversize. The guard sits below the measured server ceiling, so a diff a\n'
+  + '!! little over it is often read in full — but nothing here can tell a whole reply from\n'
+  + '!! a partial one, so treat silence about a file as no information either way.\n'
+  + '!! Well past the ceiling there is usually no reply at all: on litert-lm 0.14.0 the\n'
+  + '!! server breaks the HTTP response rather than answering from the part it read.';
 
 const FOOTER = [
   'What you just read came from a small on-device model given nothing but the diff text.',
@@ -371,8 +412,9 @@ Range (default: uncommitted changes, matching /litertlm:review):
   --path <pathspec>   Narrow to a path. Repeatable.
 
 Guards:
-  --max-bytes <n>     Refuse a diff larger than this (default: ${DEFAULTS.maxBytes}).
-  --allow-oversize    Send it anyway; the reply is stamped as partial coverage.
+  --max-bytes <n>     Refuse a request larger than this — the diff plus --focus, which
+                      travels with it (default: ${DEFAULTS.maxBytes}).
+  --allow-oversize    Send it anyway; the reply is stamped coverage-unverified.
   --dry-run           Report the range and size, send nothing, start nothing.
 
 Passed to the client:
@@ -401,10 +443,10 @@ function requireClient() {
     + '  Reinstall: /plugin install litertlm@litert-lm-local');
 }
 
-function callModel(opts, diffBuf) {
+function callModel(opts, diffBuf, oversize) {
   const prompt = 'Review this diff. Put each defect on its own line, citing the file and line. '
     + 'If you find none, say so.'
-    + (opts.focus ? ` Attend to this above all: ${opts.focus}` : '');
+    + (opts.focus ? `${FOCUS_FRAMING}${opts.focus}` : '');
 
   const args = [CLIENT, '--system', SYSTEM, '--max-tokens', String(opts.maxTokens)];
   if (opts.model) args.push('--model', opts.model);
@@ -430,7 +472,39 @@ function callModel(opts, diffBuf) {
     // Its code is deliberately collapsed to ENVIRONMENT: the caller did not write that
     // invocation, so surfacing the client's exit 2 as "you called this wrong" would
     // point them at their own command line for a fault that is not there.
-    throw new ExitError(EXIT.ENVIRONMENT, null);
+    //
+    // The one thing the client CANNOT know is that the prompt was deliberately oversized.
+    // Its diagnosis for a broken response is a model too large for memory, which sends
+    // the reader hunting VRAM for a fault that is really the size of what we sent. Only
+    // this script knows --allow-oversize was in play, so only this script can say so.
+    //
+    // Said as a possibility, not a verdict. The client exits 1 for a broken request AND
+    // for everything before it — an unknown model, a server that would not start — and
+    // its stderr is inherited rather than captured, so nothing here can tell those apart.
+    // Asserting prompt size would flatly contradict the client's own specific message in
+    // those cases, which is worse than the silence this replaced.
+    //
+    // '' rather than null for the ordinary case: `new Error(null).message` is the STRING
+    // "null", so the top-level `if (err.message)` printed a bare "[litertlm-review] null"
+    // on every non-oversize client failure — the opposite of the silence intended here.
+    // A signal-killed child is the one case where staying silent would leave nothing at
+    // all: r.status is null, and the client died before its own catch could write a word.
+    // Not a failure mode this runtime is known to produce, but silence would be the only
+    // output, so it gets a line regardless of oversize.
+    if (r.status === null) {
+      throw new ExitError(EXIT.ENVIRONMENT,
+        `the client was terminated by a signal (${r.signal ?? 'unknown'}) before it could\n`
+        + '  report anything. Nothing was reviewed. If this was not a Ctrl-C, suspect the\n'
+        + '  machine killed it — the client and the model server are separate processes, and\n'
+        + '  this one holds the diff in memory.');
+    }
+
+    throw new ExitError(EXIT.ENVIRONMENT, oversize
+      ? 'the message above is the client\'s. If it does not already explain the failure,\n'
+        + '  note that this prompt was sent oversized under --allow-oversize: past the\n'
+        + '  server\'s limit it breaks the HTTP response, which the client reads as a memory\n'
+        + '  problem. Rule that out by narrowing with --path before chasing VRAM.'
+      : '');
   }
   return (r.stdout ?? Buffer.alloc(0)).toString('utf8').trim();
 }
@@ -469,51 +543,63 @@ function main() {
   const files = fileSizes(text);
   const out = process.stdout;
 
+  // --focus is appended to the prompt and travels in the same request as the diff, so a
+  // guard that weighs only the diff can be passed by a 6 KB diff carrying 4 KB of focus.
+  // The fixed overhead (SYSTEM, the prompt stem) was already inside the measurement the
+  // guard derives from; focus is the part that varies, so it is the part to count.
+  const focusBytes = opts.focus
+    ? Buffer.byteLength(FOCUS_FRAMING + opts.focus, 'utf8')
+    : 0;
+  const sent = bytes + focusBytes;
+  const focusNote = focusBytes ? ` (${kb(bytes)} diff + ${kb(focusBytes)} focus)` : '';
+
   if (opts.dryRun) {
     out.write(`${RULE}\n`);
     out.write(`range    : ${range}\n`);
     if (opts.paths.length) out.write(`paths    : ${opts.paths.join(', ')}\n`);
     out.write(`files    : ${files.length}\n`);
-    out.write(`size     : ${kb(bytes)} against a ${kb(opts.maxBytes)} guard\n`);
+    out.write(`size     : ${kb(sent)}${focusNote} against a ${kb(opts.maxBytes)} guard\n`);
     if (untrackedNote) out.write(`excluded : ${untrackedNote} — invisible to a diff against HEAD\n`);
     for (const f of files.slice(0, 10)) out.write(`  ${kb(f.bytes).padStart(9)}  ${f.name}\n`);
     if (files.length > 10) out.write(`  ${' '.repeat(9)}  ... and ${files.length - 10} more\n`);
     out.write(`${RULE}\n`);
   }
 
-  if (bytes > opts.maxBytes && !opts.allowOversize) {
+  if (sent > opts.maxBytes && !opts.allowOversize) {
     const top = files.slice(0, 5).map((f) => `    ${kb(f.bytes).padStart(9)}  ${f.name}`).join('\n');
     throw new ExitError(EXIT.OVERSIZE,
-      `refusing to send ${kb(bytes)}; the guard is ${kb(opts.maxBytes)} `
+      `refusing to send ${kb(sent)}${focusNote}; the guard is ${kb(opts.maxBytes)} `
       + `(${files.length} file${files.length === 1 ? '' : 's'}).\n`
-      + '  A small model is truncated at its context limit silently. It would answer from the\n'
-      + '  part it read, and neither the reply nor this script could tell you which part.\n\n'
+      + '  Past its limit litert-lm 0.14.0 breaks the HTTP response rather than answering, so\n'
+      + '  sending this would most likely just fail. Where a model truncates instead, it answers\n'
+      + '  from the part it read and nothing here can tell you which part.\n\n'
       + `  Largest contributors:\n${top}\n\n`
       + '  Narrow it:   --path <pathspec>   (repeatable)\n'
+      + (focusBytes > opts.maxBytes / 4 ? '  Shorten:     --focus is counted too, and this one is long\n' : '')
       + '  Raise it:    --max-bytes <n>\n'
-      + '  Send anyway: --allow-oversize    (the reply is then stamped partial)');
+      + '  Send anyway: --allow-oversize    (coverage is then unverified)');
   }
 
-  const oversize = bytes > opts.maxBytes;
+  const oversize = sent > opts.maxBytes;
   if (opts.dryRun) {
     out.write(oversize
-      ? `${OVERSIZE_STAMP(bytes, opts.maxBytes)}\n`
+      ? `${OVERSIZE_STAMP(sent, opts.maxBytes)}\n`
       : 'within the guard — this would be sent.\n');
     return;
   }
 
   out.write(`${RULE}\n`);
   out.write(`local pass over ${range}\n`);
-  out.write(`${files.length} file${files.length === 1 ? '' : 's'}, ${kb(bytes)}`);
+  out.write(`${files.length} file${files.length === 1 ? '' : 's'}, ${kb(sent)}${focusNote}`);
   out.write(opts.focus ? `, focus: ${opts.focus}\n` : '\n');
   if (untrackedNote) {
     out.write(`NOT COVERED: ${untrackedNote} — untracked, so a diff against HEAD cannot see\n`);
     out.write('them. Silence about a new file below means it was never sent. git add -N to include.\n');
   }
-  if (oversize) out.write(`\n${OVERSIZE_STAMP(bytes, opts.maxBytes)}\n`);
+  if (oversize) out.write(`\n${OVERSIZE_STAMP(sent, opts.maxBytes)}\n`);
   out.write(`${RULE}\n\n`);
 
-  const answer = callModel(opts, buf);
+  const answer = callModel(opts, buf, oversize);
 
   if (!answer || answer === '(empty response)') {
     throw new ExitError(EXIT.ENVIRONMENT,
@@ -530,7 +616,7 @@ function main() {
 
   out.write(`${answer}\n\n`);
   out.write(`${RULE}\n`);
-  if (oversize) out.write(`${OVERSIZE_STAMP(bytes, opts.maxBytes)}\n\n`);
+  if (oversize) out.write(`${OVERSIZE_STAMP(sent, opts.maxBytes)}\n\n`);
   out.write(`${FOOTER}\n`);
 }
 

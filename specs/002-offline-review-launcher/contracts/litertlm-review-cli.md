@@ -24,8 +24,8 @@ response.
 | `--staged` | — | Review staged changes only. Mutually exclusive with `--base`. |
 | `--path <pathspec>` | — | Narrow the diff. Repeatable. |
 | `--focus <text>` | — | Emphasis for the prompt. May also be given positionally; giving both is a usage error. |
-| `--max-bytes <n>` | 32768 | Refuse a diff larger than this. |
-| `--allow-oversize` | off | Send an oversized diff; the reply is stamped as partial coverage. |
+| `--max-bytes <n>` | 6144 | Refuse a request larger than this — the diff **plus** `--focus`, which travels with it. The default is a margin below a measured ceiling, not itself a measured boundary: on litert-lm 0.14.0 the largest diff accepted in this script's framing was 6,656–8,256 B for `qwen3-4b-instruct` and 12,288–15,360 B for `gemma4-e4b`, so the tighter model sets it. |
+| `--allow-oversize` | off | Send an oversized diff; the reply is stamped coverage-unverified. |
 | `--dry-run` | off | Report range and size; start nothing, send nothing. |
 | `--model <id>` | client's | Passed through. |
 | `--max-tokens <n>` | 1200 | Passed through. |
@@ -76,9 +76,13 @@ guards against.
    brand-new file is invisible to it. Their count and names appear in the nothing-to-review
    message, in `--dry-run`, and above the response, with `git add -N` named as the way to
    include them. Not applicable to `--staged` or a committed range.
-6. **Oversize refused by default** — the guard is a heuristic about where a 4B-class model's
-   attention thins, not a measured context limit. Overriding it stamps the partial-coverage
-   warning both above and below the reply.
+6. **Oversize refused by default** — the guard derives from a measurement and is set below it:
+   the server was bisected per model, and the default sits under the tightest ceiling observed
+   rather than at it. So a diff just over the guard is often still accepted in full — the guard
+   is deliberately conservative, not the server's own boundary. Overriding it stamps a
+   coverage-unverified warning both above and below the reply. That stamp does **not** assert
+   the reply was partial, because nothing on this path can distinguish a whole reply from a
+   truncated one.
 7. **Shell-agnostic** — a single Node invocation with no continuations, identical under
    PowerShell, cmd and POSIX shells (Principle VI).
 8. **Standard library only** — no manifest, no install step (Principle III). Missing
