@@ -481,31 +481,58 @@ async function stopProcesses(opts, ours) {
 // Inference
 // ---------------------------------------------------------------------------
 
+/**
+ * Below this, a lost connection is not worth blaming on prompt length.
+ *
+ * The measured ceilings sit around 6.5-15 KB depending on model (litertlm-review.mjs
+ * DEFAULTS), so 4 KB is comfortably under the smallest of them: a payload beneath it has
+ * not plausibly exhausted any token budget, and telling that caller to check its prompt
+ * first would be actively wrong. `setup.md`'s readiness probe sends ~26 bytes.
+ */
+const SIZE_SUSPICION_BYTES = 4 * 1024;
+
 async function chat(opts) {
   const messages = [];
   if (opts.system) messages.push({ role: 'system', content: opts.system });
   messages.push({ role: 'user', content: opts.prompt });
+
+  const body = JSON.stringify({ model: opts.model, messages, max_tokens: opts.maxTokens });
 
   let res;
   try {
     res = await fetch(`${baseUrl(opts)}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: opts.model, messages, max_tokens: opts.maxTokens }),
+      body,
       signal: AbortSignal.timeout(opts.requestTimeoutMs),
     });
   } catch (err) {
     // The server drops the connection rather than returning an HTTP error for some
     // failures, so `fetch failed` is all Node gives us. Say something useful.
+    //
+    // Ordered by what THIS request makes likely, not by what is likeliest in general.
+    // This catch is shared by every caller — the review launcher's diffs, `ask`'s piped
+    // files, `setup`'s 26-byte readiness probe — and it also catches the 15-minute
+    // AbortSignal timeout. A fixed "check the prompt size first" would be right for the
+    // first and flatly wrong for the third, so the size hypothesis is promoted only when
+    // this payload is big enough for it to be possible.
+    const bytes = Buffer.byteLength(body, 'utf8');
+    const sizeSuspect = bytes >= SIZE_SUSPICION_BYTES;
+    const kb = (n) => (n < 1024 ? `${n} B` : `${(n / 1024).toFixed(1)} KB`);
+
     throw new Error(
       `lost the connection to the server mid-request (${err.message}).\n`
-      + '  CHECK THE PROMPT SIZE FIRST. litert-lm 0.14.0 runs at a fixed max_num_tokens and\n'
-      + '  breaks the HTTP response rather than refusing cleanly once a prompt exceeds it, so\n'
-      + '  this is what an over-long prompt looks like. Measured on this hardware it took only\n'
-      + '  a few KB of diff text; see litertlm-review.mjs DEFAULTS for the figures.\n'
-      + '  Failing that, the server may have exited while loading the model, which a model too\n'
-      + '  large for available memory would cause.\n'
-      + `  Check what is available:  node <this script> --list\n`
+      + (sizeSuspect
+        ? `  CHECK THE PROMPT SIZE FIRST — this request was ${kb(bytes)}. litert-lm 0.14.0 runs\n`
+          + '  at a fixed max_num_tokens and breaks the HTTP response rather than refusing\n'
+          + '  cleanly once a prompt exceeds it, so this is what an over-long prompt looks\n'
+          + '  like. The ceiling is model-dependent; see litertlm-review.mjs DEFAULTS for\n'
+          + '  measured figures. Send less and see if it clears.\n'
+        : `  This request was only ${kb(bytes)}, so prompt length is an unlikely cause — the\n`
+          + '  measured ceilings are several KB (litertlm-review.mjs DEFAULTS). Suspect the\n'
+          + '  server instead: it may have exited while loading the model, which a model too\n'
+          + '  large for available memory would cause, or the request may have timed out.\n')
+      + '  Check what is available:  node <this script> --list\n'
       + '  Then retry naming one of those with --model <id>.');
   }
 

@@ -9,8 +9,10 @@ Run the launcher:
 node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-review.mjs" --focus "$ARGUMENTS"
 ```
 
-It owns the mechanics — resolving the client, validating the range, refusing a diff past the
-size the server was measured to answer, and stopping rather than asking the model about nothing. Do not
+It owns the mechanics — resolving the client, validating the range, refusing a diff past a
+conservative guard set *below* the observed ceiling, and stopping rather than asking the model
+about nothing. A refusal means the guard fired, not that the server was measured to choke at
+that size; do not relay it as the latter. Do not
 reassemble that pipeline by hand here; the same script is what a user runs when Claude Code is
 unavailable, and two copies of the rules would drift.
 
