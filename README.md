@@ -210,14 +210,14 @@ Four things it owns that a hand-typed pipeline gets wrong:
   than capacity, and the guard follows the tighter model. **6 KB itself is a chosen margin, not a
   measured boundary**: nothing was found to break at 6,144, and three diffs do not bound a fourth
   that tokenises worse. Expect different numbers again on another model or runtime version.
-  `--allow-oversize` sends it anyway, marked coverage-unverified. **It is a probe, not a way to
-  review a large diff.** The guard is one conservative number and the real ceiling varies about
-  2× by model, so trying is the only way to learn yours — but read the result asymmetrically. A
-  reply means the server accepted that request, which is only sound because 0.14.0 refuses rather
-  than truncating; on a runtime that truncates, a reply would prove nothing. **A failure proves
-  nothing about size at all** — an unknown model or a server that never started fails the same
-  way. Narrow with `--path` when you actually want the diff reviewed, and don't raise
-  `--max-bytes` on the strength of a single send.
+  `--allow-oversize` sends it anyway, marked coverage-unverified. **It answers one question — does
+  the server come back at all at this size — and it is not a measurement.** A reply does not show
+  the whole diff was read: nothing echoes back what the model consumed, and the bisect above found
+  where the server *stops answering*, never that everything under that point was read whole. A
+  failure does not show size was the cause either — an unknown model or a server that never
+  started fails identically. Worth asking, because the ceiling is model-dependent and no API
+  reports it; not worth raising `--max-bytes` over. Narrow with `--path` when you actually want
+  the diff reviewed.
 
 **What it cannot do is the screening.** Nothing sits between the model and you: verify every
 claim against the actual code before repeating it, and say plainly how many did not survive.

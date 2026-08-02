@@ -25,7 +25,7 @@ response.
 | `--path <pathspec>` | — | Narrow the diff. Repeatable. |
 | `--focus <text>` | — | Emphasis for the prompt. May also be given positionally; giving both is a usage error. |
 | `--max-bytes <n>` | 6144 | Refuse a request larger than this — the diff **plus** `--focus`, which travels with it. The default is a margin below a measured ceiling, not itself a measured boundary: on litert-lm 0.14.0 the largest diff accepted in this script's framing was 6,656–8,256 B for `qwen3-4b-instruct` and 12,288–15,360 B for `gemma4-e4b`, so the tighter model sets it. |
-| `--allow-oversize` | off | Send an oversized request anyway; the reply is stamped coverage-unverified. Its purpose is **probing** where the server gives out on this model, not reviewing a large diff: the guard is one conservative number, the ceiling is model-dependent (figures and conditions in the `--max-bytes` row above), and litert-lm 0.14.0 reports it nowhere. The evidence is asymmetric — a reply means the server accepted that request (sound only because 0.14.0 refuses rather than truncates), while a failure establishes nothing about size, since an unknown model or a failed server start is indistinguishable from a refused request. |
+| `--allow-oversize` | off | Send an oversized request anyway; the reply is stamped coverage-unverified. It answers one question — **does the server come back at all at this size** — and is **not a measurement**. Worth asking because the ceiling is model-dependent (figures and conditions in the `--max-bytes` row above) and litert-lm 0.14.0 reports it nowhere. A reply does not establish the whole request was read, since nothing echoes back what was consumed; a failure does not establish size as the cause, since an unknown model, a failed server start, and an empty 200 are all indistinguishable from a refused request. `--max-bytes` must not move on this signal. |
 | `--dry-run` | off | Report range and size; start nothing, send nothing. |
 | `--model <id>` | client's | Passed through. |
 | `--max-tokens <n>` | 1200 | Passed through. |
@@ -78,11 +78,11 @@ guards against.
    include them. Not applicable to `--staged` or a committed range.
 6. **Oversize refused by default** — the guard derives from a measurement and is set below it:
    the server was bisected per model, and the default sits under the tightest ceiling observed
-   rather than at it. So a diff just over the guard is often still accepted in full — the guard
-   is deliberately conservative, not the server's own boundary. Overriding it stamps a
-   coverage-unverified warning both above and below the reply. That stamp does **not** assert
-   the reply was partial, because nothing on this path can distinguish a whole reply from a
-   truncated one.
+   rather than at it. So a diff just over the guard is often still answered — the guard is
+   deliberately conservative, not the server's own boundary. Being answered is not the same as
+   being read whole, and nothing on this path establishes either way: overriding the guard
+   stamps a coverage-unverified warning above and below the reply, which asserts neither that
+   the reply was partial nor that it was complete.
 7. **Shell-agnostic** — a single Node invocation with no continuations, identical under
    PowerShell, cmd and POSIX shells (Principle VI).
 8. **Standard library only** — no manifest, no install step (Principle III). Missing
