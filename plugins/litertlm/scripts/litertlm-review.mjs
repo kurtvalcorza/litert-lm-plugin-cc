@@ -487,6 +487,18 @@ function callModel(opts, diffBuf, oversize) {
     // '' rather than null for the ordinary case: `new Error(null).message` is the STRING
     // "null", so the top-level `if (err.message)` printed a bare "[litertlm-review] null"
     // on every non-oversize client failure — the opposite of the silence intended here.
+    // A signal-killed child is the one case where staying silent would leave nothing at
+    // all: r.status is null, and the client died before its own catch could write a word.
+    // Not a failure mode this runtime is known to produce, but silence would be the only
+    // output, so it gets a line regardless of oversize.
+    if (r.status === null) {
+      throw new ExitError(EXIT.ENVIRONMENT,
+        `the client was terminated by a signal (${r.signal ?? 'unknown'}) before it could\n`
+        + '  report anything. Nothing was reviewed. If this was not a Ctrl-C, suspect the\n'
+        + '  machine killed it — the client and the model server are separate processes, and\n'
+        + '  this one holds the diff in memory.');
+    }
+
     throw new ExitError(EXIT.ENVIRONMENT, oversize
       ? 'the message above is the client\'s. If it does not already explain the failure,\n'
         + '  note that this prompt was sent oversized under --allow-oversize: past the\n'
