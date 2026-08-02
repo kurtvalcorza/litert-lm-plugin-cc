@@ -91,6 +91,13 @@ const DEFAULTS = {
   maxTokens: 1200,
 };
 
+/**
+ * What wraps --focus when it reaches the prompt. A constant, not a literal at the point of
+ * use, because the size guard must weigh exactly what callModel sends: inlining it there
+ * let the guard under-count by this string's length every time focus was set.
+ */
+const FOCUS_FRAMING = ' Attend to this above all: ';
+
 /** Role stays stable; the task goes in the prompt (`litertlm-prompting`, rule 6). */
 const SYSTEM = 'You are a concise code reviewer. Report only concrete defects: bugs, '
   + 'unhandled errors, security issues. Cite the file and line. If you find nothing, say so '
@@ -405,7 +412,8 @@ Range (default: uncommitted changes, matching /litertlm:review):
   --path <pathspec>   Narrow to a path. Repeatable.
 
 Guards:
-  --max-bytes <n>     Refuse a diff larger than this (default: ${DEFAULTS.maxBytes}).
+  --max-bytes <n>     Refuse a request larger than this — the diff plus --focus, which
+                      travels with it (default: ${DEFAULTS.maxBytes}).
   --allow-oversize    Send it anyway; the reply is stamped coverage-unverified.
   --dry-run           Report the range and size, send nothing, start nothing.
 
@@ -438,7 +446,7 @@ function requireClient() {
 function callModel(opts, diffBuf, oversize) {
   const prompt = 'Review this diff. Put each defect on its own line, citing the file and line. '
     + 'If you find none, say so.'
-    + (opts.focus ? ` Attend to this above all: ${opts.focus}` : '');
+    + (opts.focus ? `${FOCUS_FRAMING}${opts.focus}` : '');
 
   const args = [CLIENT, '--system', SYSTEM, '--max-tokens', String(opts.maxTokens)];
   if (opts.model) args.push('--model', opts.model);
@@ -469,12 +477,22 @@ function callModel(opts, diffBuf, oversize) {
     // Its diagnosis for a broken response is a model too large for memory, which sends
     // the reader hunting VRAM for a fault that is really the size of what we sent. Only
     // this script knows --allow-oversize was in play, so only this script can say so.
+    //
+    // Said as a possibility, not a verdict. The client exits 1 for a broken request AND
+    // for everything before it — an unknown model, a server that would not start — and
+    // its stderr is inherited rather than captured, so nothing here can tell those apart.
+    // Asserting prompt size would flatly contradict the client's own specific message in
+    // those cases, which is worse than the silence this replaced.
+    //
+    // '' rather than null for the ordinary case: `new Error(null).message` is the STRING
+    // "null", so the top-level `if (err.message)` printed a bare "[litertlm-review] null"
+    // on every non-oversize client failure — the opposite of the silence intended here.
     throw new ExitError(EXIT.ENVIRONMENT, oversize
-      ? 'the request failed, and it was sent oversized under --allow-oversize.\n'
-        + '  Read the client message above with that in mind: past the server\'s limit it\n'
-        + '  breaks the HTTP response, which the client reports as a memory problem. The\n'
-        + '  prompt size is the likelier cause. Drop --allow-oversize and narrow with --path.'
-      : null);
+      ? 'the message above is the client\'s. If it does not already explain the failure,\n'
+        + '  note that this prompt was sent oversized under --allow-oversize: past the\n'
+        + '  server\'s limit it breaks the HTTP response, which the client reads as a memory\n'
+        + '  problem. Rule that out by narrowing with --path before chasing VRAM.'
+      : '');
   }
   return (r.stdout ?? Buffer.alloc(0)).toString('utf8').trim();
 }
@@ -517,7 +535,9 @@ function main() {
   // guard that weighs only the diff can be passed by a 6 KB diff carrying 4 KB of focus.
   // The fixed overhead (SYSTEM, the prompt stem) was already inside the measurement the
   // guard derives from; focus is the part that varies, so it is the part to count.
-  const focusBytes = Buffer.byteLength(opts.focus, 'utf8');
+  const focusBytes = opts.focus
+    ? Buffer.byteLength(FOCUS_FRAMING + opts.focus, 'utf8')
+    : 0;
   const sent = bytes + focusBytes;
   const focusNote = focusBytes ? ` (${kb(bytes)} diff + ${kb(focusBytes)} focus)` : '';
 
