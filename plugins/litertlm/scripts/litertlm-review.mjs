@@ -372,9 +372,11 @@ function fileSizes(text) {
 const RULE = '─'.repeat(76);
 
 // Deliberately not stamped "PARTIAL COVERAGE" any more. The guard sits BELOW the measured
-// server ceiling, so a diff a little over it is frequently accepted whole — asserting the
+// server ceiling, so a diff a little over it is frequently still answered — asserting the
 // reply was partial would be a specific claim this script cannot check, which is the same
-// defect as the silent-truncation claim it replaced.
+// defect as the silent-truncation claim it replaced. Note "answered", not "accepted whole":
+// that stronger word was here too, and it is exactly what the rest of this comment says a
+// reply cannot establish.
 //
 // That gap between guard and ceiling is what --allow-oversize is FOR. litert-lm 0.14.0
 // reports its limit nowhere, and the two models measured at DEFAULTS above differ by
@@ -394,6 +396,17 @@ const RULE = '─'.repeat(76);
 // counted as evidence against this size, let alone attributed to it.
 //
 // Hence: worth trying, never worth moving --max-bytes over.
+// --dry-run reaches the oversize branch too, and starts nothing. Stamping it with the
+// sent-tense text told the caller a request "was sent" that never was, and invited a
+// sizing-only run to be read as probe evidence — which is the same over-claim as the rest
+// of this file, arriving through the one path that makes no request at all.
+const OVERSIZE_PREVIEW = (bytes, limit) =>
+  `!! WOULD EXCEED THE GUARD: ${kb(bytes)} against a ${kb(limit)} guard. With\n`
+  + '!! --allow-oversize this would be sent as one request. NOTHING WAS SENT HERE —\n'
+  + '!! --dry-run starts no server and makes no request, so this is a size report and\n'
+  + '!! not evidence about what your model accepts. Send it to learn that, and read the\n'
+  + '!! result knowing an answer is still not coverage.';
+
 const OVERSIZE_STAMP = (bytes, limit) =>
   `!! COVERAGE UNVERIFIED: ${kb(bytes)} against a ${kb(limit)} guard, sent under\n`
   + '!! --allow-oversize. The guard sits below the measured server ceiling, so a diff a\n'
@@ -618,7 +631,7 @@ function main() {
   const oversize = sent > opts.maxBytes;
   if (opts.dryRun) {
     out.write(oversize
-      ? `${OVERSIZE_STAMP(sent, opts.maxBytes)}\n`
+      ? `${OVERSIZE_PREVIEW(sent, opts.maxBytes)}\n`
       : 'within the guard — this would be sent.\n');
     return;
   }
