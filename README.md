@@ -205,8 +205,9 @@ Four things it owns that a hand-typed pipeline gets wrong:
 - **Size.** Past 6 KB it refuses and names the files responsible. That figure was bisected
   against the server rather than estimated: serving `qwen3-4b-instruct` on LiteRT-LM 0.14.0
   (GPU backend, RTX 5070 Ti Laptop 12 GB), three real diffs were accepted up to 6,656, 7,168 and
-  8,256 bytes respectively — the limit is on tokens, so it moves with how the text tokenises, and
-  6 KB is what cleared all three. Expect a different number on another model or runtime version.
+  8,256 bytes respectively — the limit is on tokens, so it moves with how the text tokenises. 6 KB
+  sits below the tightest of the three rather than at it, because three diffs do not bound the
+  fourth. Expect a different number again on another model or runtime version.
   `--allow-oversize` sends it anyway and stamps the reply as partial coverage, but past that
   ceiling an oversized request usually does not come back partial at all: the server breaks the
   HTTP response and the run fails. The flag finds the ceiling; it does not get a large diff under

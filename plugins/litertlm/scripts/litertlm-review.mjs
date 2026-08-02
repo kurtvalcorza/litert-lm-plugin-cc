@@ -24,9 +24,11 @@
  *   3. THE SHELL. This is Node, not shell, so PowerShell, cmd and POSIX all invoke it
  *      the same way. No backslash continuations, which are Bash-only (Principle VI).
  *
- *   4. SIZE. A small model is silently truncated at its context limit and reports
- *      nothing — see the `litertlm-prompting` skill, rule 7. A partial read produces a
- *      reply indistinguishable from a whole one, so oversize is refused by default.
+ *   4. SIZE. Past its limit the runtime does not answer at all — measured on litert-lm
+ *      0.14.0, it breaks the HTTP response rather than replying from the part it read.
+ *      Where a model does truncate instead, the reply is indistinguishable from a whole
+ *      one (`litertlm-prompting`, rule 7). Oversize is refused by default either way:
+ *      one failure mode is confusing, the other is invisible.
  *
  * Dependency-free by constitution (Principle III): Node standard library only.
  *
@@ -64,7 +66,9 @@ const DEFAULTS = {
   // script's exact framing — SYSTEM above, the prompt in callModel, max_tokens 1200. The
   // largest diff accepted was 8,256 B for one, 7,168 B for a second, 6,656 B for a third.
   // The cap is on TOKENS, so the byte figure moves with how densely a diff tokenises;
-  // 6 KiB is the largest value that cleared all three. An earlier 32 KiB here reasoned
+  // 6 KiB is a round number below the tightest of those three, not the largest that
+  // would have cleared them — 6,656 B also cleared all three, and the margin is
+  // deliberate, since three diffs do not bound the fourth. An earlier 32 KiB here reasoned
   // about where a 4B model's *attention* thins out, which sat ~4x above the point where
   // the request fails outright.
   //
@@ -503,8 +507,9 @@ function main() {
     throw new ExitError(EXIT.OVERSIZE,
       `refusing to send ${kb(bytes)}; the guard is ${kb(opts.maxBytes)} `
       + `(${files.length} file${files.length === 1 ? '' : 's'}).\n`
-      + '  A small model is truncated at its context limit silently. It would answer from the\n'
-      + '  part it read, and neither the reply nor this script could tell you which part.\n\n'
+      + '  Past its limit litert-lm 0.14.0 breaks the HTTP response rather than answering, so\n'
+      + '  sending this would most likely just fail. Where a model truncates instead, it answers\n'
+      + '  from the part it read and nothing here can tell you which part.\n\n'
       + `  Largest contributors:\n${top}\n\n`
       + '  Narrow it:   --path <pathspec>   (repeatable)\n'
       + '  Raise it:    --max-bytes <n>\n'

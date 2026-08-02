@@ -80,9 +80,15 @@ including whenever the answer might be outside what you supplied.
 
 ### 7. Keep input short
 
-A long prompt is silently truncated at the context limit, and you will not be told. Narrow a
-large diff to one file. Excerpt the relevant function rather than pasting the module. If the
-input feels big, it is.
+A long prompt fails, and how it fails depends on the runtime. Measured on litert-lm 0.14.0
+serving `qwen3-4b-instruct`, it breaks the HTTP response rather than answering — the caller
+sees a transport error, not a short reply. Other runtimes truncate silently instead and answer
+from what fit, which is worse because nothing marks the reply as partial. Assume either.
+
+The ceiling is lower than the model card suggests: `serve` runs at a fixed
+`max_num_tokens=4096` regardless of the model's native context, which came to roughly
+6.5–8 KiB of diff text depending on how it tokenises. Narrow a large diff to one file. Excerpt
+the relevant function rather than pasting the module. If the input feels big, it is.
 
 ### 8. Set `--max-tokens` to what you actually want
 
