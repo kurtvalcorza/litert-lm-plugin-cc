@@ -179,8 +179,9 @@ starts no server, and produces no model output.
 - **FR-014**: The size limit MUST be adjustable, and an explicit override MUST exist to send an
   oversized diff anyway.
 - **FR-015**: When an oversized diff is sent, the launcher MUST state — both before the response
-  and again after it — that the model attended to only part of the input and that which part
-  cannot be determined.
+  and again after it — that coverage is **unverified**: it MUST NOT assert the read was partial,
+  and MUST NOT imply it was complete. Nothing on this path can distinguish the two, so a
+  requirement to report partial attendance would mandate a claim the launcher cannot support.
 - **FR-016**: The launcher MUST print, after every response, the caller's obligation to verify
   each claim against the actual source and to disregard those that do not survive.
 - **FR-017**: The launcher MUST NOT describe the model as reviewing, analysing, or understanding
