@@ -435,7 +435,7 @@ function requireClient() {
     + '  Reinstall: /plugin install litertlm@litert-lm-local');
 }
 
-function callModel(opts, diffBuf) {
+function callModel(opts, diffBuf, oversize) {
   const prompt = 'Review this diff. Put each defect on its own line, citing the file and line. '
     + 'If you find none, say so.'
     + (opts.focus ? ` Attend to this above all: ${opts.focus}` : '');
@@ -464,7 +464,17 @@ function callModel(opts, diffBuf) {
     // Its code is deliberately collapsed to ENVIRONMENT: the caller did not write that
     // invocation, so surfacing the client's exit 2 as "you called this wrong" would
     // point them at their own command line for a fault that is not there.
-    throw new ExitError(EXIT.ENVIRONMENT, null);
+    //
+    // The one thing the client CANNOT know is that the prompt was deliberately oversized.
+    // Its diagnosis for a broken response is a model too large for memory, which sends
+    // the reader hunting VRAM for a fault that is really the size of what we sent. Only
+    // this script knows --allow-oversize was in play, so only this script can say so.
+    throw new ExitError(EXIT.ENVIRONMENT, oversize
+      ? 'the request failed, and it was sent oversized under --allow-oversize.\n'
+        + '  Read the client message above with that in mind: past the server\'s limit it\n'
+        + '  breaks the HTTP response, which the client reports as a memory problem. The\n'
+        + '  prompt size is the likelier cause. Drop --allow-oversize and narrow with --path.'
+      : null);
   }
   return (r.stdout ?? Buffer.alloc(0)).toString('utf8').trim();
 }
@@ -503,52 +513,61 @@ function main() {
   const files = fileSizes(text);
   const out = process.stdout;
 
+  // --focus is appended to the prompt and travels in the same request as the diff, so a
+  // guard that weighs only the diff can be passed by a 6 KB diff carrying 4 KB of focus.
+  // The fixed overhead (SYSTEM, the prompt stem) was already inside the measurement the
+  // guard derives from; focus is the part that varies, so it is the part to count.
+  const focusBytes = Buffer.byteLength(opts.focus, 'utf8');
+  const sent = bytes + focusBytes;
+  const focusNote = focusBytes ? ` (${kb(bytes)} diff + ${kb(focusBytes)} focus)` : '';
+
   if (opts.dryRun) {
     out.write(`${RULE}\n`);
     out.write(`range    : ${range}\n`);
     if (opts.paths.length) out.write(`paths    : ${opts.paths.join(', ')}\n`);
     out.write(`files    : ${files.length}\n`);
-    out.write(`size     : ${kb(bytes)} against a ${kb(opts.maxBytes)} guard\n`);
+    out.write(`size     : ${kb(sent)}${focusNote} against a ${kb(opts.maxBytes)} guard\n`);
     if (untrackedNote) out.write(`excluded : ${untrackedNote} — invisible to a diff against HEAD\n`);
     for (const f of files.slice(0, 10)) out.write(`  ${kb(f.bytes).padStart(9)}  ${f.name}\n`);
     if (files.length > 10) out.write(`  ${' '.repeat(9)}  ... and ${files.length - 10} more\n`);
     out.write(`${RULE}\n`);
   }
 
-  if (bytes > opts.maxBytes && !opts.allowOversize) {
+  if (sent > opts.maxBytes && !opts.allowOversize) {
     const top = files.slice(0, 5).map((f) => `    ${kb(f.bytes).padStart(9)}  ${f.name}`).join('\n');
     throw new ExitError(EXIT.OVERSIZE,
-      `refusing to send ${kb(bytes)}; the guard is ${kb(opts.maxBytes)} `
+      `refusing to send ${kb(sent)}${focusNote}; the guard is ${kb(opts.maxBytes)} `
       + `(${files.length} file${files.length === 1 ? '' : 's'}).\n`
       + '  Past its limit litert-lm 0.14.0 breaks the HTTP response rather than answering, so\n'
       + '  sending this would most likely just fail. Where a model truncates instead, it answers\n'
       + '  from the part it read and nothing here can tell you which part.\n\n'
       + `  Largest contributors:\n${top}\n\n`
       + '  Narrow it:   --path <pathspec>   (repeatable)\n'
+      + (focusBytes > opts.maxBytes / 4 ? '  Shorten:     --focus is counted too, and this one is long\n' : '')
       + '  Raise it:    --max-bytes <n>\n'
-      + '  Send anyway: --allow-oversize    (the reply is then stamped partial)');
+      + '  Send anyway: --allow-oversize    (coverage is then unverified)');
   }
 
-  const oversize = bytes > opts.maxBytes;
+  const oversize = sent > opts.maxBytes;
   if (opts.dryRun) {
     out.write(oversize
-      ? `${OVERSIZE_STAMP(bytes, opts.maxBytes)}\n`
+      ? `${OVERSIZE_STAMP(sent, opts.maxBytes)}\n`
       : 'within the guard — this would be sent.\n');
     return;
   }
 
   out.write(`${RULE}\n`);
   out.write(`local pass over ${range}\n`);
-  out.write(`${files.length} file${files.length === 1 ? '' : 's'}, ${kb(bytes)}`);
+  out.write(`${files.length} file${files.length === 1 ? '' : 's'}, ${kb(sent)}${focusNote}`);
   out.write(opts.focus ? `, focus: ${opts.focus}\n` : '\n');
   if (untrackedNote) {
     out.write(`NOT COVERED: ${untrackedNote} — untracked, so a diff against HEAD cannot see\n`);
     out.write('them. Silence about a new file below means it was never sent. git add -N to include.\n');
   }
-  if (oversize) out.write(`\n${OVERSIZE_STAMP(bytes, opts.maxBytes)}\n`);
+  if (oversize) out.write(`\n${OVERSIZE_STAMP(sent, opts.maxBytes)}\n`);
   out.write(`${RULE}\n\n`);
 
-  const answer = callModel(opts, buf);
+  const answer = callModel(opts, buf, oversize);
 
   if (!answer || answer === '(empty response)') {
     throw new ExitError(EXIT.ENVIRONMENT,
@@ -565,7 +584,7 @@ function main() {
 
   out.write(`${answer}\n\n`);
   out.write(`${RULE}\n`);
-  if (oversize) out.write(`${OVERSIZE_STAMP(bytes, opts.maxBytes)}\n\n`);
+  if (oversize) out.write(`${OVERSIZE_STAMP(sent, opts.maxBytes)}\n\n`);
   out.write(`${FOOTER}\n`);
 }
 

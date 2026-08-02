@@ -20,7 +20,7 @@ unavailable, and two copies of the rules would drift.
 |---|---|---|
 | 0 | A pass ran | Screen it — see below |
 | 3 | The range was empty | Say so and stop. **Do not** widen the range or review the last commit instead: a reviewer given nothing invents findings, and that is worse than reporting nothing |
-| 4 | Refused as oversized | Relay its narrowing advice. Prefer `--path <pathspec>` over `--allow-oversize`; a partial read that reads as a whole one is the failure being avoided |
+| 4 | Refused as oversized | Relay its narrowing advice. Prefer `--path <pathspec>` over `--allow-oversize`. On litert-lm 0.14.0 the failure being avoided is a request the server refuses by breaking the HTTP response — which its client reports as a memory problem, sending you after VRAM instead of prompt size. Where a runtime truncates instead, the failure is a partial read that reads as a whole one. Both are worse than narrowing |
 | 2 | Called wrong | Fix the invocation |
 | 1 | Environment failure | Relay the message; it names the missing prerequisite |
 
