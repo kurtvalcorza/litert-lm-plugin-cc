@@ -79,10 +79,14 @@ proceed anyway, a coverage-unverified warning is attached to the output itself â
 cannot tell a whole reply from a truncated one, so it says coverage is unchecked rather than
 asserting the read was partial.
 
-The override exists to **measure**, not to review: the guard is a single conservative number
+The override exists to **probe**, not to review: the guard is a single conservative number
 while the real ceiling is model-dependent, and litert-lm 0.14.0 reports it nowhere, so
-attempting a send is the only way a user learns their own. A reply means that request fit; a
-failure means it did not. Nothing about that answer makes the pass count as coverage.
+attempting a send is the only way a user learns their own. What it yields is asymmetric
+evidence, and the surfaces must say so rather than rounding it to a measurement â€” a reply
+means the server accepted that request, which holds only because this runtime refuses rather
+than truncates, while a failure establishes nothing about size, because the launcher cannot
+distinguish a refused request from an unknown model or a server that never started. Nothing
+about either answer makes the pass count as coverage.
 
 **Why this priority**: The failure is silent and the output looks identical to a complete pass,
 so it cannot be left to the user to notice. It is P2 only because it needs the P1 path first.

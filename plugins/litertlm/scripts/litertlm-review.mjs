@@ -378,10 +378,14 @@ const RULE = '─'.repeat(76);
 //
 // That gap between guard and ceiling is what --allow-oversize is FOR. litert-lm 0.14.0
 // reports its limit nowhere, and the two models measured at DEFAULTS above differ by
-// roughly 2x in bytes, so attempting a send is the only way a user learns their own. A
-// reply means this diff fit; a failure means it did not. What the flag cannot do is make
-// an oversized diff reviewable, which is why the stamp says coverage is unverified rather
-// than implying the pass counts for something.
+// roughly 2x in bytes, so attempting a send is the only way a user learns their own.
+//
+// The evidence it yields is ASYMMETRIC, and the docs must not round that off. A reply
+// means the server accepted the request — sound on 0.14.0 only because it refuses rather
+// than truncates; on a truncating runtime a reply proves nothing. A failure means less
+// still: callModel cannot distinguish a broken request from an unknown model or a server
+// that never started, which is exactly why its own message stops short of blaming size.
+// So this is evidence, not measurement, and nobody should raise --max-bytes on one reply.
 const OVERSIZE_STAMP = (bytes, limit) =>
   `!! COVERAGE UNVERIFIED: ${kb(bytes)} against a ${kb(limit)} guard, sent under\n`
   + '!! --allow-oversize. The guard sits below the measured server ceiling, so a diff a\n'
@@ -421,12 +425,14 @@ Range (default: uncommitted changes, matching /litertlm:review):
 Guards:
   --max-bytes <n>     Refuse a request larger than this — the diff plus --focus, which
                       travels with it (default: ${DEFAULTS.maxBytes}).
-  --allow-oversize    Send it anyway, stamped coverage-unverified. Use this to find
-                      where YOUR model gives out, not to review a large diff — the
-                      guard is one conservative number, the real ceiling depends on
-                      the model, and no API reports it. It answers "does this diff
-                      fit?" one attempt at a time; it does not bisect for you, and it
-                      cannot make a diff the server refuses reviewable.
+  --allow-oversize    Send it anyway, stamped coverage-unverified. For probing where
+                      YOUR model gives out — the guard is one conservative number, the
+                      ceiling depends on the model, and no API reports it. Read the
+                      result asymmetrically: on litert-lm 0.14.0, which refuses rather
+                      than truncates, a reply means the server accepted this request.
+                      A FAILURE PROVES NOTHING ABOUT SIZE — an unknown model or a
+                      server that would not start fails identically. It does not
+                      bisect, and it cannot make a refused diff reviewable.
   --dry-run           Report the range and size, send nothing, start nothing.
 
 Passed to the client:
@@ -436,8 +442,11 @@ Passed to the client:
   -h, --help          This message
 
 Exit codes:
-  0 reviewed   1 environment failure   2 usage error
-  3 nothing to review (empty diff)     4 refused as oversized
+  0 a pass ran   1 environment failure   2 usage error
+  3 nothing to review (empty diff)       4 refused as oversized
+
+  0 means a reply came back, never that the diff was reviewed — screen it. Under
+  --allow-oversize it does not even mean the whole diff was read.
 
 The model runs on this machine. Nothing in your diff leaves it.
 Readiness:  node litertlm-client.mjs --check
@@ -588,10 +597,11 @@ function main() {
       + `  Largest contributors:\n${top}\n\n`
       + '  Narrow it:    --path <pathspec>   (repeatable)   <- what you probably want\n'
       + (focusBytes > opts.maxBytes / 4 ? '  Shorten:      --focus is counted too, and this one is long\n' : '')
-      + '  Raise it:     --max-bytes <n>     if you have measured your own ceiling\n'
-      + '  Probe it:     --allow-oversize    sends this to find where your model gives\n'
-      + '                                    out; a reply means it fit, a failure means\n'
-      + '                                    it did not. Coverage is unverified either way.');
+      + '  Raise it:     --max-bytes <n>     only on evidence from more than one send\n'
+      + '  Probe it:     --allow-oversize    sends this to see whether your model takes\n'
+      + '                                    it. A reply means the server accepted it; a\n'
+      + '                                    failure does NOT prove size was the cause.\n'
+      + '                                    Coverage is unverified either way.');
   }
 
   const oversize = sent > opts.maxBytes;

@@ -212,10 +212,12 @@ Four things it owns that a hand-typed pipeline gets wrong:
   that tokenises worse. Expect different numbers again on another model or runtime version.
   `--allow-oversize` sends it anyway, marked coverage-unverified. **It is a probe, not a way to
   review a large diff.** The guard is one conservative number and the real ceiling varies about
-  2× by model, so trying is the only way to learn yours: a reply means that diff fit, a failure
-  means it did not — well past the ceiling the server breaks the HTTP response and the run fails.
-  Narrow with `--path` when you actually want the diff reviewed; raise `--max-bytes` once you
-  have measured where your own model gives out.
+  2× by model, so trying is the only way to learn yours — but read the result asymmetrically. A
+  reply means the server accepted that request, which is only sound because 0.14.0 refuses rather
+  than truncating; on a runtime that truncates, a reply would prove nothing. **A failure proves
+  nothing about size at all** — an unknown model or a server that never started fails the same
+  way. Narrow with `--path` when you actually want the diff reviewed, and don't raise
+  `--max-bytes` on the strength of a single send.
 
 **What it cannot do is the screening.** Nothing sits between the model and you: verify every
 claim against the actual code before repeating it, and say plainly how many did not survive.
