@@ -115,9 +115,14 @@ after a reboot, a pid in a state file is a number, not an identity.
 [litertlm] lost the connection to the server mid-request (fetch failed).
 ```
 
-The parenthesis carries whatever Node handed up. `Missing expected CR after response line`
-and `UND_ERR_SOCKET` are the two observed here; treat a third string as the same symptom
-rather than as a different one. None of them is a network problem.
+**The parenthesis is the only discriminator you get, and it has two readings.** `fetch failed`
+is Node's wrapper text for a broken response — the useful detail is one level down in
+`err.cause.message` (*"Missing expected CR after response line"* and `UND_ERR_SOCKET` are the
+two seen here), and the client prints `err.message` only, so that detail never reaches you.
+A **timeout** names itself instead, as *"The operation was aborted due to timeout"*. So
+`fetch failed` means the response broke; anything mentioning a timeout means it did not.
+
+Neither is a network problem.
 
 **Cause**: *usually* an over-long prompt. `serve` on **litert-lm 0.14.0** runs at a fixed
 `max_num_tokens=4096`, offers no flag to raise it and no way to ask what it is. Once a prompt
@@ -130,23 +135,31 @@ the plugin makes, and two other failures land in it. Check these before believin
 paragraph above:
 
 - **Under 4 KiB, length is not the cause.** A payload that small cannot have exhausted a
-  4096-token budget. `setup`'s readiness probe is 26 bytes. Suspect a server that exited
-  while loading — which a model too large for available memory will do — and read *"A model
-  benchmarks fine but fails when actually used"* below instead.
-- **A timeout looks nearly identical at any size.** The request cap is 15 minutes and its
-  abort is caught here too, so a slow-but-working server produces this line as well. The
-  parenthesis is the discriminator: a timeout names itself there, where a broken response
-  says `fetch failed`.
+  4096-token budget. `setup`'s readiness probe weighs ~106 bytes on the wire, roughly 40×
+  under the threshold. Suspect a server that exited while loading, which a model
+  too large for available memory will do, and read *"A model benchmarks fine but fails when
+  actually used"* below instead.
+- **A timeout hits at any size.** The request cap is 15 minutes and its abort is caught here
+  too, so a slow-but-working server produces this line as well — and above 4 KiB it produces
+  the size-suspect wording, which is then wrong. Read the parenthesis.
 
 The client applies the first of these for you — it weighs the payload and promotes the size
 hypothesis only at or above 4 KiB, saying so plainly below that. Believe that hint; it knows
 the byte count and you are guessing.
 
-**Nothing is poisoned** — observed across the 2026-08-02 measurements below, litert-lm
-0.14.0, where every refused request was followed by a successful one. The server survives.
-Do not restart it and do not repair the model. It is also not *"The machine hard-crashed"*: a
-`0x116` takes the whole machine down, so if you are reading a terminal at all, that is not
-what happened.
+**Once you have established it *is* a size refusal, nothing is poisoned** — observed across
+the 2026-08-02 measurements below, litert-lm 0.14.0, where every refused request was followed
+by a successful one. There the server survives, and restarting it or repairing the model is
+wasted work.
+
+**That reassurance does not travel to the other two paths, and this is the one place the
+distinction bites.** A server that died loading an oversized model is already gone and does
+need restarting — with a smaller model. After a timeout the server may still be busy with the
+request you abandoned, so give it time rather than assuming it is idle. Only the size case is
+known-benign.
+
+None of the three is *"The machine hard-crashed"*: a `0x116` takes the whole machine down, so
+if you are reading a terminal at all, that is not what happened.
 
 **The ceiling is in bytes only by proxy, and it is model-dependent.** Measured 2026-08-02
 against litert-lm 0.14.0 on this host — RTX 5070 Ti Laptop (12 GB), each model on the backend
@@ -192,11 +205,13 @@ sending, so it normally converts this into a clean refusal — you will more oft
 thing through `/litertlm:ask` with a large piped file, or in review under `--allow-oversize`.
 
 `--allow-oversize` is a probe, and its result is weaker than it looks in both directions. The
-guard sits *below* the measured ceiling, so a diff a little over it is frequently still
-answered — but an answer only shows a response came back at that size, never that the model
-read the whole thing. A failure shows less still: the request may never have been sent at all,
-so it is not even evidence against that size. Do not raise `--max-bytes` on the strength of
-either. See `--allow-oversize` in `litertlm-review.mjs --help`.
+guard sits *below* the measured ceiling — in all six boundary searches above, the largest
+accepted payload was over the 6 KiB guard — so a diff a little over it may well come back.
+Those searches sampled where each model stops answering, not how often an arbitrary oversized
+diff succeeds, so do not read that as a rate. And an answer only shows a response came back at that size, never
+that the model read the whole thing. A failure shows less still: the request may never have
+been sent at all, so it is not even evidence against that size. Do not raise `--max-bytes` on
+the strength of either. See `--allow-oversize` in `litertlm-review.mjs --help`.
 
 **When this is expected to stop being true**: watch `litert-lm`, not the driver. The
 unreleased **0.15.0** config at `~/.litert-lm/config.json` carries a per-model
