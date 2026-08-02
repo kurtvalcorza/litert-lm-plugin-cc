@@ -210,14 +210,15 @@ Four things it owns that a hand-typed pipeline gets wrong:
   than capacity, and the guard follows the tighter model. **6 KB itself is a chosen margin, not a
   measured boundary**: nothing was found to break at 6,144, and three diffs do not bound a fourth
   that tokenises worse. Expect different numbers again on another model or runtime version.
-  `--allow-oversize` sends it anyway, marked coverage-unverified. **It answers one question — does
-  the server come back at all at this size — and it is not a measurement.** A reply does not show
-  the whole diff was read: nothing echoes back what the model consumed, and the bisect above found
-  where the server *stops answering*, never that everything under that point was read whole. A
-  failure does not show size was the cause either — an unknown model or a server that never
-  started fails identically. Worth asking, because the ceiling is model-dependent and no API
-  reports it; not worth raising `--max-bytes` over. Narrow with `--path` when you actually want
-  the diff reviewed.
+  `--allow-oversize` sends it anyway, marked coverage-unverified. **It is not a measurement, and
+  only one of its outcomes tells you anything.** A *reply* means a response came back for a request
+  that size — nothing about what was read, since nothing echoes that back, and the bisect above
+  found where the server *stops answering*, never that everything under that point was read whole.
+  A *failure* is **inconclusive**: an unknown model or a server that never started fails before the
+  request is sent at all, and an empty `200` came back yet is reported as a failure anyway — so it
+  is not even evidence against that size. Worth trying, because the ceiling is model-dependent and
+  no API reports it; never grounds for raising `--max-bytes`. Narrow with `--path` when you
+  actually want the diff reviewed.
 
 **What it cannot do is the screening.** Nothing sits between the model and you: verify every
 claim against the actual code before repeating it, and say plainly how many did not survive.

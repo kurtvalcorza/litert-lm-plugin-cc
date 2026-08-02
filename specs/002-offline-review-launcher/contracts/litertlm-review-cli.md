@@ -25,7 +25,7 @@ response.
 | `--path <pathspec>` | — | Narrow the diff. Repeatable. |
 | `--focus <text>` | — | Emphasis for the prompt. May also be given positionally; giving both is a usage error. |
 | `--max-bytes <n>` | 6144 | Refuse a request larger than this — the diff **plus** `--focus`, which travels with it. The default is a margin below a measured ceiling, not itself a measured boundary: on litert-lm 0.14.0 the largest diff accepted in this script's framing was 6,656–8,256 B for `qwen3-4b-instruct` and 12,288–15,360 B for `gemma4-e4b`, so the tighter model sets it. |
-| `--allow-oversize` | off | Send an oversized request anyway; the reply is stamped coverage-unverified. It answers one question — **does the server come back at all at this size** — and is **not a measurement**. Worth asking because the ceiling is model-dependent (figures and conditions in the `--max-bytes` row above) and litert-lm 0.14.0 reports it nowhere. A reply does not establish the whole request was read, since nothing echoes back what was consumed; a failure does not establish size as the cause, since an unknown model, a failed server start, and an empty 200 are all indistinguishable from a refused request. `--max-bytes` must not move on this signal. |
+| `--allow-oversize` | off | Send an oversized request anyway; the reply is stamped coverage-unverified. **Not a measurement**, and only one outcome is informative. A reply establishes that a response came back for a request that size — not that the whole request was read, since nothing echoes back what was consumed. A failure establishes **nothing, not even a negative**: an unknown model and a failed server start both abort before the request is sent, and an empty 200 is a response that did come back yet is reported as a failure. Worth trying because the ceiling is model-dependent (figures and conditions in the `--max-bytes` row above) and litert-lm 0.14.0 reports it nowhere; `--max-bytes` must never move on this signal. |
 | `--dry-run` | off | Report range and size; start nothing, send nothing. |
 | `--model <id>` | client's | Passed through. |
 | `--max-tokens <n>` | 1200 | Passed through. |
@@ -39,7 +39,7 @@ Default range when none is given: the uncommitted working tree (`git diff HEAD`)
 
 | Code | Meaning |
 |---|---|
-| 0 | A pass ran |
+| 0 | Ran to completion. A pass ran **unless** the invocation was `--dry-run` or `--help`, which print and stop without ever calling the model. Where a pass did run, 0 still never means the diff was reviewed. |
 | 1 | Environment failure — git missing, not a repository, no commits, client absent, model call failed |
 | 2 | Usage error — unknown flag, empty value for a range-selecting option, unresolvable base, base sharing no history with `HEAD` |
 | 3 | Nothing to review — the range resolved and its diff is empty |
@@ -47,7 +47,8 @@ Default range when none is given: the uncommitted working tree (`git diff HEAD`)
 
 3 and 4 exist as distinct codes because both are *successful* runs that produced no review, and
 a caller that cannot tell them from 0 will report a clean pass. `/litertlm:review` branches on
-them explicitly.
+them explicitly — which it can do safely because it never passes `--dry-run` or `--help`, so in
+that workflow 0 does always mean a pass ran.
 
 ## Output
 

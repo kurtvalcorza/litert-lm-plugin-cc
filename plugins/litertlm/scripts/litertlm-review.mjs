@@ -380,16 +380,20 @@ const RULE = '─'.repeat(76);
 // reports its limit nowhere, and the two models measured at DEFAULTS above differ by
 // roughly 2x in bytes, so attempting a send is the only way a user learns their own.
 //
-// What it yields is WEAKER THAN A MEASUREMENT in both directions, and the docs must not
-// round that off. A reply shows only that a response came back: nothing echoes what the
-// model consumed, so it does not establish the whole diff was read — the #7 bisect found
-// where the server stops answering, never that everything below that point was read
-// whole. A failure shows less still: callModel cannot separate a broken request from an
-// unknown model, a server that never started, or a 200 whose content was empty, which is
-// exactly why its own message stops short of blaming size.
+// What it yields is WEAKER THAN A MEASUREMENT, and only one of its outcomes carries any
+// information at all. The docs must not round either half off.
 //
-// So the honest claim is narrow: it tells you whether the server comes back at all at
-// this size. That is worth knowing and nothing more, and --max-bytes must not move on it.
+// A REPLY shows that a response came back for a request this size — and no more. Nothing
+// echoes what the model consumed, and the #7 bisect found where the server stops
+// answering, never that everything below that point was read whole.
+//
+// A FAILURE shows nothing, not even a negative. It is tempting to read it as "too big",
+// but the request may never have been sent: requireClient, an unknown model, and a server
+// that will not start all fail before any HTTP call. And an empty 200 is a response that
+// DID come back, which main reports as a failure anyway. So a failure cannot even be
+// counted as evidence against this size, let alone attributed to it.
+//
+// Hence: worth trying, never worth moving --max-bytes over.
 const OVERSIZE_STAMP = (bytes, limit) =>
   `!! COVERAGE UNVERIFIED: ${kb(bytes)} against a ${kb(limit)} guard, sent under\n`
   + '!! --allow-oversize. The guard sits below the measured server ceiling, so a diff a\n'
@@ -429,14 +433,15 @@ Range (default: uncommitted changes, matching /litertlm:review):
 Guards:
   --max-bytes <n>     Refuse a request larger than this — the diff plus --focus, which
                       travels with it (default: ${DEFAULTS.maxBytes}).
-  --allow-oversize    Send it anyway, stamped coverage-unverified. It answers exactly
-                      one question — does the server come back at all at this size —
-                      which is worth asking because the ceiling depends on the model
-                      and no API reports it. IT IS NOT A MEASUREMENT. A reply does not
-                      show the whole diff was read: nothing echoes back what the model
-                      consumed. A failure does not show size was the cause: an unknown
-                      model or a server that would not start fails identically. Do not
-                      raise --max-bytes on the strength of a reply.
+  --allow-oversize    Send it anyway, stamped coverage-unverified. IT IS NOT A
+                      MEASUREMENT, and only one of its two outcomes tells you anything:
+                        reply    a response came back for a request this size. Nothing
+                                 about what was read — nothing echoes that back.
+                        failure  INCONCLUSIVE. An unknown model or a server that would
+                                 not start never sent the request at all, and an empty
+                                 200 came back and is reported as a failure anyway.
+                      Worth trying, since the ceiling depends on the model and no API
+                      reports it. Not grounds for raising --max-bytes.
   --dry-run           Report the range and size, send nothing, start nothing.
 
 Passed to the client:
@@ -604,10 +609,10 @@ function main() {
       + '  Narrow it:    --path <pathspec>   (repeatable)   <- what you probably want\n'
       + (focusBytes > opts.maxBytes / 4 ? '  Shorten:      --focus is counted too, and this one is long\n' : '')
       + '  Raise it:     --max-bytes <n>     only from evidence outside this tool\n'
-      + '  Try it:       --allow-oversize    answers only whether the server comes back\n'
-      + '                                    at all at this size. A reply does not show\n'
-      + '                                    the whole diff was read; a failure does not\n'
-      + '                                    show size caused it. Not a measurement.');
+      + '  Try it:       --allow-oversize    a reply tells you a response came back at\n'
+      + '                                    this size, and nothing about what was read.\n'
+      + '                                    A failure tells you nothing at all — it may\n'
+      + '                                    never have been sent. Not a measurement.');
   }
 
   const oversize = sent > opts.maxBytes;

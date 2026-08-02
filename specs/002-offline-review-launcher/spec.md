@@ -15,7 +15,7 @@ That makes it unavailable in exactly the conditions that make a local pass attra
 Code offline, rate-limited, or out of quota. The underlying client needs neither an agent nor a
 network, but driving it by hand puts four burdens on the user that the slash command otherwise
 absorbs: locating the installed client, constructing a valid diff range, translating a Bash
-example into their own shell, and noticing when a diff is too large to have been read whole.
+example into their own shell, and noticing when a diff is too large for the server to answer.
 
 This feature moves those four burdens into shipped code.
 
@@ -80,13 +80,13 @@ cannot tell a whole reply from a truncated one, so it says coverage is unchecked
 asserting the read was partial.
 
 The override exists to **probe**, not to review, and the surfaces must not inflate it into a
-measurement. It answers one question — whether the server comes back at all at this size —
-which is worth asking because the ceiling is model-dependent and litert-lm 0.14.0 reports it
-nowhere. It answers nothing else: a reply does not establish that the whole request was read,
-because nothing echoes back what the model consumed, and a failure does not establish size as
-the cause, because the launcher cannot distinguish a refused request from an unknown model, a
-server that never started, or a 200 with empty content. Neither answer makes the pass count as
-coverage, and neither is grounds for raising the guard.
+measurement. Only one of its outcomes is informative. A reply establishes that a response came
+back for a request that size — not that the whole request was read, because nothing echoes back
+what the model consumed. A failure establishes nothing, **not even a negative**: an unknown
+model and a failed server start abort before the request is sent, and a 200 with empty content
+is a response that did come back yet is reported as a failure. Trying is still worthwhile,
+since the ceiling is model-dependent and litert-lm 0.14.0 reports it nowhere — but no outcome
+makes the pass count as coverage, and none is grounds for raising the guard.
 
 **Why this priority**: The failure is silent and the output looks identical to a complete pass,
 so it cannot be left to the user to notice. It is P2 only because it needs the P1 path first.
@@ -100,7 +100,9 @@ and confirm the warning appears alongside the response.
 1. **Given** a diff larger than the configured limit, **When** the launcher runs, **Then** it
    refuses, reports measured size against the limit, and names the files that dominate it.
 2. **Given** the same diff and an explicit override, **When** the launcher runs, **Then** the
-   response is accompanied by a statement that coverage was partial and unidentifiable.
+   response is accompanied by a statement that coverage is **unverified** — asserting neither
+   that the reply was partial nor that it was complete, because nothing on this path can tell
+   the two apart.
 
 ---
 
