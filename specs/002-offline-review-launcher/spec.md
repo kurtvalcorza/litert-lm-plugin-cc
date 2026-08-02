@@ -79,6 +79,11 @@ proceed anyway, a coverage-unverified warning is attached to the output itself â
 cannot tell a whole reply from a truncated one, so it says coverage is unchecked rather than
 asserting the read was partial.
 
+The override exists to **measure**, not to review: the guard is a single conservative number
+while the real ceiling is model-dependent, and litert-lm 0.14.0 reports it nowhere, so
+attempting a send is the only way a user learns their own. A reply means that request fit; a
+failure means it did not. Nothing about that answer makes the pass count as coverage.
+
 **Why this priority**: The failure is silent and the output looks identical to a complete pass,
 so it cannot be left to the user to notice. It is P2 only because it needs the P1 path first.
 

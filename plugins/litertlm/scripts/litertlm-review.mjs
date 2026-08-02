@@ -375,6 +375,13 @@ const RULE = '─'.repeat(76);
 // server ceiling, so a diff a little over it is frequently accepted whole — asserting the
 // reply was partial would be a specific claim this script cannot check, which is the same
 // defect as the silent-truncation claim it replaced.
+//
+// That gap between guard and ceiling is what --allow-oversize is FOR. litert-lm 0.14.0
+// reports its limit nowhere, and the two models measured at DEFAULTS above differ by
+// roughly 2x in bytes, so attempting a send is the only way a user learns their own. A
+// reply means this diff fit; a failure means it did not. What the flag cannot do is make
+// an oversized diff reviewable, which is why the stamp says coverage is unverified rather
+// than implying the pass counts for something.
 const OVERSIZE_STAMP = (bytes, limit) =>
   `!! COVERAGE UNVERIFIED: ${kb(bytes)} against a ${kb(limit)} guard, sent under\n`
   + '!! --allow-oversize. The guard sits below the measured server ceiling, so a diff a\n'
@@ -414,7 +421,12 @@ Range (default: uncommitted changes, matching /litertlm:review):
 Guards:
   --max-bytes <n>     Refuse a request larger than this — the diff plus --focus, which
                       travels with it (default: ${DEFAULTS.maxBytes}).
-  --allow-oversize    Send it anyway; the reply is stamped coverage-unverified.
+  --allow-oversize    Send it anyway, stamped coverage-unverified. Use this to find
+                      where YOUR model gives out, not to review a large diff — the
+                      guard is one conservative number, the real ceiling depends on
+                      the model, and no API reports it. It answers "does this diff
+                      fit?" one attempt at a time; it does not bisect for you, and it
+                      cannot make a diff the server refuses reviewable.
   --dry-run           Report the range and size, send nothing, start nothing.
 
 Passed to the client:
@@ -574,10 +586,12 @@ function main() {
       + '  sending this would most likely just fail. Where a model truncates instead, it answers\n'
       + '  from the part it read and nothing here can tell you which part.\n\n'
       + `  Largest contributors:\n${top}\n\n`
-      + '  Narrow it:   --path <pathspec>   (repeatable)\n'
-      + (focusBytes > opts.maxBytes / 4 ? '  Shorten:     --focus is counted too, and this one is long\n' : '')
-      + '  Raise it:    --max-bytes <n>\n'
-      + '  Send anyway: --allow-oversize    (coverage is then unverified)');
+      + '  Narrow it:    --path <pathspec>   (repeatable)   <- what you probably want\n'
+      + (focusBytes > opts.maxBytes / 4 ? '  Shorten:      --focus is counted too, and this one is long\n' : '')
+      + '  Raise it:     --max-bytes <n>     if you have measured your own ceiling\n'
+      + '  Probe it:     --allow-oversize    sends this to find where your model gives\n'
+      + '                                    out; a reply means it fit, a failure means\n'
+      + '                                    it did not. Coverage is unverified either way.');
   }
 
   const oversize = sent > opts.maxBytes;

@@ -25,7 +25,7 @@ response.
 | `--path <pathspec>` | — | Narrow the diff. Repeatable. |
 | `--focus <text>` | — | Emphasis for the prompt. May also be given positionally; giving both is a usage error. |
 | `--max-bytes <n>` | 6144 | Refuse a request larger than this — the diff **plus** `--focus`, which travels with it. The default is a margin below a measured ceiling, not itself a measured boundary: on litert-lm 0.14.0 the largest diff accepted in this script's framing was 6,656–8,256 B for `qwen3-4b-instruct` and 12,288–15,360 B for `gemma4-e4b`, so the tighter model sets it. |
-| `--allow-oversize` | off | Send an oversized diff; the reply is stamped coverage-unverified. |
+| `--allow-oversize` | off | Send an oversized request anyway; the reply is stamped coverage-unverified. Its purpose is **measuring** where the server gives out on this model, not reviewing a large diff: the guard is one conservative number, the ceiling is model-dependent (figures and conditions in the `--max-bytes` row above), and litert-lm 0.14.0 reports it nowhere. A reply means that request fit; a failure means it did not. |
 | `--dry-run` | off | Report range and size; start nothing, send nothing. |
 | `--model <id>` | client's | Passed through. |
 | `--max-tokens <n>` | 1200 | Passed through. |

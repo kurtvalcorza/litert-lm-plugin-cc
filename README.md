@@ -210,10 +210,12 @@ Four things it owns that a hand-typed pipeline gets wrong:
   than capacity, and the guard follows the tighter model. **6 KB itself is a chosen margin, not a
   measured boundary**: nothing was found to break at 6,144, and three diffs do not bound a fourth
   that tokenises worse. Expect different numbers again on another model or runtime version.
-  `--allow-oversize` sends it anyway, marked coverage-unverified: the guard is conservative, so a
-  diff slightly over it is often read in full, and nothing here can tell a whole reply from a
-  partial one. Well past the ceiling there is no reply at all — the server breaks the HTTP
-  response and the run fails. The flag finds the ceiling; it does not get a large diff under it.
+  `--allow-oversize` sends it anyway, marked coverage-unverified. **It is a probe, not a way to
+  review a large diff.** The guard is one conservative number and the real ceiling varies about
+  2× by model, so trying is the only way to learn yours: a reply means that diff fit, a failure
+  means it did not — well past the ceiling the server breaks the HTTP response and the run fails.
+  Narrow with `--path` when you actually want the diff reviewed; raise `--max-bytes` once you
+  have measured where your own model gives out.
 
 **What it cannot do is the screening.** Nothing sits between the model and you: verify every
 claim against the actual code before repeating it, and say plainly how many did not survive.
