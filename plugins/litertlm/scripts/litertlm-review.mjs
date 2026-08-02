@@ -372,14 +372,46 @@ function fileSizes(text) {
 const RULE = '─'.repeat(76);
 
 // Deliberately not stamped "PARTIAL COVERAGE" any more. The guard sits BELOW the measured
-// server ceiling, so a diff a little over it is frequently accepted whole — asserting the
+// server ceiling, so a diff a little over it is frequently still answered — asserting the
 // reply was partial would be a specific claim this script cannot check, which is the same
-// defect as the silent-truncation claim it replaced.
+// defect as the silent-truncation claim it replaced. Note "answered", not "accepted whole":
+// that stronger word was here too, and it is exactly what the rest of this comment says a
+// reply cannot establish.
+//
+// That gap between guard and ceiling is what --allow-oversize is FOR. litert-lm 0.14.0
+// reports its limit nowhere, and the two models measured at DEFAULTS above differ by
+// roughly 2x in bytes, so attempting a send is the only way a user learns their own.
+//
+// What it yields is WEAKER THAN A MEASUREMENT, and only one of its outcomes carries any
+// information at all. The docs must not round either half off.
+//
+// A REPLY shows that a response came back for a request this size — and no more. Nothing
+// echoes what the model consumed, and the #7 bisect found where the server stops
+// answering, never that everything below that point was read whole.
+//
+// A FAILURE shows nothing, not even a negative. It is tempting to read it as "too big",
+// but the request may never have been sent: requireClient, an unknown model, and a server
+// that will not start all fail before any HTTP call. And an empty 200 is a response that
+// DID come back, which main reports as a failure anyway. So a failure cannot even be
+// counted as evidence against this size, let alone attributed to it.
+//
+// Hence: worth trying, never worth moving --max-bytes over.
+// --dry-run reaches the oversize branch too, and starts nothing. Stamping it with the
+// sent-tense text told the caller a request "was sent" that never was, and invited a
+// sizing-only run to be read as probe evidence — which is the same over-claim as the rest
+// of this file, arriving through the one path that makes no request at all.
+const OVERSIZE_PREVIEW = (bytes, limit) =>
+  `!! WOULD EXCEED THE GUARD: ${kb(bytes)} against a ${kb(limit)} guard. With\n`
+  + '!! --allow-oversize this would be sent as one request. NOTHING WAS SENT HERE —\n'
+  + '!! --dry-run starts no server and makes no request, so this is a size report and\n'
+  + '!! not evidence about what your model accepts. Send it to learn that, and read the\n'
+  + '!! result knowing an answer is still not coverage.';
+
 const OVERSIZE_STAMP = (bytes, limit) =>
   `!! COVERAGE UNVERIFIED: ${kb(bytes)} against a ${kb(limit)} guard, sent under\n`
   + '!! --allow-oversize. The guard sits below the measured server ceiling, so a diff a\n'
-  + '!! little over it is often read in full — but nothing here can tell a whole reply from\n'
-  + '!! a partial one, so treat silence about a file as no information either way.\n'
+  + '!! little over it is often still answered — but an answer is not coverage. Nothing\n'
+  + '!! echoes back what the model read, so treat silence about a file as no information.\n'
   + '!! Well past the ceiling there is usually no reply at all: on litert-lm 0.14.0 the\n'
   + '!! server breaks the HTTP response rather than answering from the part it read.';
 
@@ -414,7 +446,15 @@ Range (default: uncommitted changes, matching /litertlm:review):
 Guards:
   --max-bytes <n>     Refuse a request larger than this — the diff plus --focus, which
                       travels with it (default: ${DEFAULTS.maxBytes}).
-  --allow-oversize    Send it anyway; the reply is stamped coverage-unverified.
+  --allow-oversize    Send it anyway, stamped coverage-unverified. IT IS NOT A
+                      MEASUREMENT, and only one of its two outcomes tells you anything:
+                        reply    a response came back for a request this size. Nothing
+                                 about what was read — nothing echoes that back.
+                        failure  INCONCLUSIVE. An unknown model or a server that would
+                                 not start never sent the request at all, and an empty
+                                 200 came back and is reported as a failure anyway.
+                      Worth trying, since the ceiling depends on the model and no API
+                      reports it. Not grounds for raising --max-bytes.
   --dry-run           Report the range and size, send nothing, start nothing.
 
 Passed to the client:
@@ -424,8 +464,13 @@ Passed to the client:
   -h, --help          This message
 
 Exit codes:
-  0 reviewed   1 environment failure   2 usage error
-  3 nothing to review (empty diff)     4 refused as oversized
+  0 ran to completion   1 environment failure   2 usage error
+  3 nothing to review (empty diff)              4 refused as oversized
+
+  0 means this script finished what it was asked to do — which for --dry-run and
+  --help is to print and stop, without ever calling the model. Where a pass did run,
+  0 still never means the diff was reviewed; screen it. Under --allow-oversize it
+  does not even mean the whole diff was read.
 
 The model runs on this machine. Nothing in your diff leaves it.
 Readiness:  node litertlm-client.mjs --check
@@ -473,10 +518,10 @@ function callModel(opts, diffBuf, oversize) {
     // invocation, so surfacing the client's exit 2 as "you called this wrong" would
     // point them at their own command line for a fault that is not there.
     //
-    // The one thing the client CANNOT know is that the prompt was deliberately oversized.
-    // Its diagnosis for a broken response is a model too large for memory, which sends
-    // the reader hunting VRAM for a fault that is really the size of what we sent. Only
-    // this script knows --allow-oversize was in play, so only this script can say so.
+    // The one thing the client CANNOT know is that the prompt was DELIBERATELY oversized.
+    // It now names prompt size first for a broken response, but it cannot say whether that
+    // size was an accident or a choice — only this script knows --allow-oversize was in
+    // play, and only it can point at the flag as the thing to drop.
     //
     // Said as a possibility, not a verdict. The client exits 1 for a broken request AND
     // for everything before it — an unknown model, a server that would not start — and
@@ -500,10 +545,10 @@ function callModel(opts, diffBuf, oversize) {
     }
 
     throw new ExitError(EXIT.ENVIRONMENT, oversize
-      ? 'the message above is the client\'s. If it does not already explain the failure,\n'
-        + '  note that this prompt was sent oversized under --allow-oversize: past the\n'
-        + '  server\'s limit it breaks the HTTP response, which the client reads as a memory\n'
-        + '  problem. Rule that out by narrowing with --path before chasing VRAM.'
+      ? 'the message above is the client\'s. Adding only what it cannot know: this prompt\n'
+        + '  was oversized ON PURPOSE, under --allow-oversize. If size turns out to be the\n'
+        + '  cause, dropping that flag and narrowing with --path is the fix, not a smaller\n'
+        + '  model or more VRAM.'
       : '');
   }
   return (r.stdout ?? Buffer.alloc(0)).toString('utf8').trim();
@@ -574,16 +619,19 @@ function main() {
       + '  sending this would most likely just fail. Where a model truncates instead, it answers\n'
       + '  from the part it read and nothing here can tell you which part.\n\n'
       + `  Largest contributors:\n${top}\n\n`
-      + '  Narrow it:   --path <pathspec>   (repeatable)\n'
-      + (focusBytes > opts.maxBytes / 4 ? '  Shorten:     --focus is counted too, and this one is long\n' : '')
-      + '  Raise it:    --max-bytes <n>\n'
-      + '  Send anyway: --allow-oversize    (coverage is then unverified)');
+      + '  Narrow it:    --path <pathspec>   (repeatable)   <- what you probably want\n'
+      + (focusBytes > opts.maxBytes / 4 ? '  Shorten:      --focus is counted too, and this one is long\n' : '')
+      + '  Raise it:     --max-bytes <n>     only from evidence outside this tool\n'
+      + '  Try it:       --allow-oversize    a reply tells you a response came back at\n'
+      + '                                    this size, and nothing about what was read.\n'
+      + '                                    A failure tells you nothing at all — it may\n'
+      + '                                    never have been sent. Not a measurement.');
   }
 
   const oversize = sent > opts.maxBytes;
   if (opts.dryRun) {
     out.write(oversize
-      ? `${OVERSIZE_STAMP(sent, opts.maxBytes)}\n`
+      ? `${OVERSIZE_PREVIEW(sent, opts.maxBytes)}\n`
       : 'within the guard — this would be sent.\n');
     return;
   }

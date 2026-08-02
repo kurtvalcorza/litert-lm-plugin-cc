@@ -15,7 +15,7 @@ That makes it unavailable in exactly the conditions that make a local pass attra
 Code offline, rate-limited, or out of quota. The underlying client needs neither an agent nor a
 network, but driving it by hand puts four burdens on the user that the slash command otherwise
 absorbs: locating the installed client, constructing a valid diff range, translating a Bash
-example into their own shell, and noticing when a diff is too large to have been read whole.
+example into their own shell, and noticing when a diff is too large for the server to answer.
 
 This feature moves those four burdens into shipped code.
 
@@ -79,6 +79,15 @@ proceed anyway, a coverage-unverified warning is attached to the output itself �
 cannot tell a whole reply from a truncated one, so it says coverage is unchecked rather than
 asserting the read was partial.
 
+The override exists to **probe**, not to review, and the surfaces must not inflate it into a
+measurement. Only one of its outcomes is informative. A reply establishes that a response came
+back for a request that size — not that the whole request was read, because nothing echoes back
+what the model consumed. A failure establishes nothing, **not even a negative**: an unknown
+model and a failed server start abort before the request is sent, and a 200 with empty content
+is a response that did come back yet is reported as a failure. Trying is still worthwhile,
+since the ceiling is model-dependent and litert-lm 0.14.0 reports it nowhere — but no outcome
+makes the pass count as coverage, and none is grounds for raising the guard.
+
 **Why this priority**: The failure is silent and the output looks identical to a complete pass,
 so it cannot be left to the user to notice. It is P2 only because it needs the P1 path first.
 
@@ -91,7 +100,9 @@ and confirm the warning appears alongside the response.
 1. **Given** a diff larger than the configured limit, **When** the launcher runs, **Then** it
    refuses, reports measured size against the limit, and names the files that dominate it.
 2. **Given** the same diff and an explicit override, **When** the launcher runs, **Then** the
-   response is accompanied by a statement that coverage was partial and unidentifiable.
+   response is accompanied by a statement that coverage is **unverified** — asserting neither
+   that the reply was partial nor that it was complete, because nothing on this path can tell
+   the two apart.
 
 ---
 
@@ -168,8 +179,9 @@ starts no server, and produces no model output.
 - **FR-014**: The size limit MUST be adjustable, and an explicit override MUST exist to send an
   oversized diff anyway.
 - **FR-015**: When an oversized diff is sent, the launcher MUST state — both before the response
-  and again after it — that the model attended to only part of the input and that which part
-  cannot be determined.
+  and again after it — that coverage is **unverified**: it MUST NOT assert the read was partial,
+  and MUST NOT imply it was complete. Nothing on this path can distinguish the two, so a
+  requirement to report partial attendance would mandate a claim the launcher cannot support.
 - **FR-016**: The launcher MUST print, after every response, the caller's obligation to verify
   each claim against the actual source and to disregard those that do not survive.
 - **FR-017**: The launcher MUST NOT describe the model as reviewing, analysing, or understanding
