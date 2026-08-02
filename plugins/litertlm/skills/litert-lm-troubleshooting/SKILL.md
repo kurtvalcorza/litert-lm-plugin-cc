@@ -1,6 +1,6 @@
 ---
 name: litert-lm-troubleshooting
-description: Failure catalogue for local LiteRT-LM inference — crashes, hangs, silent slowness, download refusals, stale state. Load this when something is wrong rather than debugging from first principles.
+description: Failure catalogue for local LiteRT-LM inference — crashes, dropped connections, hangs, silent slowness, download refusals, stale state. Load this when something is wrong rather than debugging from first principles.
 ---
 
 # When local inference misbehaves
@@ -104,6 +104,120 @@ than can be said for `--stop`.
 
 The general lesson is the one this file already stated and the code had not finished acting on:
 after a reboot, a pid in a state file is a number, not an identity.
+
+---
+
+## The connection dropped mid-request
+
+**Symptom**:
+
+```
+[litertlm] lost the connection to the server mid-request (fetch failed).
+```
+
+**The parenthesis is the only discriminator you get, and it has two readings.** `fetch failed`
+is Node's wrapper text for a broken response — the useful detail is one level down in
+`err.cause.message` (*"Missing expected CR after response line"* and `UND_ERR_SOCKET` are the
+two seen here), and the client prints `err.message` only, so that detail never reaches you.
+A **timeout** names itself instead, as *"The operation was aborted due to timeout"*. So
+`fetch failed` means the response broke; anything mentioning a timeout means it did not.
+
+Neither is a network problem.
+
+**Cause**: *usually* an over-long prompt. `serve` on **litert-lm 0.14.0** runs at a fixed
+`max_num_tokens=4096`, offers no flag to raise it and no way to ask what it is. Once a prompt
+exceeds it the server **breaks the HTTP response** rather than returning a clean error, so
+there is no status code to match on — which is why this arrives looking like a dead server
+rather than an over-long request.
+
+**"Usually" is load-bearing — this catch is shared.** The same handler covers every request
+the plugin makes, and two other failures land in it. Check these before believing the
+paragraph above:
+
+- **Under 4 KiB, length is not the cause.** A payload that small cannot have exhausted a
+  4096-token budget. `setup`'s readiness probe weighs ~106 bytes on the wire, roughly 40×
+  under the threshold. Suspect a server that exited while loading, which a model
+  too large for available memory will do, and read *"A model benchmarks fine but fails when
+  actually used"* below instead.
+- **A timeout hits at any size.** The request cap is 15 minutes and its abort is caught here
+  too, so a slow-but-working server produces this line as well — and above 4 KiB it produces
+  the size-suspect wording, which is then wrong. Read the parenthesis.
+
+The client applies the first of these for you — it weighs the payload and promotes the size
+hypothesis only at or above 4 KiB, saying so plainly below that. Believe that hint; it knows
+the byte count and you are guessing.
+
+**Once you have established it *is* a size refusal, nothing is poisoned** — observed across
+the 2026-08-02 measurements below, litert-lm 0.14.0, where every refused request was followed
+by a successful one. There the server survives, and restarting it or repairing the model is
+wasted work.
+
+**That reassurance does not travel to the other two paths, and this is the one place the
+distinction bites.** A server that died loading an oversized model is already gone and does
+need restarting — with a smaller model. After a timeout the server may still be busy with the
+request you abandoned, so give it time rather than assuming it is idle. Only the size case is
+known-benign.
+
+None of the three is *"The machine hard-crashed"*: a `0x116` takes the whole machine down, so
+if you are reading a terminal at all, that is not what happened.
+
+**The ceiling is in bytes only by proxy, and it is model-dependent.** Measured 2026-08-02
+against litert-lm 0.14.0 on this host — RTX 5070 Ti Laptop (12 GB), each model on the backend
+it resolves to by default — sending real git diffs to `/v1/chat/completions` in
+`litertlm-review.mjs`'s exact framing: its `SYSTEM` string, its prompt shape, `max_tokens`
+1200. Three diffs per model, largest accepted / smallest refused, in bytes:
+
+| Model | Backend | 1 | 2 | 3 |
+|---|---|---|---|---|
+| `qwen3-4b-instruct` | gpu | 8,256 / 8,288 | 7,168 / 8,192 | 6,656 / 7,168 |
+| `gemma4-e4b` | cpu | 15,360 / 16,384 | 12,288 / 14,336 | 12,288 / 14,336 |
+
+Both of these run the same fixed token budget, so the ~2× spread is **tokenisation, not
+capacity**. Three diffs per model do not bound a fourth, so do not carry these bytes to a
+third model, and do not carry them to a denser diff — minified output, a lockfile, CJK all
+tokenise worse than anything measured here.
+
+`DEFAULTS` in `litertlm-review.mjs` is where these figures are maintained. If this table and
+that comment ever disagree, the comment is the one kept current.
+
+**Fix**: send less. For the review launcher that means narrowing the prompt, which is what
+`--path` is for — it is repeatable:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-review.mjs" --path src/ --path lib/foo.js
+```
+
+Excerpt the relevant function rather than pasting the module; see the `litertlm-prompting`
+skill, rule 7. The 6.5–8 KiB it quotes is the `qwen3-4b-instruct` row above, not a figure for
+every model.
+
+**Three things that look like fixes and are not.** More VRAM buys nothing *if length is
+really the cause* — the limit is a fixed token count, not memory pressure. (If you have not
+ruled out the small-payload case above, memory may well be the cause, and then it is the
+whole answer.) A smaller model buys nothing reliably: both models measured above run the same
+fixed budget, so a swap changes tokenisation rather than capacity, and these two differ by ~2×
+in a direction parameter count does not predict. Lowering `--max-tokens` buys almost nothing
+either — under the same conditions, 1200 → 100 moved the ceiling by only ~256 B. Treat
+`max_num_tokens` as a prompt budget with the reply stacked on top, not a shared pool.
+
+**Where you meet this.** `/litertlm:review` guards at 6 KiB by default and refuses before
+sending, so it normally converts this into a clean refusal — you will more often hit the real
+thing through `/litertlm:ask` with a large piped file, or in review under `--allow-oversize`.
+
+`--allow-oversize` is a probe, and its result is weaker than it looks in both directions. The
+guard sits *below* the measured ceiling — in all six boundary searches above, the largest
+accepted payload was over the 6 KiB guard — so a diff a little over it may well come back.
+Those searches sampled where each model stops answering, not how often an arbitrary oversized
+diff succeeds, so do not read that as a rate. And an answer only shows a response came back at that size, never
+that the model read the whole thing. A failure shows less still: the request may never have
+been sent at all, so it is not even evidence against that size. Do not raise `--max-bytes` on
+the strength of either. See `--allow-oversize` in `litertlm-review.mjs --help`.
+
+**When this is expected to stop being true**: watch `litert-lm`, not the driver. The
+unreleased **0.15.0** config at `~/.litert-lm/config.json` carries a per-model
+`max_num_tokens`. That the field exists is not yet evidence `serve` reads it — the workaround
+retires when `serve` can be told a token budget or reports the one it has, whichever arrives.
+When it does, **re-measure rather than assuming the number rose**.
 
 ---
 
