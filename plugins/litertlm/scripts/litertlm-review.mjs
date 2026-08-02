@@ -518,10 +518,10 @@ function callModel(opts, diffBuf, oversize) {
     // invocation, so surfacing the client's exit 2 as "you called this wrong" would
     // point them at their own command line for a fault that is not there.
     //
-    // The one thing the client CANNOT know is that the prompt was deliberately oversized.
-    // Its diagnosis for a broken response is a model too large for memory, which sends
-    // the reader hunting VRAM for a fault that is really the size of what we sent. Only
-    // this script knows --allow-oversize was in play, so only this script can say so.
+    // The one thing the client CANNOT know is that the prompt was DELIBERATELY oversized.
+    // It now names prompt size first for a broken response, but it cannot say whether that
+    // size was an accident or a choice — only this script knows --allow-oversize was in
+    // play, and only it can point at the flag as the thing to drop.
     //
     // Said as a possibility, not a verdict. The client exits 1 for a broken request AND
     // for everything before it — an unknown model, a server that would not start — and
@@ -545,10 +545,10 @@ function callModel(opts, diffBuf, oversize) {
     }
 
     throw new ExitError(EXIT.ENVIRONMENT, oversize
-      ? 'the message above is the client\'s. If it does not already explain the failure,\n'
-        + '  note that this prompt was sent oversized under --allow-oversize: past the\n'
-        + '  server\'s limit it breaks the HTTP response, which the client reads as a memory\n'
-        + '  problem. Rule that out by narrowing with --path before chasing VRAM.'
+      ? 'the message above is the client\'s. Adding only what it cannot know: this prompt\n'
+        + '  was oversized ON PURPOSE, under --allow-oversize. If size turns out to be the\n'
+        + '  cause, dropping that flag and narrowing with --path is the fix, not a smaller\n'
+        + '  model or more VRAM.'
       : '');
   }
   return (r.stdout ?? Buffer.alloc(0)).toString('utf8').trim();

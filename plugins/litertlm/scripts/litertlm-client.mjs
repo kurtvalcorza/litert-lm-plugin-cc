@@ -499,8 +499,12 @@ async function chat(opts) {
     // failures, so `fetch failed` is all Node gives us. Say something useful.
     throw new Error(
       `lost the connection to the server mid-request (${err.message}).\n`
-      + '  The server may have exited while loading the model — a model too large for '
-      + 'available memory is the usual cause.\n'
+      + '  CHECK THE PROMPT SIZE FIRST. litert-lm 0.14.0 runs at a fixed max_num_tokens and\n'
+      + '  breaks the HTTP response rather than refusing cleanly once a prompt exceeds it, so\n'
+      + '  this is what an over-long prompt looks like. Measured on this hardware it took only\n'
+      + '  a few KB of diff text; see litertlm-review.mjs DEFAULTS for the figures.\n'
+      + '  Failing that, the server may have exited while loading the model, which a model too\n'
+      + '  large for available memory would cause.\n'
       + `  Check what is available:  node <this script> --list\n`
       + '  Then retry naming one of those with --model <id>.');
   }
