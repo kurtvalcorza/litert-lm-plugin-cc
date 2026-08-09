@@ -9,8 +9,13 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-client.mjs" --stop
 ```
 
 This kills both the server and its idle watchdog, then clears the runtime state files. It
-confirms the port actually closed rather than assuming the signal landed, so a success message
-means the memory is genuinely back.
+confirms those processes actually exited rather than assuming the signal landed — by identity,
+not by the port. A server can close its socket and still be alive in teardown, so "the port went
+quiet" would say nothing about whether the memory is back.
+
+A success message therefore means **this plugin's processes are gone**. It does not promise the
+port is free: an unrelated listener may be sharing or holding it, and one is deliberately left
+running rather than killed.
 
 It stops **only what it can prove belongs to this plugin** — a recorded process whose identity
 still matches, or a listener on the port whose command line is a `litert-lm serve`. Anything

@@ -112,6 +112,14 @@ function inspectLinux(pid) {
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
     const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+
+    // Field 3 is run state. A zombie has exited — it holds no memory, answers no
+    // socket, and is only still in the table because nobody has reaped it. It keeps
+    // its pid and its start time, though, so without this check it matches its own
+    // recorded token forever and `--stop` reports a process it successfully killed as
+    // still running. Under a container PID 1 that does not reap, that is permanent.
+    if (fields[0] === 'Z') return null;
+
     const start = fields[19];                       // field 22, 1-indexed
     if (!start) return null;
     const cmdline = flatten(
@@ -331,19 +339,28 @@ export function isLitertLmServeCommand(cmdline) {
 }
 
 /**
- * Did this command line LAUNCH `exe` — is it argv[0], rather than a word somewhere?
+ * Did this command line LAUNCH `exe`?
  *
- * A substring search over the whole line does not answer that. It accepts, for
- * instance, `node worker.js --inspect C:\...\litert-lm.exe`, which merely mentions
- * the path; if a recycled pid belonged to something shaped like that, it would be
- * recorded as our server and later signalled.
+ * Two shapes count, and the second is not a concession — it is what actually
+ * happens on POSIX. `uv tool install litert-lm` writes a Python console script with
+ * a shebang, and the kernel rewrites a shebang exec to put the INTERPRETER at
+ * argv[0] and the script at argv[1]. Requiring argv[0] to be `exe` therefore never
+ * matches a real litert-lm on Linux or macOS: `server.pid` would never be recorded
+ * there, quietly removing the recorded-process fallback that `--stop` depends on
+ * when socket discovery is unavailable. On Windows `exe` is a real launcher binary
+ * and sits at argv[0], which is why this went unnoticed.
+ *
+ * What is still rejected is the case this exists for: a path mentioned somewhere in
+ * the arguments, as in `node worker.js --inspect C:\...\litert-lm.exe`.
  */
 export function commandLaunches(cmdline, exe) {
-  const argv0 = argvTokens(cmdline)[0];
-  if (!argv0 || !exe) return false;
-  return process.platform === 'win32'
-    ? argv0.toLowerCase() === String(exe).toLowerCase()
-    : argv0 === String(exe);
+  if (!exe) return false;
+  const argv = argvTokens(cmdline);
+  const same = (a, b) => (a === undefined || b === undefined ? false
+    : (process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b));
+
+  if (same(argv[0], String(exe))) return true;
+  return PYTHON_INTERPRETER.test(argv[0] ?? '') && same(argv[1], String(exe));
 }
 
 /**

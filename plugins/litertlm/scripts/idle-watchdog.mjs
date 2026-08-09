@@ -215,7 +215,12 @@ function ourTargets() {
  * not small.
  */
 function terminateServer(targets) {
-  for (const { pid } of targets) {
+  // Re-prove immediately before signalling, not from the snapshot. `ourTargets`
+  // identifies the socket owner and may then spend a second lookup resolving
+  // `server.pid` — seconds, on Windows — and a target that exits in that gap has its
+  // number reissued. The client path was given this treatment; this one was not, so
+  // the rule had two homes and only one of them was right. Again.
+  for (const pid of stillOurs(targets)) {
     try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
   }
 }

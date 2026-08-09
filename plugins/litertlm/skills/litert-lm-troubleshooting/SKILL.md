@@ -332,8 +332,10 @@ transparently. To reclaim immediately:
 node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-client.mjs" --stop
 ```
 
-If memory is still held afterwards, something else owns the port — `--stop` verifies the port
-actually closed and will say so rather than reporting false success.
+`--stop` verifies that the processes it identified as this plugin's actually exited, and names
+any that did not. It does **not** verify the port closed: a server can drop its socket and stay
+alive in teardown, still holding memory, so port silence would be the wrong thing to check. If
+it reports success and memory is still held, the holder is not one of this plugin's processes.
 
 `--stop` signals only processes it can prove are this plugin's: one it recorded whose identity
 still matches, or a listener on the port whose command line is a `litert-lm serve`. If it prints

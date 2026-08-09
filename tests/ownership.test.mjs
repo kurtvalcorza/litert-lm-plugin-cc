@@ -32,8 +32,8 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import {
-  commandLaunches, formatPidRecord, isLitertLmServeCommand, parsePidRecord, pidsOnPort,
-  recordIsStale, signallablePid, startToken,
+  commandLaunches, formatPidRecord, identity, isLitertLmServeCommand, parsePidRecord,
+  pidsOnPort, recordIsStale, signallablePid, startToken,
 } from '../plugins/litertlm/scripts/process-identity.mjs';
 
 const SCRIPTS = join(dirname(fileURLToPath(import.meta.url)), '..', 'plugins', 'litertlm', 'scripts');
@@ -392,6 +392,44 @@ describe('--stop', () => {
         'a recorded target that ignores SIGTERM must be escalated to SIGKILL');
     });
 
+  // A target that survives is the one case where the state record still matters:
+  // it may have closed its socket, so port discovery cannot find it, and clearing
+  // the record left "inspect it, then retry" with nothing to inspect and nothing for
+  // the retry to identify. Uses SIGKILL-immunity via PID 1... which does not exist,
+  // so instead: a process that cannot be killed by us is unavailable, and the next
+  // best observable is that the record for a LIVE target is not cleared.
+  test('keeps the record of a target that is still alive', { timeout: 60_000 }, async (t) => {
+    if (process.platform === 'win32') {
+      t.skip('SIGTERM cannot be trapped on Windows, so a survivor cannot be staged');
+      return;
+    }
+    const port = PORT.reuse + 60;
+    const runtime = runtimeDir();
+    const dir = stateDir(runtime, port);
+
+    // Deaf to SIGTERM *and* to SIGKILL is impossible, so this survives the SIGTERM
+    // phase and dies only to escalation — long enough to prove the record is kept
+    // while it is alive, by checking mid-flight from a concurrent reader.
+    const stubborn = reap(spawn(process.execPath,
+      ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"],
+      { stdio: 'ignore' }));
+    await sleep(600);
+    writeFileSync(join(dir, 'server.pid'), formatPidRecord(stubborn.pid), 'utf8');
+
+    const stop = spawn(process.execPath, [CLIENT, '--stop', '--port', String(port)],
+      { stdio: 'ignore', env: { ...process.env, LITERT_LM_PLUGIN_RUNTIME: runtime } });
+
+    // While the client is still escalating, the record must still be there.
+    await sleep(900);
+    assert.ok(readIfPresent(join(dir, 'server.pid')),
+      'the record must survive as long as the process it names does');
+
+    await waitFor(() => stop.exitCode !== null, { timeout: 30_000 });
+    assert.ok(await waitFor(() => !alive(stubborn.pid)), 'and the target is eventually stopped');
+    assert.equal(readIfPresent(join(dir, 'server.pid')), null,
+      'once it is gone, so is the record');
+  });
+
   test('still clears stale state when nothing provable is ours', async () => {
     const port = PORT.staleState;
     const runtime = runtimeDir();
@@ -631,10 +669,47 @@ describe('the launched-executable check', () => {
     assert.equal(commandLaunches(`"${exe}" serve --port 9379`, exe), true);
     assert.equal(commandLaunches(`${exe} serve --port 9379`, exe), true);
     assert.equal(commandLaunches(`node worker.js --inspect ${exe}`, exe), false);
-    assert.equal(commandLaunches(`python ${exe} serve`, exe), false, 'argv[0] is python');
     assert.equal(commandLaunches('', exe), false);
     assert.equal(commandLaunches(`${exe} serve`, ''), false);
   });
+
+  test('accepts the interpreter+script shape a shebang produces', () => {
+    const exe = '/home/kurt/.local/bin/litert-lm';
+    assert.equal(commandLaunches(`/usr/bin/python3 ${exe} serve --port 9379`, exe), true);
+    // Still only argv[0] or argv[1]: a path further along is an argument.
+    assert.equal(commandLaunches(`/usr/bin/python3 -X dev ${exe} serve`, exe), false);
+    assert.equal(commandLaunches(`/bin/sh ${exe} serve`, exe), false, 'sh is not an interpreter we accept');
+  });
+
+  // The premise above is a claim about the operating system, so this asks the OS.
+  // `uv tool install litert-lm` writes a Python console script with a shebang, and a
+  // shebang exec puts the INTERPRETER at argv[0] with the script at argv[1] — which
+  // is why requiring argv[0] to be the executable never matched a real litert-lm on
+  // Linux or macOS. Runs on both in CI; there is no shebang on Windows.
+  test('a real shebang launcher has the interpreter at argv[0]', { timeout: 30_000 },
+    async (t) => {
+      if (process.platform === 'win32') { t.skip('shebangs are POSIX'); return; }
+      const python = spawnSync('sh', ['-c', 'command -v python3'], { encoding: 'utf8' })
+        .stdout?.trim();
+      if (!python) { t.skip('no python3 on this host'); return; }
+
+      const dir = runtimeDir();
+      const script = join(dir, 'litert-lm');
+      writeFileSync(script,
+        `#!${python}\nimport time\ntime.sleep(30)\n`, 'utf8');
+      chmodSync(script, 0o755);
+
+      const child = reap(spawn(script, ['serve', '--port', '9999'], { stdio: 'ignore' }));
+      await sleep(1500);
+      assert.ok(alive(child.pid), 'the shebang launcher should be running');
+
+      const seen = identity(child.pid);
+      assert.ok(seen, 'the OS should describe it');
+      assert.equal(commandLaunches(seen.cmdline, script), true,
+        `a shebang launcher must be recognised as launching itself: ${seen.cmdline}`);
+
+      try { child.kill('SIGKILL'); } catch { /* ignore */ }
+    });
 });
 
 describe('release metadata', () => {

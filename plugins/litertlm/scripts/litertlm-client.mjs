@@ -562,7 +562,9 @@ function stillAlive(targets) {
 async function stopProcesses(opts) {
   const port = opts.port;
 
-  const recorded = [...ownedPids(port, ['watchdog.pid', 'server.pid']).values()];
+  const PID_FILES = ['watchdog.pid', 'server.pid'];
+  const recordedByName = ownedPids(port, PID_FILES);
+  const recorded = [...recordedByName.values()];
   const { ours, strangers } = classifyPortOwners(port);
 
   // One set of targets, each carrying the token that identifies it.
@@ -602,8 +604,19 @@ async function stopProcesses(opts) {
   }
 
   clearInFlight(port);
-  for (const f of ['server.pid', 'watchdog.pid', 'in-flight', 'last-activity',
-    'stopping', 'loaded-model', 'stopped-idle']) clearState(port, f);
+  for (const f of ['in-flight', 'last-activity', 'stopping', 'loaded-model',
+    'stopped-idle']) clearState(port, f);
+
+  // Keep the record of anything that survived. Clearing it unconditionally destroyed
+  // the only evidence a retry could use: a target that has closed its socket but is
+  // still alive is invisible to port discovery, so "inspect it, then retry" left the
+  // user with nothing to inspect and nothing for the retry to find. A record is
+  // dropped only once the process it names is gone.
+  const survivors = new Set(remaining);
+  for (const name of PID_FILES) {
+    const rec = recordedByName.get(name);
+    if (rec === undefined || !survivors.has(rec.pid)) clearState(port, name);
+  }
 
   // The verdict is about the processes we signalled, never about the endpoint.
   //
@@ -617,6 +630,7 @@ async function stopProcesses(opts) {
   return {
     signalled,
     strangers,
+    surviving: remaining,
     heldPort: ours.length > 0,
     down: remaining.length === 0,
   };
@@ -744,7 +758,7 @@ async function main() {
     // The probe reports; it does not authorise. Whether anything gets signalled is
     // decided inside stopProcesses, from process identity.
     const wasUp = await probe(opts);
-    const { signalled, strangers, heldPort, down } = await stopProcesses(opts);
+    const { signalled, strangers, surviving, heldPort, down } = await stopProcesses(opts);
 
     const noteStrangers = () => {
       if (!strangers.length) return;
@@ -773,8 +787,13 @@ async function main() {
       noteStrangers();
     } else {
       noteStrangers();
-      throw new Error(`the litert-lm server on ${baseUrl(opts)} is still running after being `
-        + 'asked to stop.\n  Inspect it, then retry.');
+      // Name the survivors. They may have closed their socket and so be invisible to
+      // any port-based look-up the reader would otherwise try — which is exactly why
+      // their state records were kept rather than cleared.
+      throw new Error(
+        `pid ${surviving.join(', ')} did not stop.\n`
+        + '  It is this plugin\'s process and it is still running, so it may still hold\n'
+        + '  accelerator memory even if it has closed its socket. Inspect it, then retry.');
     }
     return;
   }
