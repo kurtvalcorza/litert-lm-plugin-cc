@@ -53,9 +53,24 @@ after(() => {
   for (const c of spawned) { try { c.kill('SIGKILL'); } catch { /* already gone */ } }
 });
 
+/**
+ * Is this pid a running process — not a zombie?
+ *
+ * `kill(pid, 0)` keeps succeeding for a process that has exited but not been reaped,
+ * and under a container PID 1 that does not reap, a SIGKILLed fixture stays in that
+ * state indefinitely. The plugin itself does not care about the distinction (a
+ * zombie holds no accelerator memory and answers no sockets), but a test asserting
+ * "this fixture is gone" does, and it failed on exactly such a host.
+ */
 const alive = (pid) => {
   if (!Number.isInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; } catch { return false; }
+  try { process.kill(pid, 0); } catch { return false; }
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[0] !== 'Z';
+  } catch {
+    return true;                       // no /proc (Windows, macOS): kill(0) is all we have
+  }
 };
 
 const runtimeDir = () => mkdtempSync(join(tmpdir(), 'litertlm-test-'));
@@ -346,6 +361,36 @@ describe('--stop', () => {
     assert.equal(r.status, 0);
     assert.ok(alive(bystander.pid), 'a reused pid in watchdog.pid must never be signalled');
   });
+
+  // A recorded target that is alive but NOT listening must still be chased. This is
+  // the shape of a server that closes its socket on SIGTERM and then hangs in
+  // teardown while still holding accelerator memory. Conditioning the check on the
+  // port made "off the port" mean "exited", so the client stopped pressing and
+  // reported the memory released.
+  test('keeps pressing a target that is alive but no longer listening',
+    { timeout: 60_000 }, async (t) => {
+      if (process.platform === 'win32') {
+        t.skip('SIGTERM cannot be trapped on Windows, so escalation is unobservable');
+        return;
+      }
+      const port = PORT.reuse + 40;
+      const runtime = runtimeDir();
+
+      // Alive, never listening, and deaf to SIGTERM — so success requires escalation.
+      const stubborn = reap(spawn(process.execPath,
+        ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"],
+        { stdio: 'ignore' }));
+      await sleep(600);
+
+      writeFileSync(join(stateDir(runtime, port), 'server.pid'),
+        formatPidRecord(stubborn.pid), 'utf8');
+
+      const r = runClient(['--stop', '--port', String(port)], runtime);
+
+      assert.equal(r.status, 0, `--stop should succeed after escalating: ${r.stderr}`);
+      assert.ok(await waitFor(() => !alive(stubborn.pid)),
+        'a recorded target that ignores SIGTERM must be escalated to SIGKILL');
+    });
 
   test('still clears stale state when nothing provable is ours', async () => {
     const port = PORT.staleState;

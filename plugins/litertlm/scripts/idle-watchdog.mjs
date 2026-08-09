@@ -13,7 +13,7 @@
  * Started detached by litertlm-client.mjs; never invoked by a user directly.
  */
 
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -95,31 +95,54 @@ function stateWrittenAt(name) {
  * one written before this boot — is not a claim, and is removed so an abandoned
  * record cannot lock the port out of supervision forever.
  *
- * The removal quotes the exact bytes it judged: if the file changed between the
- * staleness check and the unlink, someone live has taken the slot in between and we
- * leave it alone. Without that, reclaiming a stale record could delete a live winner
- * and publish over it.
+ * Reclaiming a stale record is a RENAME, not a re-read followed by an unlink. Those
+ * are two path operations, and two watchdogs could both read the same stale bytes,
+ * both conclude they may delete, and the second one delete the record the first had
+ * just published. `rename` is atomic and consumes the name: exactly one reclaimer
+ * moves the file aside, the other gets ENOENT and stands down. If the bytes we moved
+ * turn out not to be the ones we judged — someone published in the gap — we put them
+ * back with the same exclusive create and withdraw.
  *
  * Only a watchdog writes this file, and only before it begins supervising — never
  * after deciding to stand down. That is what keeps "whoever wrote last is alive"
  * true, and it is why the client no longer publishes this record on our behalf.
  */
+function publish(record) {
+  mkdirSync(stateDir(opts.port), { recursive: true });
+  writeFileSync(statePath('watchdog.pid'), record, { encoding: 'utf8', flag: 'wx' });
+}
+
 function claimWatchdogSlot() {
   const record = formatPidRecord(process.pid);       // one lookup, not one per attempt
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      mkdirSync(stateDir(opts.port), { recursive: true });
-      writeFileSync(statePath('watchdog.pid'), record, { encoding: 'utf8', flag: 'wx' });
-      return true;
-    } catch {
-      if (attempt === 1) return false;
-      const raw = readState('watchdog.pid', '');
-      if (!recordIsStale(parsePidRecord(raw), stateWrittenAt('watchdog.pid'))) return false;
-      if (readState('watchdog.pid', '') !== raw) return false;   // changed under us
-      clearState('watchdog.pid');
-    }
+  try {
+    publish(record);
+    return true;
+  } catch { /* someone holds the name; it may be stale */ }
+
+  const raw = readState('watchdog.pid', '');
+  if (!recordIsStale(parsePidRecord(raw), stateWrittenAt('watchdog.pid'))) return false;
+
+  const aside = statePath(`watchdog.pid.reclaim.${process.pid}`);
+  try {
+    renameSync(statePath('watchdog.pid'), aside);    // atomic: only one of us wins
+  } catch {
+    return false;                                    // another reclaimer took it
   }
-  return false;
+
+  try {
+    // What we moved must be what we judged. If it changed, a live watchdog published
+    // in the gap and we are holding its record — hand it back rather than replace it.
+    if (readFileSync(aside, 'utf8').trim() !== raw) {
+      try { publish(readFileSync(aside, 'utf8')); } catch { /* slot already retaken */ }
+      return false;
+    }
+    publish(record);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    try { rmSync(aside, { force: true }); } catch { /* ignore */ }
+  }
 }
 
 /**
@@ -198,18 +221,23 @@ function terminateServer(targets) {
 }
 
 /**
- * Of `targets`, those still on the port AND still the same process.
+ * Of `targets`, those the OS says are STILL the same process, asked afresh.
  *
  * The cache is dropped first: it was filled before we signalled, so it would still
  * be describing processes that have since exited and would confirm a replacement
  * that inherited the pid. See the scope note on the cache in process-identity.mjs.
+ *
+ * Deliberately not intersected with the port. Requiring a target to still be
+ * LISTENING made "closed its socket" mean "exited" — and a server that closes the
+ * listener on SIGTERM and then hangs in teardown, still holding accelerator memory,
+ * is exactly the case where this watchdog has to keep pressing rather than write
+ * `stopped-idle` and walk away.
  */
 function stillOurs(targets) {
-  const onPort = new Set(pidsOnPort(opts.port));
-  const candidates = targets.filter((t) => onPort.has(t.pid));
-  forgetIdentities(candidates.map((t) => t.pid));
-  identities(candidates.map((t) => t.pid));
-  return candidates.filter((t) => isRecordedProcess(t.pid, t.token)).map((t) => t.pid);
+  const pids = targets.map((t) => t.pid);
+  forgetIdentities(pids);
+  identities(pids);
+  return targets.filter((t) => isRecordedProcess(t.pid, t.token)).map((t) => t.pid);
 }
 
 function cleanupAndExit(code = 0) {

@@ -174,7 +174,7 @@ function stateWrittenAt(port, name) {
  * Nothing recorded means `--stop` falls back to socket-owner discovery, which is
  * the right answer when we have nothing trustworthy to say.
  */
-function recordSpawnedPid(port, name, child, exe) {
+async function recordSpawnedPid(port, name, child, exe) {
   clearState(port, name);
   if (!child.pid) return false;
 
@@ -184,6 +184,18 @@ function recordSpawnedPid(port, name, child, exe) {
   // that would be recorded as our server.
   const seen = identity(child.pid);
   if (seen === null || !commandLaunches(seen.cmdline, exe)) return false;
+
+  // Still not enough on its own. If our child died during the lookup and the number
+  // was reissued to ANOTHER invocation of the same executable, argv[0] matches and we
+  // would persist a stranger's token as ours. Only the child handle can distinguish
+  // "our process" from "a process like ours" — so ask it, after yielding.
+  //
+  // The yield is the point. The lookup is `spawnSync` and blocks the event loop, so
+  // an exit that happened during it has not been delivered yet and `exitCode` still
+  // reads null. Checking it without turning the loop first is how an earlier version
+  // of this guard looked correct while doing nothing.
+  await sleep(50);
+  if (child.exitCode !== null || child.signalCode !== null) return false;
 
   writeState(port, name, formatPidRecord(child.pid));
   return true;
@@ -220,10 +232,12 @@ function ownedPids(port, names) {
 
   identities(records.map(([, rec]) => rec.pid));            // one lookup for all
 
+  // Returns the record, not a bare number. A pid on its own stops meaning anything
+  // the moment its process exits, so anything that will act on this later has to
+  // carry the token and re-check — see `stillAlive`.
   const owned = new Map();
   for (const [name, rec] of records) {
-    const pid = signallablePid(rec, stateWrittenAt(port, name));
-    if (pid !== null) owned.set(name, pid);
+    if (signallablePid(rec, stateWrittenAt(port, name)) !== null) owned.set(name, rec);
   }
   return owned;
 }
@@ -470,7 +484,7 @@ async function ensureServer(opts) {
   // Record the identity now, while the process is still the one we just spawned —
   // and only if the OS still says so. Asked for later, the answer could already be
   // about whoever inherited the pid.
-  recordSpawnedPid(opts.port, 'server.pid', child, exe);
+  await recordSpawnedPid(opts.port, 'server.pid', child, exe);
   // Prune, not wipe: another client may have acquired a marker against this same
   // new server between our spawn and this line.
   pruneInFlight(opts.port);
@@ -516,19 +530,23 @@ function classifyPortOwners(port) {
 }
 
 /**
- * Of the owners we proved, those still on the port AND still the same process.
+ * Of `targets`, those the OS says are STILL the same process, asked afresh.
  *
- * The cache is dropped first on purpose: it was populated before we sent SIGTERM,
- * so without this it would keep describing processes that have since exited and
- * happily confirm their replacements. Intersecting pid numbers is not enough — that
- * is the whole premise of this change, and it applies to our own frozen set too.
+ * The cache is dropped first on purpose: it was populated before we signalled
+ * anything, so without this it would keep describing processes that have since
+ * exited and happily confirm their replacements.
+ *
+ * Deliberately does not intersect with the port. An earlier version did, and it made
+ * "stopped listening" mean "exited" — a server that closes its socket on SIGTERM and
+ * then hangs in teardown, still holding accelerator memory, would drop out of the set
+ * and be reported as successfully stopped. The token already proves identity; the
+ * socket adds nothing to that and subtracts the case that matters most.
  */
-function stillOurs(port, ours) {
-  const onPort = new Set(pidsOnPort(port));
-  const candidates = ours.filter((o) => onPort.has(o.pid));
-  forgetIdentities(candidates.map((o) => o.pid));
-  identities(candidates.map((o) => o.pid));
-  return candidates.filter((o) => isRecordedProcess(o.pid, o.token)).map((o) => o.pid);
+function stillAlive(targets) {
+  const pids = targets.map((t) => t.pid);
+  forgetIdentities(pids);
+  identities(pids);
+  return targets.filter((t) => isRecordedProcess(t.pid, t.token)).map((t) => t.pid);
 }
 
 /**
@@ -546,32 +564,41 @@ async function stopProcesses(opts) {
 
   const recorded = [...ownedPids(port, ['watchdog.pid', 'server.pid']).values()];
   const { ours, strangers } = classifyPortOwners(port);
-  const signalled = [...new Set([...recorded, ...ours.map((o) => o.pid)])];
+
+  // One set of targets, each carrying the token that identifies it.
+  const targets = [];
+  for (const t of [...recorded, ...ours]) {
+    if (!targets.some((seen) => seen.pid === t.pid)) targets.push(t);
+  }
+
+  // Re-prove every target immediately before the FIRST signal, not only before
+  // escalation. `ownedPids` proved the recorded pids, but `classifyPortOwners` then
+  // spends two process lookups — seconds, on Windows — and a recorded process can
+  // exit and have its number reissued inside that gap. Proving early and signalling
+  // late is not proof; it is a stale claim with a delay in front of it.
+  let remaining = stillAlive(targets);
+  const signalled = [...remaining];
 
   for (const pid of signalled) {
     try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
   }
 
-  // Confirm the processes we signalled actually went away, rather than assuming
-  // SIGTERM landed — and judge that by THEM, not by the port.
-  //
-  // The port is an endpoint; our targets are processes. If a stranger takes the
-  // socket while we are tearing our own server down, or was sharing it, the port
-  // keeps answering and says nothing about whether our work succeeded. Escalation is
-  // likewise restricted to owners proven earlier AND re-proven now: freezing pid
-  // numbers is not enough, because under churn the listener we signalled can exit
-  // and something unrelated inherit both its number and its socket.
-  let remaining = ours.map((o) => o.pid);
-  if (ours.length) {
+  // Then confirm they actually went away rather than assuming SIGTERM landed. Both
+  // the wait and the escalation key off the same identity check, so a process that
+  // ignores SIGTERM, or closes its socket and hangs mid-teardown while still holding
+  // accelerator memory, keeps being chased instead of being declared finished.
+  if (signalled.length) {
     for (let i = 0; i < 20; i++) {
       await sleep(400);
-      remaining = stillOurs(port, ours);
+      remaining = stillAlive(targets);
       if (!remaining.length) break;
       for (const pid of remaining) {
         try { process.kill(pid, process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL'); }
         catch { /* ignore */ }
       }
     }
+  } else {
+    remaining = [];
   }
 
   clearInFlight(port);
