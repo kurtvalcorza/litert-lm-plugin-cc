@@ -494,6 +494,59 @@ describe('the idle watchdog', () => {
       assert.ok(alive(winner.pid), 'which is still running');
     });
 
+  // A target that survives escalation must not be reported as stopped.
+  //
+  // Same class as the empty-targets case, one branch over: the watchdog reached its
+  // success bookkeeping unconditionally after the escalation loop, so a process it
+  // failed to kill still produced `stopped-idle` — telling the next client memory was
+  // released — and still had its `server.pid` cleared, destroying the identity a
+  // later attempt would need for a target that is alive but no longer listening.
+  test('does not report an idle stop it could not carry out', { timeout: 90_000 },
+    async (t) => {
+      if (process.platform === 'win32') {
+        t.skip('SIGTERM cannot be trapped on Windows, so a survivor cannot be staged');
+        return;
+      }
+      const port = PORT.watchdogStranger + 40;
+      const runtime = runtimeDir();
+      const dir = stateDir(runtime, port);
+
+      // Answers /v1/models so the watchdog supervises it, and ignores every signal it
+      // is allowed to ignore, so escalation runs out of attempts.
+      const stubborn = reap(spawn(process.execPath, ['--input-type=module', '-e', `
+        import { createServer } from 'node:http';
+        process.on('SIGTERM', () => {});
+        process.on('SIGINT', () => {});
+        createServer((req, res) => {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ object: 'list', data: [] }));
+        }).listen(${port}, '127.0.0.1');
+      `], { stdio: 'ignore' }));
+      await sleep(1200);
+
+      // Recorded as ours with a real token, so the watchdog proves and targets it
+      // without needing the command line to look like litert-lm.
+      writeFileSync(join(dir, 'server.pid'), formatPidRecord(stubborn.pid), 'utf8');
+      writeFileSync(join(dir, 'last-activity'), String(Date.now() - 600_000), 'utf8');
+
+      const watchdog = reap(spawn(process.execPath,
+        [WATCHDOG, '--port', String(port), '--idle-timeout', '1'],
+        { stdio: 'ignore', env: { ...process.env, LITERT_LM_PLUGIN_RUNTIME: runtime } }));
+
+      // One poll to decide, then 30 escalation attempts at 500ms.
+      assert.ok(await waitFor(() => watchdog.exitCode !== null, { timeout: 60_000 }),
+        'the watchdog should finish its attempt');
+
+      assert.equal(readIfPresent(join(dir, 'stopped-idle')), null,
+        'a stop that did not happen must not be reported as one');
+      assert.ok(readIfPresent(join(dir, 'server.pid')),
+        'and the identity needed to retry must survive');
+      assert.equal(readIfPresent(join(dir, 'stopping')), null,
+        'while the handshake is released so clients are not blocked');
+
+      try { stubborn.kill('SIGKILL'); } catch { /* ignore */ }
+    });
+
   // The other half of an exclusive claim: it must not become a lock. A record left
   // by a crashed watchdog has to be reclaimable, or no watchdog ever starts on this
   // port again and the server holds accelerator memory until someone runs --stop.

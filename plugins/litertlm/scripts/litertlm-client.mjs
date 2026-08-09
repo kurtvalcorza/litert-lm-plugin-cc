@@ -599,6 +599,12 @@ async function stopProcesses(opts) {
         catch { /* ignore */ }
       }
     }
+    // One more check, after the last signal rather than before it. The loop refreshes
+    // `remaining` at the TOP, so a target that dies in response to the final
+    // iteration's signal would still be listed when the loop ends — reported as
+    // having refused to stop, and its state kept, when it had in fact just exited.
+    await sleep(200);
+    remaining = stillAlive(targets);
   } else {
     remaining = [];
   }
@@ -607,15 +613,26 @@ async function stopProcesses(opts) {
   for (const f of ['in-flight', 'last-activity', 'stopping', 'loaded-model',
     'stopped-idle']) clearState(port, f);
 
-  // Keep the record of anything that survived. Clearing it unconditionally destroyed
-  // the only evidence a retry could use: a target that has closed its socket but is
-  // still alive is invisible to port discovery, so "inspect it, then retry" left the
-  // user with nothing to inspect and nothing for the retry to find. A record is
-  // dropped only once the process it names is gone.
+  // Keep the identity of anything that survived. Clearing it unconditionally
+  // destroyed the only evidence a retry could use: a target that has closed its
+  // socket but is still alive is invisible to port discovery, so "inspect it, then
+  // retry" left the user with nothing to inspect and nothing for the retry to find.
   const survivors = new Set(remaining);
+  const kept = new Set();
   for (const name of PID_FILES) {
     const rec = recordedByName.get(name);
-    if (rec === undefined || !survivors.has(rec.pid)) clearState(port, name);
+    if (rec !== undefined && survivors.has(rec.pid)) kept.add(rec.pid);
+    else clearState(port, name);
+  }
+
+  // Preserving only PRE-EXISTING records is not enough. The survivor is usually the
+  // listener grandchild found from the port, which no pid file ever named — so every
+  // record would be cleared while `remaining` still pointed at it, and a retry could
+  // find it neither by port (it may have closed the socket) nor by state. Write the
+  // identity we proved, so the next run can act on the advice this one gives.
+  const orphan = targets.find((t) => survivors.has(t.pid) && !kept.has(t.pid));
+  if (orphan !== undefined) {
+    writeState(port, 'server.pid', `${orphan.pid} ${orphan.token}`);
   }
 
   // The verdict is about the processes we signalled, never about the endpoint.

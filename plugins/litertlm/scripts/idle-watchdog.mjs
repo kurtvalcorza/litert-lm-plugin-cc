@@ -338,6 +338,21 @@ async function main() {
       }
     }
 
+    // The verdict, taken after the last signal rather than before it. The loop
+    // refreshes at the top, so a target that dies in response to the final iteration
+    // would still be listed when it ends.
+    await sleep(200);
+    if (stillOurs(targets).length) {
+      // Escalation did not finish the job — a process wedged in uninterruptible I/O,
+      // or one the OS refused to signal. Publish NOTHING: `stopped-idle` tells the
+      // next client that accelerator memory was released, and clearing `server.pid`
+      // destroys the identity a later attempt would need to find a target that is
+      // still alive but no longer listening. Standing down without a report leaves
+      // the next client free to reconcile and start a fresh supervisor, which will
+      // try again once the server goes idle.
+      cleanupAndExit(1);
+    }
+
     clearState('server.pid');
     try {
       rmSync(join(stateDir(opts.port), 'in-flight.d'), { recursive: true, force: true });
