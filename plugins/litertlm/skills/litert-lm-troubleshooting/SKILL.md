@@ -335,6 +335,18 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-client.mjs" --stop
 If memory is still held afterwards, something else owns the port — `--stop` verifies the port
 actually closed and will say so rather than reporting false success.
 
+`--stop` signals only processes it can prove are this plugin's: one it recorded whose identity
+still matches, or a listener on the port whose command line is a `litert-lm serve`. If it prints
+`is listening on port … and was left running`, the port belongs to something else — another
+model server, or a previous server started under a different name. That message is the answer,
+not a failure: stop that process yourself, or run on a different `--port`.
+
+The same rule now applies to a `server.pid` left over from a crash. A pid whose owner has exited
+can be handed to an unrelated process, so a recorded pid alone no longer authorises anything.
+If `--stop` says nothing was running while a server clearly is, check that the listener really
+is `litert-lm` — `Get-NetTCPConnection -LocalPort 9379 -State Listen` on Windows, `lsof -i :9379`
+elsewhere.
+
 `--idle-timeout 0` disables automatic shutdown entirely.
 
 ---

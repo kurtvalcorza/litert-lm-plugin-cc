@@ -275,6 +275,18 @@ not a document to retrofit;
 [`quickstart.md`](specs/001-local-gemma-plugin/quickstart.md) contains runnable verification
 scenarios for every claim above.
 
+### Tests
+
+```bash
+node --test "tests/*.test.mjs"
+```
+
+No dependencies and no test framework — `node:test` is standard library, like everything else
+here. The suite spawns real processes, binds real sockets and sends real signals, because the
+defects it guards against lived in the gap between what the code believed about a pid and what
+the operating system knew; a mock would have agreed with the bug. It uses spare ports and a
+scratch state directory, so it is safe to run while a server is up on the default port.
+
 ## Licence
 
 [Apache-2.0](LICENSE). See [NOTICE](NOTICE) for upstream attribution.

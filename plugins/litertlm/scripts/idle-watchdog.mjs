@@ -14,13 +14,21 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 // The marker rule lives in one file so this and the client cannot drift apart.
-import { pidAlive, reapMarkers } from './marker-state.mjs';
+import { reapMarkers } from './marker-state.mjs';
+
+// So does the ownership rule. This file used to be the weaker of the two readers:
+// it accepted a recorded `server.pid` on bare liveness, with none of the checks the
+// client applied, so the supervisor could SIGTERM a bystander the client would have
+// refused to touch. One home, one rule, no weaker copy.
+import {
+  formatPidRecord, identities, looksLikeLitertLmServe, parsePidRecord, signallablePid,
+} from './process-identity.mjs';
 
 const POLL_INTERVAL_MS = 5000;
 
@@ -73,6 +81,21 @@ function writeState(name, value) {
 function clearState(name) {
   try { rmSync(statePath(name), { force: true }); } catch { /* ignore */ }
 }
+
+/** When a state file was last written, or null if it is not there. */
+function stateWrittenAt(name) {
+  try { return statSync(statePath(name)).mtimeMs; } catch { return null; }
+}
+
+/**
+ * The pid recorded under `name`, but only if it is provably still that process.
+ *
+ * Authority-grade at both call sites, and affordable at both: this process is
+ * detached and long-lived, so a lookup at start-up and another when it decides to
+ * terminate something are not on anyone's interactive path.
+ */
+const ownedPid = (name) =>
+  signallablePid(parsePidRecord(readState(name, '')), stateWrittenAt(name));
 
 /**
  * Count live in-flight requests, reaping stale markers on the way.
@@ -136,13 +159,23 @@ function pidsOnPort(port) {
  * the GPU backend an abrupt teardown of an unrelated process is not free — repeated
  * re-init is what has been observed to hang the display driver (bugcheck 0x116).
  *
- * Only this port's socket owners, plus the pid we recorded ourselves, are targets.
+ * Narrowing to the port was necessary but not sufficient: the port is a location,
+ * not an identity, and an unrelated OpenAI-compatible server sitting on it was still
+ * a target. Every pid is now proven before it is signalled — socket owners by their
+ * command line, the recorded pid by the start token written when it was spawned.
+ * Anything unprovable is left running.
  */
+function ourTargets() {
+  const listening = pidsOnPort(opts.port);
+  identities(listening);                              // one lookup for all of them
+  const targets = new Set(listening.filter(looksLikeLitertLmServe));
+  const recorded = ownedPid('server.pid');
+  if (recorded !== null) targets.add(recorded);
+  return targets;
+}
+
 function terminateServer() {
-  const targets = new Set(pidsOnPort(opts.port));
-  const recorded = Number.parseInt(readState('server.pid', ''), 10);
-  if (pidAlive(recorded)) targets.add(recorded);
-  for (const pid of targets) {
+  for (const pid of ourTargets()) {
     try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
   }
 }
@@ -152,8 +185,8 @@ function cleanupAndExit(code = 0) {
   // concludes the shutdown is over and immediately asks whether a watchdog is live;
   // if `watchdog.pid` still named this (exiting) process it would decline to start
   // one, and the server it goes on to launch would never be supervised.
-  const mine = Number.parseInt(readState('watchdog.pid', ''), 10);
-  if (mine === process.pid) clearState('watchdog.pid');
+  const mine = parsePidRecord(readState('watchdog.pid', ''));
+  if (mine?.pid === process.pid) clearState('watchdog.pid');
   clearState('stopping');
   process.exit(code);
 }
@@ -164,10 +197,17 @@ async function main() {
   }
 
   // Single-supervisor rule (T055): never compete with a live watchdog on this port.
-  const existing = Number.parseInt(readState('watchdog.pid', ''), 10);
-  if (pidAlive(existing) && existing !== process.pid) process.exit(0);
+  // Proven identity, not bare liveness — a reused pid here used to make a fresh
+  // watchdog stand down in favour of a supervisor that does not exist, and the
+  // server it was meant to supervise would then hold accelerator memory until
+  // someone ran --stop by hand.
+  const existing = ownedPid('watchdog.pid');
+  if (existing !== null && existing !== process.pid) process.exit(0);
 
-  writeState('watchdog.pid', process.pid);
+  // Normally the client has already recorded us, and `existing` is our own pid — in
+  // which case there is nothing to write and no lookup to pay for. Self-recording
+  // remains for the case where this was started some other way.
+  if (existing === null) writeState('watchdog.pid', formatPidRecord(process.pid));
 
   const idleMs = opts.idleTimeout * 1000;
   const ceilingMs = Math.max(idleMs * HARD_CEILING_MULTIPLIER, HARD_CEILING_FLOOR_MS);
@@ -177,8 +217,8 @@ async function main() {
     await sleep(POLL_INTERVAL_MS);
 
     // Another watchdog took over — stand down rather than double-terminate.
-    const owner = Number.parseInt(readState('watchdog.pid', ''), 10);
-    if (owner !== process.pid) process.exit(0);
+    const owner = parsePidRecord(readState('watchdog.pid', ''));
+    if (owner?.pid !== process.pid) process.exit(0);
 
     // A model switch tears the engine down and re-initialises it, so the server is
     // legitimately unreachable for tens of seconds *while a request is in flight*.
@@ -211,14 +251,16 @@ async function main() {
 
     // Signal before acting, so a client cannot connect to a dying server (FR-025).
     writeState('stopping', Date.now());
+    const targets = ourTargets();
     terminateServer();
 
     for (let i = 0; i < 30; i++) {
       await sleep(500);
       if (!(await serverReachable())) break;
-      // Still answering: escalate on whatever still holds the socket. SIGTERM can be
-      // ignored, and a server left alive here holds accelerator memory indefinitely.
-      for (const pid of pidsOnPort(opts.port)) {
+      // Still answering: escalate, but only on pids already proven ours above. What
+      // is still reachable might be a different server that took the port while we
+      // were tearing ours down, and re-deriving the set here would escalate onto it.
+      for (const pid of pidsOnPort(opts.port).filter((p) => targets.has(p))) {
         try { process.kill(pid, process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL'); }
         catch { /* ignore */ }
       }

@@ -23,9 +23,16 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 // The marker rule lives in one file so this and the watchdog cannot drift apart.
-// BOOT_TIME_MS comes from there too: the pid files need the same boot-session test
-// the markers already get, and one definition of "before this boot" is the point.
-import { BOOT_TIME_MS, pidAlive, reapMarkers } from './marker-state.mjs';
+import { pidAlive, reapMarkers } from './marker-state.mjs';
+
+// Ownership — who we are allowed to signal — is defined once, for the same reason.
+// `recordIsStale` and `signallablePid` answer deliberately different questions; the
+// note above them explains which belongs where, and it is worth reading before
+// choosing one.
+import {
+  formatPidRecord, identities, looksLikeLitertLmServe, parsePidRecord, recordIsStale,
+  signallablePid,
+} from './process-identity.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -146,32 +153,48 @@ function stateWrittenAt(port, name) {
   try { return statSync(statePath(port, name)).mtimeMs; } catch { return null; }
 }
 
+/** Record a pid we just spawned, together with the token that re-identifies it. */
+const writeOwnedPid = (port, name, pid) =>
+  writeState(port, name, formatPidRecord(pid));
+
+const pidRecord = (port, name) => parsePidRecord(readState(port, name, ''));
+
 /**
- * The pid recorded under `name`, but only if it is ours to believe.
+ * Hygiene only: is this state file dead wood? Costs nothing, kills nothing.
  *
- * Two tests, both required — the same pair `markerIsStale` applies to in-flight
- * markers, for the same reason. Pid liveness is exact only WITHIN one boot session:
- * the OS reuses pids, so after a reboot a dead server's pid can belong to something
- * unrelated and very much alive.
- *
- * That is not theoretical. After the 0x116 bugcheck of 2026-08-01 20:49 this host
- * came back with `server.pid` naming a running Discord and `watchdog.pid` naming a
- * running VS Code, both files written two minutes before boot. Believing them cost
- * two things: `startWatchdog` saw a supervisor that did not exist and never started
- * one, so the server would have held accelerator memory until stopped by hand; and
- * `stopProcesses` would have sent SIGTERM to both of those applications.
- *
- * marker-state.mjs already warned about exactly this and noted an earlier crash had
- * survived it "only because the pid happened not to be reused". The rule was right;
- * it was simply not applied here.
+ * See the two-questions note in process-identity.mjs for why this is deliberately
+ * weaker than `ownedPids` and must never be used to justify signalling anything.
  */
-const livePid = (port, name) => {
-  const pid = Number.parseInt(readState(port, name, ''), 10);
-  if (!pidAlive(pid)) return null;
-  const writtenAt = stateWrittenAt(port, name);
-  if (writtenAt !== null && writtenAt < BOOT_TIME_MS) return null;   // pre-boot: a reused pid
-  return pid;
-};
+const staleRecord = (port, name) =>
+  recordIsStale(pidRecord(port, name), stateWrittenAt(port, name));
+
+/**
+ * Authority: of `names`, the pids we can PROVE are the processes we started.
+ *
+ * The verdict is `signallablePid`, in process-identity.mjs — the watchdog applies
+ * the identical rule, and it is defined once for the same reason the marker rule is.
+ * What is added here is batching: identity costs a PowerShell start-up per CALL on
+ * Windows rather than per pid, so the whole set is looked up before it is judged,
+ * and the per-name calls below then read a warm cache.
+ */
+function ownedPids(port, names) {
+  const records = names
+    .map((name) => [name, pidRecord(port, name)])
+    // A record the cheap tests already reject, or one carrying no token, is refused
+    // by `signallablePid` regardless — looking it up would buy nothing and cost a
+    // subprocess. Tokenless is the common case on the first run after upgrading.
+    .filter(([name, rec]) =>
+      rec !== null && rec.token !== null && !staleRecord(port, name));
+
+  identities(records.map(([, rec]) => rec.pid));            // one lookup for all
+
+  const owned = new Map();
+  for (const [name, rec] of records) {
+    const pid = signallablePid(rec, stateWrittenAt(port, name));
+    if (pid !== null) owned.set(name, pid);
+  }
+  return owned;
+}
 
 /**
  * Discard state left by a process that no longer exists.
@@ -192,8 +215,14 @@ const livePid = (port, name) => {
  * watchdog is still relying on.
  */
 function reconcileState(port, serverUp) {
-  if (livePid(port, 'watchdog.pid') === null) clearState(port, 'watchdog.pid');
-  if (livePid(port, 'server.pid') === null) clearState(port, 'server.pid');
+  // Hygiene, not authority: this function only deletes files. Proving identity here
+  // would put a process lookup on every invocation — `--check` included — to protect
+  // an operation that cannot hurt anything. See process-identity.mjs.
+  const watchdogGone = staleRecord(port, 'watchdog.pid');
+  const serverGone = staleRecord(port, 'server.pid');
+
+  if (watchdogGone) clearState(port, 'watchdog.pid');
+  if (serverGone) clearState(port, 'server.pid');
 
   // Owner-liveness only — see pruneInFlight for why reachability must not decide.
   pruneInFlight(port);
@@ -203,9 +232,9 @@ function reconcileState(port, serverUp) {
   // unreachable would therefore erase it during almost the whole shutdown, letting
   // the next client walk past awaitNotStopping and start a second server while the
   // first watchdog is still tearing state down. It is stale only if its author died.
-  if (livePid(port, 'watchdog.pid') === null) clearState(port, 'stopping');
+  if (watchdogGone) clearState(port, 'stopping');
 
-  if (!serverUp && livePid(port, 'server.pid') === null) {
+  if (!serverUp && serverGone) {
     clearState(port, 'in-flight');          // legacy counter from older installs
     clearState(port, 'loaded-model');
   }
@@ -295,7 +324,20 @@ async function awaitNotStopping(opts) {
 function startWatchdog(opts) {
   if (opts.idleTimeout === 0) return;
   // Liveness, not file existence: a stale pid must never suppress the watchdog.
-  if (livePid(opts.port, 'watchdog.pid') !== null) return;
+  //
+  // Hygiene-grade, and this one is a judgement rather than a free win. Erring
+  // towards starting a watchdog is self-correcting — the new one proves identity,
+  // sees an owner that is not itself, and exits. Erring the other way is not: a
+  // `watchdog.pid` naming a pid that was reused within this boot suppresses the
+  // spawn, and the server then holds accelerator memory with nobody supervising it.
+  //
+  // Accepted anyway, because this call sits on the warm `ask` path — it runs every
+  // time an existing server is adopted — and proving identity here would put ~930ms
+  // onto every request to close a window that needs the watchdog to die AND its
+  // exact pid to be handed to something else. The consequence is also recoverable
+  // and visible: `--stop` still identifies and stops the server correctly, since
+  // that path IS authority-grade. Revisit if a phantom supervisor is ever observed.
+  if (!staleRecord(opts.port, 'watchdog.pid')) return;
   try {
     const child = spawn(
       process.execPath,
@@ -304,6 +346,12 @@ function startWatchdog(opts) {
       { detached: true, stdio: 'ignore' },
     );
     child.unref();
+    // Record it here rather than letting it record itself. Establishing identity
+    // costs a process lookup, and doing that inside the watchdog puts the lookup
+    // BEFORE the file appears — leaving a window in which we have already exited and
+    // the next client sees no supervisor and starts a second one. We know the pid the
+    // moment spawn returns, so the record can exist before this process ends.
+    if (child.pid) writeOwnedPid(opts.port, 'watchdog.pid', child.pid);
   } catch {
     process.stderr.write('[litertlm] warning: idle watchdog failed to start; the server will '
       + 'stay resident until you run --stop.\n');
@@ -378,7 +426,9 @@ async function ensureServer(opts) {
       + `  (underlying error: ${err.message})`);
   }
 
-  if (child.pid) writeState(opts.port, 'server.pid', child.pid);
+  // Record the identity now, while the process is certainly the one we just spawned.
+  // Asked for later, the answer could already be about a different process.
+  if (child.pid) writeOwnedPid(opts.port, 'server.pid', child.pid);
   // Prune, not wipe: another client may have acquired a marker against this same
   // new server between our spawn and this line.
   pruneInFlight(opts.port);
@@ -434,36 +484,55 @@ function pidsOnPort(port) {
 }
 
 /**
- * Stop our server and watchdog.
+ * Split the port's listeners into ours and everyone else's.
  *
- * `ours` says whether a litert-lm-shaped server actually answered on this port. It
- * gates killing whoever owns the socket, because that step is otherwise a licence
- * to terminate an arbitrary process: the port is a guess, not an identity.
+ * A reply to `/v1/models` used to stand in for this, and it is not an ownership
+ * test — it is a protocol test that every OpenAI-compatible server passes. On this
+ * host that made `--stop` terminate an unrelated server and report success.
  *
- * The recorded pids used to be exempt from that scepticism — "we started them", so
- * they were signalled unconditionally. A reboot breaks that claim: the pid outlives
- * the file only as a number, and the OS hands it to someone else. Going through
- * livePid applies the boot-session test, so a pre-boot file names nobody now.
- * Without it, `--stop` after a crash is a coin toss over which of your applications
- * receives a SIGTERM.
+ * The command line answers the question the probe could not. It has to, because the
+ * socket owner is a process we never spawned: `litert-lm serve` is a three-stage
+ * launcher (litert-lm.exe -> uv shim -> python) and the listener is a grandchild
+ * with no entry in our state. See process-identity.mjs for why descent from our
+ * recorded pid was considered and rejected.
  */
-async function stopProcesses(opts, ours) {
+function classifyPortOwners(port) {
+  const listening = pidsOnPort(port);
+  identities(listening);                              // one lookup for all of them
+  const ours = listening.filter(looksLikeLitertLmServe);
+  const ourSet = new Set(ours);
+  return { ours, strangers: listening.filter((p) => !ourSet.has(p)) };
+}
+
+/**
+ * Stop our server and watchdog — and nothing else.
+ *
+ * Every target is proven before it is signalled: recorded pids by the start token
+ * written when we spawned them, socket owners by their command line. A process that
+ * cannot be proven is left running and reported, never signalled on suspicion.
+ *
+ * State is cleared either way. "We could not identify anything to stop" and "there
+ * is stale state here" are different facts, and the second is safe to act on alone.
+ */
+async function stopProcesses(opts) {
   const port = opts.port;
 
-  const recorded = ['watchdog.pid', 'server.pid']
-    .map((n) => livePid(port, n))
-    .filter((n) => n !== null);
+  const recorded = [...ownedPids(port, ['watchdog.pid', 'server.pid']).values()];
+  const { ours, strangers } = classifyPortOwners(port);
+  const signalled = [...new Set([...recorded, ...ours])];
 
-  for (const pid of [...recorded, ...(ours ? pidsOnPort(port) : [])]) {
+  for (const pid of signalled) {
     try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
   }
 
-  // Confirm the port actually closed rather than assuming SIGTERM landed.
-  if (ours) {
+  // Confirm the port actually closed rather than assuming SIGTERM landed. Escalation
+  // is restricted to pids already proven ours above: re-deriving the set here would
+  // let a process that took the port in the meantime inherit the escalation.
+  if (ours.length) {
     for (let i = 0; i < 20; i++) {
       if (!(await probe(opts, 1000))) break;
       await sleep(400);
-      for (const pid of pidsOnPort(port)) {
+      for (const pid of pidsOnPort(port).filter((p) => ours.includes(p))) {
         try { process.kill(pid, process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL'); }
         catch { /* ignore */ }
       }
@@ -474,7 +543,7 @@ async function stopProcesses(opts, ours) {
   for (const f of ['server.pid', 'watchdog.pid', 'in-flight', 'last-activity',
     'stopping', 'loaded-model', 'stopped-idle']) clearState(port, f);
 
-  return !(await probe(opts, 1000));
+  return { signalled, strangers, down: !(await probe(opts, 1000)) };
 }
 
 // ---------------------------------------------------------------------------
@@ -596,22 +665,31 @@ async function main() {
   if (opts.action === 'help') { process.stdout.write(HELP + '\n'); return; }
 
   if (opts.action === 'stop') {
-    // A successful /v1/models is what identifies the socket owner as ours. Without
-    // it we still stop what we recorded, but we do not shoot at the port.
+    // The probe reports; it does not authorise. Whether anything gets signalled is
+    // decided inside stopProcesses, from process identity.
     const wasUp = await probe(opts);
-    const strangers = wasUp ? [] : pidsOnPort(opts.port);
-    const nowDown = await stopProcesses(opts, Boolean(wasUp));
-    if (!wasUp) {
-      process.stdout.write('Server was not running; state cleared.\n');
-      if (strangers.length) {
-        process.stderr.write(
-          `[litertlm] note: pid ${strangers.join(', ')} is listening on port ${opts.port} but did `
-          + 'not answer /v1/models, so it is not this plugin\'s server and was left alone.\n'
-          + `  If you meant to free the port, stop that process yourself, or use --port <n>.\n`);
-      }
-    } else if (nowDown) {
+    const { signalled, strangers, down } = await stopProcesses(opts);
+
+    const noteStrangers = () => {
+      if (!strangers.length) return;
+      process.stderr.write(
+        `[litertlm] note: pid ${strangers.join(', ')} is listening on port ${opts.port}`
+        + `${wasUp ? ' and answers /v1/models' : ''}, but its command line is not a litert-lm\n`
+        + '  server, so it is not this plugin\'s and was left running.\n'
+        + '  If you meant to free the port, stop that process yourself, or use --port <n>.\n');
+    };
+
+    if (!signalled.length) {
+      // Nothing provable was ours. Clearing state is still right and still done.
+      process.stdout.write(strangers.length
+        ? `No server of this plugin's was running on port ${opts.port}; state cleared.\n`
+        : 'Server was not running; state cleared.\n');
+      noteStrangers();
+    } else if (down) {
       process.stdout.write('Server stopped; accelerator memory released.\n');
+      noteStrangers();
     } else {
+      noteStrangers();
       throw new Error(`the server on ${baseUrl(opts)} is still responding after being asked to `
         + 'stop.\n  Something else may own the port. Inspect it, then retry.');
     }

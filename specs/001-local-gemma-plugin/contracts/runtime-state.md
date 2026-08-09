@@ -12,8 +12,8 @@ different ports never share state.
 
 | File | Format | Writer | Reader |
 |---|---|---|---|
-| `server.pid` | integer | client, after successful start | watchdog |
-| `watchdog.pid` | integer | watchdog, on adoption | client |
+| `server.pid` | `<pid> <start-token>` | client, after successful start | watchdog |
+| `watchdog.pid` | `<pid> <start-token>` | client, at spawn (watchdog self-records if absent) | client, watchdog |
 | `last-activity` | epoch ms | client, before and after each request | watchdog |
 | `in-flight.d/<pid>-<ts>` | **directory of marker files** | client, one per request | watchdog |
 | `stopping` | empty; presence is the signal | watchdog, before terminating | client |
@@ -34,6 +34,25 @@ heuristic: a marker whose process no longer exists is stale by definition. The w
 such markers as it counts, so a crashed client cannot pin accelerator memory — no timeout
 guesswork required.
 
+**Why a pid file holds a token as well as a pid** *(revised after issue #10)*: a pid is a slot
+the OS reuses, not a handle on a process. A recorded pid whose owner has exited can name
+something else entirely, and both parties here send signals to recorded pids. The token is the
+process's OS-reported creation time, captured at spawn; pid and token together are unique for as
+long as that process lives, so a reused pid fails the comparison. A file carrying a bare pid —
+every file written by a version before this one — is readable but **never signallable**.
+
+Two questions are asked of these files and they are not the same question:
+
+| Question | Test | Cost | Used by |
+|---|---|---|---|
+| May I delete this stale file? | pid alive + file written after boot | free | `reconcileState`, `startWatchdog` |
+| May I signal this pid? | the above **plus** the token matches | one process lookup | `--stop`, watchdog termination |
+
+The strong test is defined in terms of the weak one, so they cannot drift apart. The weak one
+must never be used to justify a signal. Splitting them is what keeps the cost off the
+interactive path: establishing identity means starting PowerShell on Windows (~930ms measured),
+and reconciliation runs on every invocation while only ever deleting files.
+
 ## Default values
 
 A missing file means:
@@ -44,6 +63,7 @@ A missing file means:
 | `last-activity` | **now** — never "long ago" |
 | `stopping` | not stopping |
 | `server.pid` | unknown; discover or ignore |
+| a pid file with no token | present but unprovable — reclaimable, never signallable |
 
 The `last-activity` default is deliberate: treating absence as "epoch zero" would let a
 watchdog reap a server that had just started.
