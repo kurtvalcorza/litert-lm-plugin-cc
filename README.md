@@ -287,6 +287,11 @@ defects it guards against lived in the gap between what the code believed about 
 the operating system knew; a mock would have agreed with the bug. It uses spare ports and a
 scratch state directory, so it is safe to run while a server is up on the default port.
 
+Finding who owns a socket needs `lsof` or `ss` outside Windows. Minimal Linux images often ship
+neither, and the plugin cannot identify a port's owner without one — so `--stop` there falls back
+to the recorded process alone. The two socket-owner tests detect this and skip rather than
+reporting a failure that is really a missing utility.
+
 ## Licence
 
 [Apache-2.0](LICENSE). See [NOTICE](NOTICE) for upstream attribution.

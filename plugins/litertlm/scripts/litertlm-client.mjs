@@ -30,8 +30,8 @@ import { pidAlive, reapMarkers } from './marker-state.mjs';
 // note above them explains which belongs where, and it is worth reading before
 // choosing one.
 import {
-  formatPidRecord, identities, looksLikeLitertLmServe, parsePidRecord, recordIsStale,
-  signallablePid,
+  forgetIdentities, formatPidRecord, identities, isRecordedProcess, looksLikeLitertLmServe,
+  parsePidRecord, pidsOnPort, recordIsStale, signallablePid, startToken,
 } from './process-identity.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -156,6 +156,33 @@ function stateWrittenAt(port, name) {
 /** Record a pid we just spawned, together with the token that re-identifies it. */
 const writeOwnedPid = (port, name, pid) =>
   writeState(port, name, formatPidRecord(pid));
+
+/**
+ * Record a pid only if nobody else holds the slot. Returns whether we got it.
+ *
+ * `wx` makes the create atomic, so of two racing clients exactly one wins and the
+ * loser leaves the winner's record alone. A file that is merely stale — a pid that
+ * has died, or one written before this boot — is not a claim and is cleared first,
+ * which is what stops an abandoned record locking the slot forever.
+ *
+ * Stale-then-create is not itself atomic, so two clients can still both get past
+ * the unlink. The exclusive create decides that race too: one succeeds, the other
+ * sees EEXIST and stands down.
+ */
+function claimOwnedPid(port, name, pid) {
+  const record = formatPidRecord(pid);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      mkdirSync(stateDir(port), { recursive: true });
+      writeFileSync(statePath(port, name), record, { encoding: 'utf8', flag: 'wx' });
+      return true;
+    } catch {
+      if (attempt === 1 || !staleRecord(port, name)) return false;
+      clearState(port, name);
+    }
+  }
+  return false;
+}
 
 const pidRecord = (port, name) => parsePidRecord(readState(port, name, ''));
 
@@ -351,7 +378,13 @@ function startWatchdog(opts) {
     // BEFORE the file appears — leaving a window in which we have already exited and
     // the next client sees no supervisor and starts a second one. We know the pid the
     // moment spawn returns, so the record can exist before this process ends.
-    if (child.pid) writeOwnedPid(opts.port, 'watchdog.pid', child.pid);
+    //
+    // Claimed, not written. Two clients can adopt one warm server and both spawn a
+    // watchdog; the loser's watchdog sees a proven owner and exits, and an
+    // unconditional write here would then stamp that dead pid over the winner's
+    // record. The surviving watchdog reads an owner that is not itself on its next
+    // poll and exits too, leaving the server running with nobody supervising it.
+    if (child.pid) claimOwnedPid(opts.port, 'watchdog.pid', child.pid);
   } catch {
     process.stderr.write('[litertlm] warning: idle watchdog failed to start; the server will '
       + 'stay resident until you run --stop.\n');
@@ -449,41 +482,6 @@ async function ensureServer(opts) {
 }
 
 /**
- * Find whatever process is listening on the port.
- *
- * litert-lm is a two-stage launcher: the pid we spawned is often not the process
- * that ends up holding the socket, so killing the recorded pid alone leaves the
- * server running. Asking the OS who owns the port is the only reliable answer.
- */
-function pidsOnPort(port) {
-  const run = (cmd, args) => {
-    try {
-      return spawnSync(cmd, args, { encoding: 'utf8', windowsHide: true }).stdout ?? '';
-    } catch {
-      return '';
-    }
-  };
-
-  const pids = new Set();
-  if (process.platform === 'win32') {
-    const out = run('powershell.exe', ['-NoProfile', '-Command',
-      `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue `
-      + '| Select-Object -ExpandProperty OwningProcess']);
-    for (const line of out.split(/\r?\n/)) {
-      const n = Number.parseInt(line.trim(), 10);
-      if (Number.isInteger(n) && n > 0) pids.add(n);
-    }
-  } else {
-    const out = run('lsof', ['-ti', `tcp:${port}`, '-sTCP:LISTEN']);
-    for (const line of out.split('\n')) {
-      const n = Number.parseInt(line.trim(), 10);
-      if (Number.isInteger(n) && n > 0) pids.add(n);
-    }
-  }
-  return [...pids];
-}
-
-/**
  * Split the port's listeners into ours and everyone else's.
  *
  * A reply to `/v1/models` used to stand in for this, and it is not an ownership
@@ -499,9 +497,29 @@ function pidsOnPort(port) {
 function classifyPortOwners(port) {
   const listening = pidsOnPort(port);
   identities(listening);                              // one lookup for all of them
-  const ours = listening.filter(looksLikeLitertLmServe);
-  const ourSet = new Set(ours);
+  // Keep each owner's start token, not just its number. Escalation happens after we
+  // have already killed things, and by then a pid we proved is a pid that may have
+  // been reissued — the number alone stops meaning anything the moment it dies.
+  const ours = listening.filter(looksLikeLitertLmServe)
+    .map((pid) => ({ pid, token: startToken(pid) }));
+  const ourSet = new Set(ours.map((o) => o.pid));
   return { ours, strangers: listening.filter((p) => !ourSet.has(p)) };
+}
+
+/**
+ * Of the owners we proved, those still on the port AND still the same process.
+ *
+ * The cache is dropped first on purpose: it was populated before we sent SIGTERM,
+ * so without this it would keep describing processes that have since exited and
+ * happily confirm their replacements. Intersecting pid numbers is not enough — that
+ * is the whole premise of this change, and it applies to our own frozen set too.
+ */
+function stillOurs(port, ours) {
+  const onPort = new Set(pidsOnPort(port));
+  const candidates = ours.filter((o) => onPort.has(o.pid));
+  forgetIdentities(candidates.map((o) => o.pid));
+  identities(candidates.map((o) => o.pid));
+  return candidates.filter((o) => isRecordedProcess(o.pid, o.token)).map((o) => o.pid);
 }
 
 /**
@@ -519,20 +537,24 @@ async function stopProcesses(opts) {
 
   const recorded = [...ownedPids(port, ['watchdog.pid', 'server.pid']).values()];
   const { ours, strangers } = classifyPortOwners(port);
-  const signalled = [...new Set([...recorded, ...ours])];
+  const signalled = [...new Set([...recorded, ...ours.map((o) => o.pid)])];
 
   for (const pid of signalled) {
     try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
   }
 
-  // Confirm the port actually closed rather than assuming SIGTERM landed. Escalation
-  // is restricted to pids already proven ours above: re-deriving the set here would
-  // let a process that took the port in the meantime inherit the escalation.
+  // Confirm the port actually closed rather than assuming SIGTERM landed.
+  //
+  // Escalation is restricted to the owners proven above AND re-proven now. Freezing
+  // the pid numbers is necessary but not sufficient: under pid churn the listener we
+  // signalled can exit and an unrelated process inherit both its number and the port
+  // before the next pass, at which point a numeric intersection would hand it a
+  // SIGKILL. `stillOurs` re-asks the OS instead of trusting the number.
   if (ours.length) {
     for (let i = 0; i < 20; i++) {
       if (!(await probe(opts, 1000))) break;
       await sleep(400);
-      for (const pid of pidsOnPort(port).filter((p) => ours.includes(p))) {
+      for (const pid of stillOurs(port, ours)) {
         try { process.kill(pid, process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL'); }
         catch { /* ignore */ }
       }

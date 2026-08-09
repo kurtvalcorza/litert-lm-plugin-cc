@@ -52,12 +52,22 @@ import { readFileSync } from 'node:fs';
 import { BOOT_TIME_MS, pidAlive } from './marker-state.mjs';
 
 /**
- * pid -> {start, cmdline} | null, memoised for the life of this process.
+ * pid -> {start, cmdline} | null, memoised.
  *
- * Identity is immutable while a process lives, and a pid that has died stays dead,
- * so a second lookup can only repeat the first. This matters for cost, not just
- * tidiness: on Windows every uncached lookup is a PowerShell start-up, and
- * `reconcileState` alone asks about the same two pids four times.
+ * Worth the memo because on Windows every uncached lookup is a PowerShell start-up
+ * (~930ms measured) and `reconcileState` alone asks about the same two pids four
+ * times.
+ *
+ * SCOPE, AND WHY IT IS NARROW: this is only sound across a single short operation.
+ * An earlier version of this comment justified the memo with "a pid that has died
+ * stays dead", which is precisely the assumption the rest of this file exists to
+ * disprove — the pid NUMBER outlives the process and the OS hands it to someone
+ * else. A cached entry describing a process that has since exited will happily
+ * identify its replacement as the original.
+ *
+ * So: anything that signals a pid AFTER having killed something must call
+ * `forgetIdentities` first, and any long-lived caller must not assume a second
+ * lookup of the same pid is free of meaning. Both escalation loops do exactly that.
  */
 const cache = new Map();
 
@@ -154,6 +164,68 @@ export function identities(pids) {
 
 export const identity = (pid) => identities([pid]).get(pid) ?? null;
 
+/**
+ * Drop cached identities so the next lookup asks the OS again.
+ *
+ * Required before re-checking a pid we have already signalled: by then the process
+ * may have exited and the number been reissued, and the cache would still be
+ * describing the process we killed.
+ */
+export function forgetIdentities(pids) {
+  for (const pid of pids) cache.delete(pid);
+}
+
+// ---------------------------------------------------------------------------
+// Who is listening on a port
+//
+// Lives here, next to identity, because both the client and the watchdog need it
+// and each used to carry its own copy — including its own platform quirks to fix
+// twice. Discovery answers "who holds this socket"; it says nothing about whether
+// that process is ours, which is what `isLitertLmServeCommand` is for.
+// ---------------------------------------------------------------------------
+
+/**
+ * litert-lm is a multi-stage launcher: the pid we spawned is not the process that
+ * ends up holding the socket, so the recorded pid alone can never stop the server.
+ * Asking the OS who owns the port is the only reliable answer.
+ *
+ * On Linux `lsof` is tried first and `ss` second. Minimal container and CI images
+ * routinely ship iproute2 without lsof, and with only lsof the discovery silently
+ * returned nothing — which reads exactly like "the port is free" and makes `--stop`
+ * quietly do nothing.
+ */
+export function pidsOnPort(port) {
+  const run = (cmd, args) => {
+    try {
+      return spawnSync(cmd, args, { encoding: 'utf8', windowsHide: true }).stdout ?? '';
+    } catch {
+      return '';
+    }
+  };
+
+  const pids = new Set();
+  const collect = (text, re) => {
+    for (const m of text.matchAll(re)) {
+      const n = Number.parseInt(m[1], 10);
+      if (Number.isInteger(n) && n > 0) pids.add(n);
+    }
+  };
+
+  if (process.platform === 'win32') {
+    collect(run('powershell.exe', ['-NoProfile', '-Command',
+      `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue `
+      + '| Select-Object -ExpandProperty OwningProcess']), /^\s*(\d+)\s*$/gm);
+    return [...pids];
+  }
+
+  collect(run('lsof', ['-ti', `tcp:${port}`, '-sTCP:LISTEN']), /^\s*(\d+)\s*$/gm);
+  if (pids.size) return [...pids];
+
+  // `ss -ltnp` prints owners as: users:(("python",pid=68056,fd=7))
+  collect(run('ss', ['-ltnp', 'sport', `= :${port}`]), /pid=(\d+)/g);
+  return [...pids];
+}
+
 /** The token to store alongside a pid so it can be re-identified later. */
 export function startToken(pid) {
   return identity(pid)?.start ?? null;
@@ -174,22 +246,45 @@ export function isRecordedProcess(pid, token) {
 }
 
 /**
- * Does this process look like a `litert-lm serve`?
+ * Is this command line a `litert-lm serve`?
+ *
+ * The argv token immediately before `serve` must itself END with the litert-lm
+ * program name — quoted or not, with or without `.exe`. Anything looser is not a
+ * command-line test but two unrelated word searches, and they can be satisfied by
+ * completely different parts of the line:
+ *
+ *   python /work/litert_lm/tools/server.py serve   <- directory + unrelated arg
+ *   vim /home/kurt/litert-lm/serve notes.txt       <- directory + a FILE named serve
+ *
+ * Both were classified as ours by the first version of this predicate, and either
+ * one holding the configured port would have been signalled — recreating the exact
+ * accident this change exists to prevent. The first came from review; the second
+ * turned up while writing the test for the first.
+ *
+ * Deliberately does NOT require `--port <n>`: a server started by hand as plain
+ * `litert-lm serve` on the default port carries no such flag, and `ensureServer`
+ * adopts exactly that server. The listening socket already supplies the port; the
+ * command line only has to supply the identity.
+ *
+ * Fails safe in the other direction too. `litert-lm --verbose serve` puts a flag
+ * between the program and the subcommand and so is NOT recognised; the cost of that
+ * is a real server being reported as a stranger and left running, which is visible
+ * and recoverable, rather than a stranger being killed, which is neither.
+ */
+const LITERT_LM_SERVE =
+  /(?:^|\s)(?:"[^"]*litert[-_]lm(?:\.exe)?"|'[^']*litert[-_]lm(?:\.exe)?'|[^\s"']*litert[-_]lm(?:\.exe)?)\s+serve(?:\s|$)/i;
+
+export const isLitertLmServeCommand = (cmdline) => LITERT_LM_SERVE.test(cmdline ?? '');
+
+/**
+ * Does the process behind this pid look like a `litert-lm serve`?
  *
  * Only ever asked of a pid already observed listening on the port we are about to
- * act on, so this does not have to identify litert-lm among all processes — only
- * to separate it from an unrelated server that happens to hold the same socket.
- *
- * Deliberately does NOT require `--port <n>` in the command line: a server started
- * by hand as plain `litert-lm serve` on the default port carries no such flag, and
- * `ensureServer` adopts exactly that server. The listening socket already supplies
- * the port; the command line only has to supply the identity.
+ * act on, so this does not have to identify litert-lm among all processes — only to
+ * separate it from an unrelated server that happens to hold the same socket.
  */
-export function looksLikeLitertLmServe(pid) {
-  const cmdline = identity(pid)?.cmdline;
-  if (!cmdline) return false;
-  return /litert[-_]lm/i.test(cmdline) && /(^|[\s"'/\\])serve(\s|$)/i.test(cmdline);
-}
+export const looksLikeLitertLmServe = (pid) =>
+  isLitertLmServeCommand(identity(pid)?.cmdline);
 
 // ---------------------------------------------------------------------------
 // The pid-file record
@@ -199,11 +294,21 @@ export function looksLikeLitertLmServe(pid) {
 // three rounds of defects in this plugin were all one rule with two homes.
 // ---------------------------------------------------------------------------
 
-/** Parse a pid file's contents. Older installs wrote a bare `<pid>` and no token. */
+/**
+ * Parse a pid file's contents. Older installs wrote a bare `<pid>` and no token.
+ *
+ * The token is EVERYTHING after the pid, not the next whitespace-delimited field.
+ * On Windows it is one integer, but the POSIX `ps` path produces a five-field
+ * `lstart` such as `Sun Aug 9 12:34:56 2026`; splitting on whitespace kept only
+ * `Sun`, so every later comparison failed and no recorded process on macOS was ever
+ * signallable. Found in review, before any macOS run existed to catch it.
+ */
 export function parsePidRecord(raw) {
-  const [pidStr, token] = String(raw ?? '').trim().split(/\s+/);
-  const pid = Number.parseInt(pidStr, 10);
-  return Number.isInteger(pid) && pid > 0 ? { pid, token: token ?? null } : null;
+  const m = String(raw ?? '').trim().match(/^(\d+)(?:\s+(.+))?$/s);
+  if (m === null) return null;
+  const pid = Number.parseInt(m[1], 10);
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  return { pid, token: m[2]?.trim() || null };
 }
 
 /** Serialise a pid we just spawned. Call while it is certainly the right process. */

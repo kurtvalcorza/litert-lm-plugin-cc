@@ -13,7 +13,6 @@
  * Started detached by litertlm-client.mjs; never invoked by a user directly.
  */
 
-import { spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -27,7 +26,8 @@ import { reapMarkers } from './marker-state.mjs';
 // client applied, so the supervisor could SIGTERM a bystander the client would have
 // refused to touch. One home, one rule, no weaker copy.
 import {
-  formatPidRecord, identities, looksLikeLitertLmServe, parsePidRecord, signallablePid,
+  forgetIdentities, formatPidRecord, identities, isRecordedProcess, looksLikeLitertLmServe,
+  parsePidRecord, pidsOnPort, signallablePid, startToken,
 } from './process-identity.mjs';
 
 const POLL_INTERVAL_MS = 5000;
@@ -120,35 +120,6 @@ async function serverReachable() {
 }
 
 /**
- * Find whatever process is listening on the port (mirrors litertlm-client.mjs).
- *
- * litert-lm is a two-stage launcher: the pid we recorded is often not the process
- * holding the socket, so the recorded pid alone is not enough to stop it.
- */
-function pidsOnPort(port) {
-  const run = (cmd, args) => {
-    try {
-      return spawnSync(cmd, args, { encoding: 'utf8', windowsHide: true }).stdout ?? '';
-    } catch {
-      return '';
-    }
-  };
-
-  const out = process.platform === 'win32'
-    ? run('powershell.exe', ['-NoProfile', '-Command',
-      `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue `
-      + '| Select-Object -ExpandProperty OwningProcess'])
-    : run('lsof', ['-ti', `tcp:${port}`, '-sTCP:LISTEN']);
-
-  const pids = new Set();
-  for (const line of out.split(/\r?\n/)) {
-    const n = Number.parseInt(line.trim(), 10);
-    if (Number.isInteger(n) && n > 0) pids.add(n);
-  }
-  return [...pids];
-}
-
-/**
  * Stop the server this watchdog supervises — and only that one.
  *
  * An earlier version ran `Get-Process litert-lm | Stop-Process -Force` (and `pkill -f
@@ -168,16 +139,42 @@ function pidsOnPort(port) {
 function ourTargets() {
   const listening = pidsOnPort(opts.port);
   identities(listening);                              // one lookup for all of them
-  const targets = new Set(listening.filter(looksLikeLitertLmServe));
+  const targets = listening.filter(looksLikeLitertLmServe)
+    .map((pid) => ({ pid, token: startToken(pid) }));
   const recorded = ownedPid('server.pid');
-  if (recorded !== null) targets.add(recorded);
+  if (recorded !== null && !targets.some((t) => t.pid === recorded)) {
+    targets.push({ pid: recorded, token: startToken(recorded) });
+  }
   return targets;
 }
 
-function terminateServer() {
-  for (const pid of ourTargets()) {
+/**
+ * Signal exactly this set. It takes the snapshot rather than deriving its own, so
+ * the initial SIGTERM and every escalation act on ONE ownership decision. Deriving
+ * it here as well left a window between the two lookups in which a new
+ * `litert-lm serve` could take the port and receive a signal meant for its
+ * predecessor — and on Windows each lookup starts PowerShell, so that window was
+ * not small.
+ */
+function terminateServer(targets) {
+  for (const { pid } of targets) {
     try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
   }
+}
+
+/**
+ * Of `targets`, those still on the port AND still the same process.
+ *
+ * The cache is dropped first: it was filled before we signalled, so it would still
+ * be describing processes that have since exited and would confirm a replacement
+ * that inherited the pid. See the scope note on the cache in process-identity.mjs.
+ */
+function stillOurs(targets) {
+  const onPort = new Set(pidsOnPort(opts.port));
+  const candidates = targets.filter((t) => onPort.has(t.pid));
+  forgetIdentities(candidates.map((t) => t.pid));
+  identities(candidates.map((t) => t.pid));
+  return candidates.filter((t) => isRecordedProcess(t.pid, t.token)).map((t) => t.pid);
 }
 
 function cleanupAndExit(code = 0) {
@@ -252,15 +249,16 @@ async function main() {
     // Signal before acting, so a client cannot connect to a dying server (FR-025).
     writeState('stopping', Date.now());
     const targets = ourTargets();
-    terminateServer();
+    terminateServer(targets);
 
     for (let i = 0; i < 30; i++) {
       await sleep(500);
       if (!(await serverReachable())) break;
-      // Still answering: escalate, but only on pids already proven ours above. What
-      // is still reachable might be a different server that took the port while we
-      // were tearing ours down, and re-deriving the set here would escalate onto it.
-      for (const pid of pidsOnPort(opts.port).filter((p) => targets.has(p))) {
+      // Still answering: escalate, but only on owners proven above AND re-proven
+      // now. What is still reachable might be a different server that took the port
+      // while we were tearing ours down — possibly one that inherited the very pid
+      // we just killed, which a numeric check would wave straight through.
+      for (const pid of stillOurs(targets)) {
         try { process.kill(pid, process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL'); }
         catch { /* ignore */ }
       }
