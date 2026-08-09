@@ -501,32 +501,40 @@ describe('the idle watchdog', () => {
   // failed to kill still produced `stopped-idle` — telling the next client memory was
   // released — and still had its `server.pid` cleared, destroying the identity a
   // later attempt would need for a target that is alive but no longer listening.
-  test('does not report an idle stop it could not carry out', { timeout: 90_000 },
+  test('does not report an idle stop it could not carry out', { timeout: 120_000 },
     async (t) => {
       if (process.platform === 'win32') {
-        t.skip('SIGTERM cannot be trapped on Windows, so a survivor cannot be staged');
+        t.skip('needs a process this test cannot signal; see below');
         return;
       }
+      // Staging a survivor needs a process that outlives our own SIGKILL, and a
+      // process we own never does — an earlier version of this test trapped SIGTERM
+      // and was simply killed by the escalation, so the watchdog correctly reported
+      // success and the assertion failed. Both POSIX legs caught that.
+      //
+      // pid 1 is the one process on a POSIX host that a normal user provably cannot
+      // signal: every kill returns EPERM, so `stillOurs` keeps reporting it and the
+      // watchdog runs out of attempts, which is exactly the branch under test.
+      //
+      // Skipped as root, where that guarantee evaporates and the signals would land
+      // on init. A test that can take down the machine if the suite happens to run
+      // privileged is not worth the coverage.
+      if (typeof process.getuid !== 'function' || process.getuid() === 0) {
+        t.skip('runs as root: signalling pid 1 would not fail harmlessly');
+        return;
+      }
+
       const port = PORT.watchdogStranger + 40;
       const runtime = runtimeDir();
       const dir = stateDir(runtime, port);
 
-      // Answers /v1/models so the watchdog supervises it, and ignores every signal it
-      // is allowed to ignore, so escalation runs out of attempts.
-      const stubborn = reap(spawn(process.execPath, ['--input-type=module', '-e', `
-        import { createServer } from 'node:http';
-        process.on('SIGTERM', () => {});
-        process.on('SIGINT', () => {});
-        createServer((req, res) => {
-          res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ object: 'list', data: [] }));
-        }).listen(${port}, '127.0.0.1');
-      `], { stdio: 'ignore' }));
-      await sleep(1200);
+      // Something has to answer on the port, or the watchdog stands down before it
+      // ever decides the server is idle. This responder is not itself a target: its
+      // command line is node's, so it is never classified as ours.
+      const responder = await startStranger(port);
 
-      // Recorded as ours with a real token, so the watchdog proves and targets it
-      // without needing the command line to look like litert-lm.
-      writeFileSync(join(dir, 'server.pid'), formatPidRecord(stubborn.pid), 'utf8');
+      // pid 1 recorded as ours, with a real token, so it is proven and targeted.
+      writeFileSync(join(dir, 'server.pid'), formatPidRecord(1), 'utf8');
       writeFileSync(join(dir, 'last-activity'), String(Date.now() - 600_000), 'utf8');
 
       const watchdog = reap(spawn(process.execPath,
@@ -539,12 +547,12 @@ describe('the idle watchdog', () => {
 
       assert.equal(readIfPresent(join(dir, 'stopped-idle')), null,
         'a stop that did not happen must not be reported as one');
-      assert.ok(readIfPresent(join(dir, 'server.pid')),
+      assert.equal(parsePidRecord(readIfPresent(join(dir, 'server.pid')))?.pid, 1,
         'and the identity needed to retry must survive');
       assert.equal(readIfPresent(join(dir, 'stopping')), null,
         'while the handshake is released so clients are not blocked');
 
-      try { stubborn.kill('SIGKILL'); } catch { /* ignore */ }
+      try { responder.kill('SIGKILL'); } catch { /* ignore */ }
     });
 
   // The other half of an exclusive claim: it must not become a lock. A record left
