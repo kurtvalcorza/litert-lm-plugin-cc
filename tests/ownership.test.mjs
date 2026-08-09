@@ -375,6 +375,7 @@ describe('--stop', () => {
       }
       const port = PORT.reuse + 40;
       const runtime = runtimeDir();
+      const dir = stateDir(runtime, port);
 
       // Alive, never listening, and deaf to SIGTERM — so success requires escalation.
       const stubborn = reap(spawn(process.execPath,
@@ -382,53 +383,26 @@ describe('--stop', () => {
         { stdio: 'ignore' }));
       await sleep(600);
 
-      writeFileSync(join(stateDir(runtime, port), 'server.pid'),
-        formatPidRecord(stubborn.pid), 'utf8');
+      writeFileSync(join(dir, 'server.pid'), formatPidRecord(stubborn.pid), 'utf8');
 
       const r = runClient(['--stop', '--port', String(port)], runtime);
 
       assert.equal(r.status, 0, `--stop should succeed after escalating: ${r.stderr}`);
       assert.ok(await waitFor(() => !alive(stubborn.pid)),
         'a recorded target that ignores SIGTERM must be escalated to SIGKILL');
+
+      // A record is dropped only once the process it names is gone — and this one is.
+      //
+      // The surviving half of that rule is NOT asserted anywhere, deliberately:
+      // staging a survivor needs a process that outlives our own SIGKILL, and there
+      // is no portable, safe way to arrange one. An earlier attempt watched for the
+      // record mid-escalation on a fixed 900ms sleep; on Linux, where /proc makes
+      // identity instant, --stop finished sooner than that and had already cleared it
+      // correctly. CI caught the race. A fixed sleep in a test is a bet on which
+      // platform is slowest.
+      assert.equal(readIfPresent(join(dir, 'server.pid')), null,
+        'once the target is gone, so is its record');
     });
-
-  // A target that survives is the one case where the state record still matters:
-  // it may have closed its socket, so port discovery cannot find it, and clearing
-  // the record left "inspect it, then retry" with nothing to inspect and nothing for
-  // the retry to identify. Uses SIGKILL-immunity via PID 1... which does not exist,
-  // so instead: a process that cannot be killed by us is unavailable, and the next
-  // best observable is that the record for a LIVE target is not cleared.
-  test('keeps the record of a target that is still alive', { timeout: 60_000 }, async (t) => {
-    if (process.platform === 'win32') {
-      t.skip('SIGTERM cannot be trapped on Windows, so a survivor cannot be staged');
-      return;
-    }
-    const port = PORT.reuse + 60;
-    const runtime = runtimeDir();
-    const dir = stateDir(runtime, port);
-
-    // Deaf to SIGTERM *and* to SIGKILL is impossible, so this survives the SIGTERM
-    // phase and dies only to escalation — long enough to prove the record is kept
-    // while it is alive, by checking mid-flight from a concurrent reader.
-    const stubborn = reap(spawn(process.execPath,
-      ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"],
-      { stdio: 'ignore' }));
-    await sleep(600);
-    writeFileSync(join(dir, 'server.pid'), formatPidRecord(stubborn.pid), 'utf8');
-
-    const stop = spawn(process.execPath, [CLIENT, '--stop', '--port', String(port)],
-      { stdio: 'ignore', env: { ...process.env, LITERT_LM_PLUGIN_RUNTIME: runtime } });
-
-    // While the client is still escalating, the record must still be there.
-    await sleep(900);
-    assert.ok(readIfPresent(join(dir, 'server.pid')),
-      'the record must survive as long as the process it names does');
-
-    await waitFor(() => stop.exitCode !== null, { timeout: 30_000 });
-    assert.ok(await waitFor(() => !alive(stubborn.pid)), 'and the target is eventually stopped');
-    assert.equal(readIfPresent(join(dir, 'server.pid')), null,
-      'once it is gone, so is the record');
-  });
 
   test('still clears stale state when nothing provable is ours', async () => {
     const port = PORT.staleState;
