@@ -457,6 +457,17 @@ describe('--stop', () => {
         'keeping the identity a retry needs');
       assert.equal(readIfPresent(join(dir, 'stopped-at')), null,
         'a stop that failed must not disband the supervision it could not replace');
+
+      // Every survivor, not only the one the pid slots could hold.
+      const carried = String(readIfPresent(join(dir, 'survivors')) ?? '').trim();
+      assert.equal(parsePidRecord(carried)?.pid, protectedPid,
+        'the survivor list must name it so a retry can find it off-port');
+
+      // And a retry reads that list back rather than starting blind.
+      const again = runClient(['--stop', '--port', String(port)], runtime);
+      assert.notEqual(again.status, 0, 'it is still there, so still a failure');
+      assert.match(again.stderr, new RegExp(`${protectedPid}`),
+        'and the retry still names it');
     });
 
   test('still clears stale state when nothing provable is ours', async () => {

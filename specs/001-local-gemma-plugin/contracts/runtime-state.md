@@ -18,7 +18,8 @@ different ports never share state.
 | `in-flight.d/<pid>-<ts>` | **directory of marker files** | client, one per request | watchdog |
 | `stopping` | empty; presence is the signal | watchdog, before terminating | client |
 | `stopped-idle` | epoch ms | watchdog, before exiting | client (consumes) |
-| `stopped-at` | epoch ms | client, at the end of `--stop` | watchdog, before claiming |
+| `stopped-at` | epoch ms | client, at the end of a SUCCESSFUL `--stop` | watchdog and client, before publishing |
+| `survivors` | `<pid> <start-token>` per line | client, when a stop fails | client, on the next stop |
 | `loaded-model` | model id | client, after a successful request | client |
 
 **Why files, not one document**: single-fact files make every read and write atomic enough
@@ -83,6 +84,22 @@ and "the server is gone" are different claims — a model switch produces the fi
 seconds, which is what `UNREACHABLE_TOLERANCE` exists for — and a watchdog that stood down for
 an unanswered probe would abandon the server it was spawned to supervise. Nothing needs to clear
 this file: an older stop is simply earlier than the next watchdog's spawn.
+
+**A failed shutdown records every survivor, not just the ones that fit.** `server.pid` and
+`watchdog.pid` are one slot each, and a stop can leave more survivors than that — a launcher and
+a listener, for instance. The extra identity used to exist only in the error text, so a retry
+could not find it once it had closed its socket and left port discovery blind. `survivors` has
+no such ceiling and is cleared the moment a stop actually succeeds.
+
+**An incomplete picture cancels the whole operation.** If any listener on the port cannot be
+identified, `--stop` signals nothing and clears nothing. Signalling only what is provable would
+take out the watchdog — a recorded target — and then fail on the server, leaving it running with
+nobody supervising it. A refusal can be retried; an unsupervised server can only be noticed.
+
+**A cancelled start undoes itself.** A `--stop` that lands while a server is coming up cancels
+that start, and the starting client tears down what it spawned rather than merely declining to
+record it. Staying quiet while the server came up anyway produced the worse of the two outcomes:
+running, unrecorded, and harder to find than if nothing had been suppressed.
 
 **Existence is `kill(pid, 0)`, and `EPERM` means alive.** That call has two distinct failures.
 `ESRCH` is "no such process"; `EPERM` is "it exists and you may not touch it". Flattening them

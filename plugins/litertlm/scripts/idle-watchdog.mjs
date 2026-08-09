@@ -377,11 +377,15 @@ async function main() {
     // server had been idle-stopped when it is still running and still unsupervised.
     const { targets, unidentified } = ourTargets();
     // Nothing provable AND nothing unprovable: genuinely not ours, stand down clean.
-    // An unidentified listener is not that — it is a question we failed to answer,
-    // and answering it wrong in the reassuring direction is what publishes a stop
-    // that never happened.
     if (!targets.length && !unidentified.length) cleanupAndExit(0);
-    if (!targets.length) cleanupAndExit(1);
+
+    // Unidentified means a question we failed to answer, and the previous version
+    // answered it by LEAVING — exiting non-zero, which clears `watchdog.pid` and
+    // hands a still-live server back to nobody. A transient PowerShell or `ps`
+    // failure would therefore cost the server its supervisor permanently. Staying
+    // and asking again next poll costs one cycle; leaving costs the thing this
+    // process exists for.
+    if (!targets.length) continue;
 
     // Signal before acting, so a client cannot connect to a dying server (FR-025).
     writeState('stopping', Date.now());

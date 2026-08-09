@@ -456,6 +456,36 @@ function resolveLitertLm() {
   return null;
 }
 
+/**
+ * Undo a start that a concurrent `--stop` cancelled.
+ *
+ * Only touches what this invocation is responsible for: the launcher we spawned,
+ * and any listener on the port we can prove is a litert-lm serve. Everything else is
+ * left exactly as found — a cancelled start is not a licence to tidy up the machine.
+ */
+async function cancelStartedServer(opts, child) {
+  const port = opts.port;
+  const mine = [];
+  if (child.pid) {
+    const token = startToken(child.pid);
+    if (token) mine.push({ pid: child.pid, token });
+  }
+  mine.push(...classifyPortOwners(port).ours);
+
+  for (let i = 0; i < 20; i++) {
+    const { alive } = resolveTargets(mine);
+    if (!alive.length) break;
+    for (const pid of alive) {
+      try { process.kill(pid, i === 0 || process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL'); }
+      catch { /* already gone */ }
+    }
+    await sleep(400);
+  }
+
+  clearState(port, 'server.pid');
+  clearState(port, 'loaded-model');
+}
+
 async function ensureServer(opts) {
   reconcileState(opts.port, await probe(opts, 1000));
 
@@ -517,6 +547,22 @@ async function ensureServer(opts) {
   const deadline = Date.now() + opts.startupTimeoutMs;
   while (Date.now() < deadline) {
     await sleep(750);
+
+    // A concurrent `--stop` cancels this start, and cancelling has to mean stopping.
+    //
+    // Declining to RECORD the pid was not enough, and left the worse outcome of the
+    // two: `--stop` reported success, this loop carried on, and the server came up
+    // anyway — running, unrecorded, and therefore harder to find than if we had
+    // never suppressed the record at all. A start that has been overtaken has to
+    // undo itself, not just stay quiet about it.
+    const stoppedAt = Number.parseInt(readState(opts.port, 'stopped-at', ''), 10);
+    if (Number.isFinite(stoppedAt) && stoppedAt > spawnedAt) {
+      await cancelStartedServer(opts, child);
+      throw new Error(
+        'the server start was cancelled by a --stop that ran at the same time.\n'
+        + '  Nothing is left running. Retry if you did want it started.');
+    }
+
     const up = await probe(opts);
     if (up) { startWatchdog(opts); return { models: up, started: true }; }
   }
@@ -601,10 +647,37 @@ async function stopProcesses(opts) {
   const recorded = [...recordedByName.values()];
   const { ours, strangers, unidentified } = classifyPortOwners(port);
 
+  // Survivors of a PREVIOUS failed stop, which the two pid slots could not hold.
+  //
+  // `server.pid` and `watchdog.pid` are one slot each and a failed shutdown can
+  // leave more survivors than that — a launcher and a listener, say. The extra one
+  // used to exist only in the error message, so a retry could not find it once it
+  // had closed its socket. This file has no such limit: one record per line, read
+  // back as targets, and removed the moment a stop actually succeeds.
+  const carried = String(readState(port, 'survivors', '')).split('\n')
+    .map((line) => parsePidRecord(line))
+    .filter((rec) => rec !== null && rec.token !== null
+      && !recordIsStale(rec, stateWrittenAt(port, 'survivors')));
+
   // One set of targets, each carrying the token that identifies it.
   const targets = [];
-  for (const t of [...recorded, ...ours]) {
+  for (const t of [...recorded, ...ours, ...carried]) {
     if (!targets.some((seen) => seen.pid === t.pid)) targets.push(t);
+  }
+
+  // Refuse to tear down a system we cannot see all of.
+  //
+  // With a listener we could not identify, signalling what we CAN prove takes out
+  // the watchdog — a recorded target — and then fails on the server, leaving it
+  // running with nobody supervising it. That is strictly worse than doing nothing:
+  // a refusal is recoverable by retrying, an unsupervised server is not recoverable
+  // by anything except noticing. So when the picture is incomplete, nothing is
+  // signalled and nothing is cleared.
+  if (unidentified.length) {
+    return {
+      signalled: [], strangers, surviving: [], unknown: unidentified,
+      heldPort: false, down: false,
+    };
   }
 
   // Re-prove every target immediately before the FIRST signal, not only before
@@ -682,6 +755,15 @@ async function stopProcesses(opts) {
   const orphan = targets.find((t) => survivors.has(t.pid) && !kept.has(t.pid));
   if (orphan !== undefined && serverSlotFree) {
     writeState(port, 'server.pid', `${orphan.pid} ${orphan.token}`);
+  }
+
+  // And every survivor, without the two-slot ceiling, so a retry can find all of
+  // them rather than only whichever one happened to fit.
+  const stillHere = targets.filter((t) => survivors.has(t.pid) && t.token);
+  if (stillHere.length) {
+    writeState(port, 'survivors', stillHere.map((t) => `${t.pid} ${t.token}`).join('\n'));
+  } else {
+    clearState(port, 'survivors');
   }
 
   // A tombstone, written last and ONLY on success. A watchdog spawned before this
