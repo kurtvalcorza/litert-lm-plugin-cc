@@ -32,8 +32,8 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import {
-  formatPidRecord, isLitertLmServeCommand, parsePidRecord, pidsOnPort, recordIsStale,
-  signallablePid, startToken,
+  commandLaunches, formatPidRecord, isLitertLmServeCommand, parsePidRecord, pidsOnPort,
+  recordIsStale, signallablePid, startToken,
 } from '../plugins/litertlm/scripts/process-identity.mjs';
 
 const SCRIPTS = join(dirname(fileURLToPath(import.meta.url)), '..', 'plugins', 'litertlm', 'scripts');
@@ -269,6 +269,28 @@ describe('recognising a litert-lm serve command line', () => {
     }
   });
 
+  // A launcher position is not a launcher role. These put litert-lm at argv[1], or
+  // `-m` somewhere, and the third version accepted all of them because it checked
+  // only the index of the token before `serve`.
+  const WRONG_ROLE = [
+    './backup.sh litert-lm serve',
+    'node litert-lm serve',
+    'supervisor /tmp/litert-lm serve',
+    'python unrelated.py -m litert_lm serve',
+    'sudo litert-lm serve',
+  ];
+
+  test('rejects litert-lm at a launcher index but in the wrong role', () => {
+    for (const cmdline of WRONG_ROLE) {
+      assert.equal(isLitertLmServeCommand(cmdline), false, cmdline);
+    }
+  });
+
+  test('accepts an interpreter only when it really is one', () => {
+    assert.equal(isLitertLmServeCommand('/usr/bin/python3.12 /opt/litert-lm serve'), true);
+    assert.equal(isLitertLmServeCommand('/usr/bin/perl /opt/litert-lm serve'), false);
+  });
+
   test('rejects rather than guesses when something separates the launcher parts', () => {
     // False negatives, deliberately: the server is reported as a stranger and left
     // running, which is visible and recoverable. The opposite error is neither.
@@ -374,6 +396,15 @@ describe('the idle watchdog', () => {
 
       assert.ok(alive(stranger.pid),
         'the watchdog must not terminate a server it cannot prove is ours');
+
+      // ...and it must not file a shutdown report either. `stopped-idle` is the
+      // breadcrumb the next client reads to explain a slow first request as "we
+      // released the memory"; writing it here records a release that never happened
+      // and describes a live, unsupervised process as stopped.
+      assert.equal(readIfPresent(join(dir, 'stopped-idle')), null,
+        'no idle-stop breadcrumb for a server that was never stopped');
+      assert.equal(readIfPresent(join(dir, 'stopping')), null,
+        'and no dangling shutdown handshake');
     });
 
   // Two clients adopting one warm server both spawn a watchdog. The loser's watchdog
@@ -455,8 +486,16 @@ describe('recording a process we spawned', () => {
     // The client invokes `<exe> serve --host H --port P` from its own cwd, so `serve`
     // resolves to this script: it hands the socket to a detached grandchild and
     // exits, exactly as a real launcher stage does.
+    // The grandchild records its own pid. Cleanup must not go through pidsOnPort:
+    // one configuration of this suite deliberately runs with neither lsof nor ss, and
+    // there discovery returns nothing — so cleanup that asked the OS who owns the
+    // port would silently reap nothing and leave the fixture listening into the next
+    // run. Observed exactly that on Linux: pid 3518 still on the port afterwards.
     writeFileSync(join(workDir, 'grandchild.js'), `
       const { createServer } = require('node:http');
+      const { writeFileSync } = require('node:fs');
+      const { join } = require('node:path');
+      writeFileSync(join(__dirname, 'grandchild.pid'), String(process.pid), 'utf8');
       createServer((req, res) => {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ object: 'list', data: [{ id: 'fake' }] }));
@@ -527,10 +566,30 @@ describe('recording a process we spawned', () => {
       assert.doesNotMatch(stop.stderr, /still responding/,
         'a stranger that keeps answering is not evidence that we failed');
 
-      for (const pid of pidsOnPort(port)) {
-        try { process.kill(pid, 'SIGKILL'); } catch { /* ignore */ }
-      }
+      const leaked = Number.parseInt(readIfPresent(join(workDir, 'grandchild.pid')) ?? '', 10);
+      assert.ok(Number.isInteger(leaked), 'the fixture must report its own pid for cleanup');
+      try { process.kill(leaked, 'SIGKILL'); } catch { /* already gone */ }
+      assert.ok(await waitFor(() => !alive(leaked)),
+        'the detached fixture must not outlive the test');
     });
+});
+
+describe('the launched-executable check', () => {
+  // A substring search over the command line is not a launcher test: it accepts a
+  // process that merely mentions the path, which under pid reuse is exactly the
+  // process that must never be recorded as our server.
+  test('requires the executable to be argv[0], not merely present', () => {
+    const exe = process.platform === 'win32'
+      ? 'C:\\Users\\Kurt\\.local\\bin\\litert-lm.exe'
+      : '/home/kurt/.local/bin/litert-lm';
+
+    assert.equal(commandLaunches(`"${exe}" serve --port 9379`, exe), true);
+    assert.equal(commandLaunches(`${exe} serve --port 9379`, exe), true);
+    assert.equal(commandLaunches(`node worker.js --inspect ${exe}`, exe), false);
+    assert.equal(commandLaunches(`python ${exe} serve`, exe), false, 'argv[0] is python');
+    assert.equal(commandLaunches('', exe), false);
+    assert.equal(commandLaunches(`${exe} serve`, ''), false);
+  });
 });
 
 describe('release metadata', () => {

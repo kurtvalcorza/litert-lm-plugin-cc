@@ -30,9 +30,9 @@ import { pidAlive, reapMarkers } from './marker-state.mjs';
 // note above them explains which belongs where, and it is worth reading before
 // choosing one.
 import {
-  forgetIdentities, formatPidRecord, identities, identity, isRecordedProcess,
-  looksLikeLitertLmServe, parsePidRecord, pidsOnPort, recordIsStale, signallablePid,
-  startToken,
+  commandLaunches, forgetIdentities, formatPidRecord, identities, identity,
+  isRecordedProcess, looksLikeLitertLmServe, parsePidRecord, pidsOnPort, recordIsStale,
+  signallablePid, startToken,
 } from './process-identity.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -178,10 +178,12 @@ function recordSpawnedPid(port, name, child, exe) {
   clearState(port, name);
   if (!child.pid) return false;
 
+  // argv[0] must BE the executable we launched. A substring search over the whole
+  // command line is not that test: `node worker.js --inspect …\litert-lm.exe`
+  // mentions the path without having launched it, and a recycled pid shaped like
+  // that would be recorded as our server.
   const seen = identity(child.pid);
-  const launched = seen !== null
-    && seen.cmdline.toLowerCase().includes(exe.toLowerCase());
-  if (!launched) return false;
+  if (seen === null || !commandLaunches(seen.cmdline, exe)) return false;
 
   writeState(port, name, formatPidRecord(child.pid));
   return true;
@@ -550,18 +552,22 @@ async function stopProcesses(opts) {
     try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
   }
 
-  // Confirm the port actually closed rather than assuming SIGTERM landed.
+  // Confirm the processes we signalled actually went away, rather than assuming
+  // SIGTERM landed — and judge that by THEM, not by the port.
   //
-  // Escalation is restricted to the owners proven above AND re-proven now. Freezing
-  // the pid numbers is necessary but not sufficient: under pid churn the listener we
-  // signalled can exit and an unrelated process inherit both its number and the port
-  // before the next pass, at which point a numeric intersection would hand it a
-  // SIGKILL. `stillOurs` re-asks the OS instead of trusting the number.
+  // The port is an endpoint; our targets are processes. If a stranger takes the
+  // socket while we are tearing our own server down, or was sharing it, the port
+  // keeps answering and says nothing about whether our work succeeded. Escalation is
+  // likewise restricted to owners proven earlier AND re-proven now: freezing pid
+  // numbers is not enough, because under churn the listener we signalled can exit
+  // and something unrelated inherit both its number and its socket.
+  let remaining = ours.map((o) => o.pid);
   if (ours.length) {
     for (let i = 0; i < 20; i++) {
-      if (!(await probe(opts, 1000))) break;
       await sleep(400);
-      for (const pid of stillOurs(port, ours)) {
+      remaining = stillOurs(port, ours);
+      if (!remaining.length) break;
+      for (const pid of remaining) {
         try { process.kill(pid, process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL'); }
         catch { /* ignore */ }
       }
@@ -572,18 +578,20 @@ async function stopProcesses(opts) {
   for (const f of ['server.pid', 'watchdog.pid', 'in-flight', 'last-activity',
     'stopping', 'loaded-model', 'stopped-idle']) clearState(port, f);
 
-  // Whether the PORT fell silent only means something if we signalled whoever holds
-  // it. If the socket belongs to a stranger we deliberately left running, it will
-  // keep answering, and treating that as our failure reports an error for having
-  // done exactly the right thing — which is what it did, on Linux, the first time
-  // this ran there. Windows had passed the same case by accident: identity costs a
-  // PowerShell start-up there, so the watchdog had not yet published the pid that
-  // made this path reachable.
+  // The verdict is about the processes we signalled, never about the endpoint.
+  //
+  // Judging by the port reported failure for doing exactly the right thing — leaving
+  // a stranger alone while stopping our own watchdog — which is what it did on Linux
+  // the first time the suite ran there. Windows had passed that case by accident:
+  // identity costs a PowerShell start-up there, so the watchdog had not yet published
+  // the pid that made the path reachable. Scoping to `ours` also covers the case
+  // where a stranger takes the socket mid-teardown, where the port would still be
+  // answering for a reason that has nothing to do with us.
   return {
     signalled,
     strangers,
     heldPort: ours.length > 0,
-    down: ours.length > 0 ? !(await probe(opts, 1000)) : true,
+    down: remaining.length === 0,
   };
 }
 
@@ -738,8 +746,8 @@ async function main() {
       noteStrangers();
     } else {
       noteStrangers();
-      throw new Error(`the server on ${baseUrl(opts)} is still responding after being asked to `
-        + 'stop.\n  Something else may own the port. Inspect it, then retry.');
+      throw new Error(`the litert-lm server on ${baseUrl(opts)} is still running after being `
+        + 'asked to stop.\n  Inspect it, then retry.');
     }
     return;
   }

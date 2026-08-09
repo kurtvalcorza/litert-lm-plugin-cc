@@ -277,19 +277,29 @@ async function main() {
     // counter leaked rather than work being genuinely in progress (T056).
     if (inFlight > 0 && idleFor < ceilingMs) continue;
 
+    // Nothing here is provably ours. That happens when the server on this port was
+    // adopted and cannot be identified as a litert-lm — another OpenAI-compatible
+    // process, say. Stand down without touching it, and WITHOUT the shutdown
+    // bookkeeping: clearing state and writing `stopped-idle` would record that we
+    // released accelerator memory we never held, and the next client would be told a
+    // server had been idle-stopped when it is still running and still unsupervised.
+    const targets = ourTargets();
+    if (!targets.length) cleanupAndExit(0);
+
     // Signal before acting, so a client cannot connect to a dying server (FR-025).
     writeState('stopping', Date.now());
-    const targets = ourTargets();
     terminateServer(targets);
 
+    // Wait on OUR targets, not on the endpoint: something else may hold or take the
+    // port, and its answering says nothing about whether our server is gone.
     for (let i = 0; i < 30; i++) {
       await sleep(500);
-      if (!(await serverReachable())) break;
-      // Still answering: escalate, but only on owners proven above AND re-proven
-      // now. What is still reachable might be a different server that took the port
-      // while we were tearing ours down — possibly one that inherited the very pid
-      // we just killed, which a numeric check would wave straight through.
-      for (const pid of stillOurs(targets)) {
+      const surviving = stillOurs(targets);
+      if (!surviving.length) break;
+      // Still running: escalate, but only on owners proven above AND re-proven now —
+      // a process that inherited the pid we just killed must not inherit the SIGKILL
+      // along with it, which a numeric check would wave straight through.
+      for (const pid of surviving) {
         try { process.kill(pid, process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL'); }
         catch { /* ignore */ }
       }

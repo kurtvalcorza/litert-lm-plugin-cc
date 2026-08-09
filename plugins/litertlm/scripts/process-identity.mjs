@@ -281,9 +281,15 @@ export function isRecordedProcess(pid, token) {
  *     python unrelated_server.py litert_lm serve     <- adjacent, both arguments
  *     node server.js --label litert-lm serve         <- adjacent, both arguments
  *
+ *   v3, required a launcher POSITION but never checked what occupied the others:
+ *     ./backup.sh litert-lm serve         <- argv[0] is not an interpreter
+ *     node litert-lm serve                <- argv[0] is not an interpreter
+ *     python unrelated.py -m litert_lm serve   <- `-m` accepted at any index
+ *
  * Every one of those would have been signalled had it owned the configured port,
- * which is the accident this whole change exists to prevent. Adjacency was a
- * narrower guess, not a different kind of answer; position is the answer.
+ * which is the accident this whole change exists to prevent. Each version was a
+ * narrower guess rather than a different kind of answer; the shape of the whole
+ * invocation is the answer.
  *
  * Deliberately does NOT require `--port <n>`: a server started by hand as plain
  * `litert-lm serve` on the default port carries no such flag, and `ensureServer`
@@ -305,15 +311,39 @@ function argvTokens(cmdline) {
 /** A path or bare name whose final component IS the litert-lm program. */
 const LITERT_LM_PROGRAM = /(?:^|[/\\])litert[-_]lm(?:\.exe)?$/i;
 
+/** A path or bare name whose final component is a Python interpreter. */
+const PYTHON_INTERPRETER = /(?:^|[/\\])python[\d.]*(?:\.exe)?$/i;
+
 export function isLitertLmServeCommand(cmdline) {
   const argv = argvTokens(cmdline);
   const serveIdx = argv.findIndex((t) => t.toLowerCase() === 'serve');
-  if (serveIdx < 1) return false;
-  if (!LITERT_LM_PROGRAM.test(argv[serveIdx - 1])) return false;
-  // Launcher role: the entry point (argv[0], or argv[1] behind an interpreter) or a
-  // `-m litert_lm` module invocation. Position is what separates the program from an
-  // argument that merely happens to be spelled the same way.
-  return serveIdx - 1 <= 1 || argv[serveIdx - 2] === '-m';
+  if (serveIdx < 1 || !LITERT_LM_PROGRAM.test(argv[serveIdx - 1])) return false;
+
+  // Exactly three shapes are a litert-lm serve, and each is checked whole rather
+  // than by the position of one token:
+  switch (serveIdx) {
+    case 1: return true;                                   // litert-lm serve
+    case 2: return PYTHON_INTERPRETER.test(argv[0]);       // python litert-lm serve
+    case 3: return PYTHON_INTERPRETER.test(argv[0])        // python -m litert_lm serve
+      && argv[1] === '-m';
+    default: return false;
+  }
+}
+
+/**
+ * Did this command line LAUNCH `exe` — is it argv[0], rather than a word somewhere?
+ *
+ * A substring search over the whole line does not answer that. It accepts, for
+ * instance, `node worker.js --inspect C:\...\litert-lm.exe`, which merely mentions
+ * the path; if a recycled pid belonged to something shaped like that, it would be
+ * recorded as our server and later signalled.
+ */
+export function commandLaunches(cmdline, exe) {
+  const argv0 = argvTokens(cmdline)[0];
+  if (!argv0 || !exe) return false;
+  return process.platform === 'win32'
+    ? argv0.toLowerCase() === String(exe).toLowerCase()
+    : argv0 === String(exe);
 }
 
 /**

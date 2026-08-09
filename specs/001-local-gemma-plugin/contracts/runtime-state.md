@@ -13,7 +13,7 @@ different ports never share state.
 | File | Format | Writer | Reader |
 |---|---|---|---|
 | `server.pid` | `<pid> <start-token>` | client, after successful start | watchdog |
-| `watchdog.pid` | `<pid> <start-token>` | client, at spawn (watchdog self-records if absent) | client, watchdog |
+| `watchdog.pid` | `<pid> <start-token>` | **watchdog only** — see below | client, watchdog |
 | `last-activity` | epoch ms | client, before and after each request | watchdog |
 | `in-flight.d/<pid>-<ts>` | **directory of marker files** | client, one per request | watchdog |
 | `stopping` | empty; presence is the signal | watchdog, before terminating | client |
@@ -52,6 +52,22 @@ The strong test is defined in terms of the weak one, so they cannot drift apart.
 must never be used to justify a signal. Splitting them is what keeps the cost off the
 interactive path: establishing identity means starting PowerShell on Windows (~930ms measured),
 and reconciliation runs on every invocation while only ever deleting files.
+
+**The watchdog is the SOLE writer of `watchdog.pid`, and claims it exclusively.** The client
+spawns a watchdog but never publishes its pid. Doing so was an optimisation — the record appears
+at once rather than after the watchdog's own identity lookup, so a client arriving in between
+does not spawn a redundant supervisor — and it cost correctness: a *parent* can only publish a
+claim its child has already abandoned. Two clients adopt one warm server, both spawn a watchdog,
+the loser's watchdog sees a proven owner and exits, and the loser's client then writes that
+now-dead pid over the winner's record; the survivor reads an owner that is not itself and exits
+too, leaving the server unsupervised. A watchdog never writes after deciding to stand down, so
+single-writer removes the class rather than arbitrating it. The claim itself is an exclusive
+create (`wx`), and a stale record is reclaimed only after re-reading the exact bytes judged
+stale, so reclamation cannot delete a live winner.
+
+**Shutdown is judged by the processes signalled, never by the port.** The socket is an endpoint;
+targets are processes. A stranger that holds or takes the port keeps answering, and treating
+that as failure reports an error for correctly leaving it alone.
 
 ## Default values
 
