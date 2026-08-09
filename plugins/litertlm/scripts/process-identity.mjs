@@ -44,6 +44,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
 // The boot-session test and pid liveness already have a home; ownership builds on
@@ -121,7 +122,24 @@ function inspectLinux(pid) {
   }
 }
 
-/** macOS and other POSIX: `ps` is the only portable answer. 1-second resolution. */
+/**
+ * macOS and other POSIX: `ps` is the only portable answer, and a coarse one.
+ *
+ * `lstart` is `Www Mmm dd HH:MM:SS YYYY` — no subsecond field, so two processes
+ * created in the same second are indistinguishable by time alone. That is the exact
+ * pid-churn case the identity check exists to catch: a target exits, its pid is
+ * reissued within the same second, and `{pid, start}` matches the replacement.
+ *
+ * The token therefore carries a digest of the command line as well. A collision now
+ * needs the recycled pid to be running the same argv too, which narrows "unrelated
+ * process" to "another instance of the same server" — still a collision in
+ * principle, but no longer one that can reach an unrelated program.
+ *
+ * Not fully closed, and worth being plain about that: Linux (/proc field 22, clock
+ * ticks) and Windows (creation time, 100ns) are precise enough not to need this.
+ * A subsecond source on macOS would be better than a digest; there is no portable
+ * one via `ps`.
+ */
 function inspectPosixPs(pids) {
   let out = '';
   try {
@@ -133,7 +151,10 @@ function inspectPosixPs(pids) {
     // pid, then a fixed 5-field `lstart` (Www Mmm DD HH:MM:SS YYYY), then argv.
     const m = line.trim().match(/^(\d+)\s+(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.*)$/);
     if (!m) continue;
-    cache.set(Number.parseInt(m[1], 10), { start: flatten(m[2]), cmdline: flatten(m[3]) });
+    const cmdline = flatten(m[3]);
+    const digest = createHash('sha256').update(cmdline).digest('hex').slice(0, 16);
+    cache.set(Number.parseInt(m[1], 10),
+      { start: `${flatten(m[2])}#${digest}`, cmdline });
   }
 }
 
@@ -248,33 +269,52 @@ export function isRecordedProcess(pid, token) {
 /**
  * Is this command line a `litert-lm serve`?
  *
- * The argv token immediately before `serve` must itself END with the litert-lm
- * program name — quoted or not, with or without `.exe`. Anything looser is not a
- * command-line test but two unrelated word searches, and they can be satisfied by
- * completely different parts of the line:
+ * Parsed as argv, not searched as text, and the litert-lm token must occupy a
+ * LAUNCHER POSITION. Two weaker versions of this test shipped in review and both
+ * were wrong in the same direction:
  *
- *   python /work/litert_lm/tools/server.py serve   <- directory + unrelated arg
- *   vim /home/kurt/litert-lm/serve notes.txt       <- directory + a FILE named serve
+ *   v1, two independent word searches — satisfied by unrelated parts of one line:
+ *     python /work/litert_lm/tools/server.py serve   <- directory + unrelated arg
+ *     vim /home/kurt/litert-lm/serve notes.txt       <- directory + a FILE named serve
  *
- * Both were classified as ours by the first version of this predicate, and either
- * one holding the configured port would have been signalled — recreating the exact
- * accident this change exists to prevent. The first came from review; the second
- * turned up while writing the test for the first.
+ *   v2, required them adjacent — which is still not a role:
+ *     python unrelated_server.py litert_lm serve     <- adjacent, both arguments
+ *     node server.js --label litert-lm serve         <- adjacent, both arguments
+ *
+ * Every one of those would have been signalled had it owned the configured port,
+ * which is the accident this whole change exists to prevent. Adjacency was a
+ * narrower guess, not a different kind of answer; position is the answer.
  *
  * Deliberately does NOT require `--port <n>`: a server started by hand as plain
  * `litert-lm serve` on the default port carries no such flag, and `ensureServer`
  * adopts exactly that server. The listening socket already supplies the port; the
  * command line only has to supply the identity.
  *
- * Fails safe in the other direction too. `litert-lm --verbose serve` puts a flag
- * between the program and the subcommand and so is NOT recognised; the cost of that
- * is a real server being reported as a stranger and left running, which is visible
- * and recoverable, rather than a stranger being killed, which is neither.
+ * Fails safe in the other direction too. `litert-lm --verbose serve` and
+ * `uv run litert-lm serve` put something between the program and either the
+ * interpreter or the subcommand, and neither is recognised. The cost is a real
+ * server being reported as a stranger and left running — visible, and fixable by
+ * stopping it yourself — rather than a stranger being killed, which is neither.
  */
-const LITERT_LM_SERVE =
-  /(?:^|\s)(?:"[^"]*litert[-_]lm(?:\.exe)?"|'[^']*litert[-_]lm(?:\.exe)?'|[^\s"']*litert[-_]lm(?:\.exe)?)\s+serve(?:\s|$)/i;
+/** Split a command line into argv-ish tokens, keeping quoted paths whole. */
+function argvTokens(cmdline) {
+  return [...String(cmdline ?? '').matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)]
+    .map((m) => m[1] ?? m[2] ?? m[3]);
+}
 
-export const isLitertLmServeCommand = (cmdline) => LITERT_LM_SERVE.test(cmdline ?? '');
+/** A path or bare name whose final component IS the litert-lm program. */
+const LITERT_LM_PROGRAM = /(?:^|[/\\])litert[-_]lm(?:\.exe)?$/i;
+
+export function isLitertLmServeCommand(cmdline) {
+  const argv = argvTokens(cmdline);
+  const serveIdx = argv.findIndex((t) => t.toLowerCase() === 'serve');
+  if (serveIdx < 1) return false;
+  if (!LITERT_LM_PROGRAM.test(argv[serveIdx - 1])) return false;
+  // Launcher role: the entry point (argv[0], or argv[1] behind an interpreter) or a
+  // `-m litert_lm` module invocation. Position is what separates the program from an
+  // argument that merely happens to be spelled the same way.
+  return serveIdx - 1 <= 1 || argv[serveIdx - 2] === '-m';
+}
 
 /**
  * Does the process behind this pid look like a `litert-lm serve`?

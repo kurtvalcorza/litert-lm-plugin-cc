@@ -21,7 +21,9 @@
 
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync, copyFileSync, linkSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync,
+} from 'node:fs';
 import { after, describe, test } from 'node:test';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -236,6 +238,16 @@ describe('recognising a litert-lm serve command line', () => {
     '',
   ];
 
+  // These put the two strings ADJACENT, which the second version of the predicate
+  // accepted. Adjacency is not a launcher role — in each of these litert-lm is an
+  // argument to something else entirely.
+  const ADJACENT_BUT_NOT_OURS = [
+    'python unrelated_server.py litert_lm serve',
+    'node server.js --label litert-lm serve',
+    './backup.sh --tag litert-lm serve --port 9379',
+    'docker run --name litert-lm serve',
+  ];
+
   test('recognises every real launcher stage', () => {
     for (const cmdline of OURS) {
       assert.equal(isLitertLmServeCommand(cmdline), true, cmdline.slice(0, 80));
@@ -248,10 +260,18 @@ describe('recognising a litert-lm serve command line', () => {
     }
   });
 
-  test('rejects rather than guesses when a flag separates program from subcommand', () => {
-    // A false negative, deliberately: the server is reported as a stranger and left
+  test('rejects litert-lm appearing next to serve as a mere argument', () => {
+    for (const cmdline of ADJACENT_BUT_NOT_OURS) {
+      assert.equal(isLitertLmServeCommand(cmdline), false, cmdline);
+    }
+  });
+
+  test('rejects rather than guesses when something separates the launcher parts', () => {
+    // False negatives, deliberately: the server is reported as a stranger and left
     // running, which is visible and recoverable. The opposite error is neither.
-    assert.equal(isLitertLmServeCommand('/usr/bin/litert-lm --verbose serve'), false);
+    for (const cmdline of ['/usr/bin/litert-lm --verbose serve', 'uv run litert-lm serve']) {
+      assert.equal(isLitertLmServeCommand(cmdline), false, cmdline);
+    }
   });
 });
 
@@ -405,6 +425,88 @@ describe('the idle watchdog', () => {
     assert.ok(claimed?.token, 'with a real identity, not the placeholder');
     assert.notEqual(claimed?.token, 'pretend-token');
   });
+});
+
+describe('recording a process we spawned', () => {
+  /**
+   * A stand-in for `litert-lm` whose FIRST stage exits immediately after handing the
+   * socket to a detached grandchild.
+   *
+   * Not contrived — litert-lm is genuinely a multi-stage launcher, and the pid the
+   * client records is the stage that exits, not the one that ends up serving. It
+   * makes the token-capture window observable: identity takes 0.9-3.4s on Windows,
+   * so the recorded child is already dead by the time the token arrives, and a pid
+   * reissued in that window would be recorded as though it were our server.
+   */
+  function installFakeLitertLm(binDir, workDir, port) {
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(workDir, { recursive: true });
+
+    // A copy of node under the name the client resolves. It must be directly
+    // spawnable: the client spawns without a shell, and Node refuses to spawn a
+    // .cmd/.bat that way, so a batch stub is not an option.
+    const exe = join(binDir, process.platform === 'win32' ? 'litert-lm.exe' : 'litert-lm');
+    try { linkSync(process.execPath, exe); } catch { copyFileSync(process.execPath, exe); }
+    if (process.platform !== 'win32') chmodSync(exe, 0o755);
+
+    // The client invokes `<exe> serve --host H --port P` from its own cwd, so `serve`
+    // resolves to this script: it hands the socket to a detached grandchild and
+    // exits, exactly as a real launcher stage does.
+    writeFileSync(join(workDir, 'grandchild.js'), `
+      const { createServer } = require('node:http');
+      createServer((req, res) => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', data: [{ id: 'fake' }] }));
+      }).listen(${port}, '127.0.0.1');
+      setInterval(() => {}, 1000);
+    `, 'utf8');
+    writeFileSync(join(workDir, 'serve'), `
+      const { spawn } = require('node:child_process');
+      const { join } = require('node:path');
+      spawn(process.execPath, [join(__dirname, 'grandchild.js')],
+        { detached: true, stdio: 'ignore' }).unref();
+      process.exit(0);
+    `, 'utf8');
+  }
+
+  test('a launcher stage that exits during token capture is not recorded',
+    { timeout: 90_000 }, async () => {
+      const port = PORT.staleState + 10;
+      const runtime = runtimeDir();
+      const dir = join(runtime, String(port));
+      const binDir = join(runtime, 'bin');
+      const workDir = join(runtime, 'work');
+      installFakeLitertLm(binDir, workDir, port);
+
+      const sep = process.platform === 'win32' ? ';' : ':';
+      const r = spawnSync(process.execPath, [CLIENT, '--list', '--port', String(port)], {
+        encoding: 'utf8',
+        windowsHide: true,
+        cwd: workDir,
+        env: {
+          ...process.env,
+          LITERT_LM_PLUGIN_RUNTIME: runtime,
+          PATH: `${binDir}${sep}${process.env.PATH ?? ''}`,
+          Path: `${binDir}${sep}${process.env.Path ?? ''}`,
+        },
+      });
+
+      // The grandchild serves, so the client should succeed...
+      assert.equal(r.status, 0, `client should reach the fake server: ${r.stderr}`);
+      // ...but the pid it spawned is long gone, so nothing about it is recordable.
+      assert.throws(() => readFileSync(join(dir, 'server.pid'), 'utf8'),
+        'a launcher stage that has already exited must not be recorded as the server');
+
+      // And nothing of ours is on the port, so --stop must leave the grandchild be.
+      const stop = runClient(['--stop', '--port', String(port)], runtime);
+      assert.equal(stop.status, 0);
+      assert.doesNotMatch(stop.stdout, /Server stopped/,
+        'the fake grandchild is not a litert-lm serve and is not ours to claim');
+
+      for (const pid of pidsOnPort(port)) {
+        try { process.kill(pid, 'SIGKILL'); } catch { /* ignore */ }
+      }
+    });
 });
 
 describe('release metadata', () => {

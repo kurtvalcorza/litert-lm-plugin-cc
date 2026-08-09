@@ -30,8 +30,9 @@ import { pidAlive, reapMarkers } from './marker-state.mjs';
 // note above them explains which belongs where, and it is worth reading before
 // choosing one.
 import {
-  forgetIdentities, formatPidRecord, identities, isRecordedProcess, looksLikeLitertLmServe,
-  parsePidRecord, pidsOnPort, recordIsStale, signallablePid, startToken,
+  forgetIdentities, formatPidRecord, identities, identity, isRecordedProcess,
+  looksLikeLitertLmServe, parsePidRecord, pidsOnPort, recordIsStale, signallablePid,
+  startToken,
 } from './process-identity.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -153,35 +154,37 @@ function stateWrittenAt(port, name) {
   try { return statSync(statePath(port, name)).mtimeMs; } catch { return null; }
 }
 
-/** Record a pid we just spawned, together with the token that re-identifies it. */
-const writeOwnedPid = (port, name, pid) =>
-  writeState(port, name, formatPidRecord(pid));
-
 /**
- * Record a pid only if nobody else holds the slot. Returns whether we got it.
+ * Record a process we just spawned, with the token that re-identifies it.
  *
- * `wx` makes the create atomic, so of two racing clients exactly one wins and the
- * loser leaves the winner's record alone. A file that is merely stale — a pid that
- * has died, or one written before this boot — is not a claim and is cleared first,
- * which is what stops an abandoned record locking the slot forever.
+ * Establishing identity is not instantaneous — on Windows it starts PowerShell,
+ * measured at 0.9-3.4s — and a child that dies inside that window can have its pid
+ * reissued before the lookup lands. The token captured would then describe the
+ * replacement, and persisting it would produce a `server.pid` that passes every
+ * later identity check while naming an unrelated process: the exact failure this
+ * file exists to prevent, reintroduced by the act of recording.
  *
- * Stale-then-create is not itself atomic, so two clients can still both get past
- * the unlink. The exclusive create decides that race too: one succeeds, the other
- * sees EEXIST and stands down.
+ * So the pid is only recorded if what the OS describes is still the program we
+ * launched. Checking `child.exitCode` instead does NOT work, and looked like it did:
+ * the identity lookup is `spawnSync`, which blocks the event loop, so the child's
+ * exit event has not been delivered yet and `exitCode` is still null when we come
+ * back. The command line is evidence about the process; the handle, at that moment,
+ * is only evidence about our own event loop.
+ *
+ * Nothing recorded means `--stop` falls back to socket-owner discovery, which is
+ * the right answer when we have nothing trustworthy to say.
  */
-function claimOwnedPid(port, name, pid) {
-  const record = formatPidRecord(pid);
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      mkdirSync(stateDir(port), { recursive: true });
-      writeFileSync(statePath(port, name), record, { encoding: 'utf8', flag: 'wx' });
-      return true;
-    } catch {
-      if (attempt === 1 || !staleRecord(port, name)) return false;
-      clearState(port, name);
-    }
-  }
-  return false;
+function recordSpawnedPid(port, name, child, exe) {
+  clearState(port, name);
+  if (!child.pid) return false;
+
+  const seen = identity(child.pid);
+  const launched = seen !== null
+    && seen.cmdline.toLowerCase().includes(exe.toLowerCase());
+  if (!launched) return false;
+
+  writeState(port, name, formatPidRecord(child.pid));
+  return true;
 }
 
 const pidRecord = (port, name) => parsePidRecord(readState(port, name, ''));
@@ -373,18 +376,21 @@ function startWatchdog(opts) {
       { detached: true, stdio: 'ignore' },
     );
     child.unref();
-    // Record it here rather than letting it record itself. Establishing identity
-    // costs a process lookup, and doing that inside the watchdog puts the lookup
-    // BEFORE the file appears — leaving a window in which we have already exited and
-    // the next client sees no supervisor and starts a second one. We know the pid the
-    // moment spawn returns, so the record can exist before this process ends.
+    // Deliberately does NOT record the watchdog. The watchdog publishes its own pid,
+    // and it is the only writer of that file.
     //
-    // Claimed, not written. Two clients can adopt one warm server and both spawn a
-    // watchdog; the loser's watchdog sees a proven owner and exits, and an
-    // unconditional write here would then stamp that dead pid over the winner's
-    // record. The surviving watchdog reads an owner that is not itself on its next
-    // poll and exits too, leaving the server running with nobody supervising it.
-    if (child.pid) claimOwnedPid(opts.port, 'watchdog.pid', child.pid);
+    // Recording it here was an optimisation — the record appears immediately instead
+    // of after the watchdog's own identity lookup, so a client arriving in between
+    // does not spawn a redundant supervisor. It cost correctness. A parent can only
+    // publish a claim its child has already abandoned: two clients adopt one warm
+    // server, both spawn a watchdog, the loser's watchdog sees a proven owner and
+    // exits, and the loser's CLIENT then writes that now-dead pid over the winner's
+    // record. The survivor reads an owner that is not itself and exits too, leaving
+    // the server unsupervised.
+    //
+    // A watchdog never writes after deciding to stand down, so making it the sole
+    // writer removes the whole class rather than arbitrating it. The redundant spawn
+    // this reintroduces is a node start-up that immediately exits.
   } catch {
     process.stderr.write('[litertlm] warning: idle watchdog failed to start; the server will '
       + 'stay resident until you run --stop.\n');
@@ -459,9 +465,10 @@ async function ensureServer(opts) {
       + `  (underlying error: ${err.message})`);
   }
 
-  // Record the identity now, while the process is certainly the one we just spawned.
-  // Asked for later, the answer could already be about a different process.
-  if (child.pid) writeOwnedPid(opts.port, 'server.pid', child.pid);
+  // Record the identity now, while the process is still the one we just spawned —
+  // and only if the OS still says so. Asked for later, the answer could already be
+  // about whoever inherited the pid.
+  recordSpawnedPid(opts.port, 'server.pid', child, exe);
   // Prune, not wipe: another client may have acquired a marker against this same
   // new server between our spawn and this line.
   pruneInFlight(opts.port);

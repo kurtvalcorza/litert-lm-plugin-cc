@@ -27,7 +27,7 @@ import { reapMarkers } from './marker-state.mjs';
 // refused to touch. One home, one rule, no weaker copy.
 import {
   forgetIdentities, formatPidRecord, identities, isRecordedProcess, looksLikeLitertLmServe,
-  parsePidRecord, pidsOnPort, signallablePid, startToken,
+  parsePidRecord, pidsOnPort, recordIsStale, signallablePid, startToken,
 } from './process-identity.mjs';
 
 const POLL_INTERVAL_MS = 5000;
@@ -85,6 +85,41 @@ function clearState(name) {
 /** When a state file was last written, or null if it is not there. */
 function stateWrittenAt(name) {
   try { return statSync(statePath(name)).mtimeMs; } catch { return null; }
+}
+
+/**
+ * Take the supervisor slot for this port, or report that someone else holds it.
+ *
+ * `wx` makes the create atomic, so of two watchdogs racing exactly one wins and the
+ * loser stands down rather than overwriting. A merely stale file — a dead pid, or
+ * one written before this boot — is not a claim, and is removed so an abandoned
+ * record cannot lock the port out of supervision forever.
+ *
+ * The removal quotes the exact bytes it judged: if the file changed between the
+ * staleness check and the unlink, someone live has taken the slot in between and we
+ * leave it alone. Without that, reclaiming a stale record could delete a live winner
+ * and publish over it.
+ *
+ * Only a watchdog writes this file, and only before it begins supervising — never
+ * after deciding to stand down. That is what keeps "whoever wrote last is alive"
+ * true, and it is why the client no longer publishes this record on our behalf.
+ */
+function claimWatchdogSlot() {
+  const record = formatPidRecord(process.pid);       // one lookup, not one per attempt
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      mkdirSync(stateDir(opts.port), { recursive: true });
+      writeFileSync(statePath('watchdog.pid'), record, { encoding: 'utf8', flag: 'wx' });
+      return true;
+    } catch {
+      if (attempt === 1) return false;
+      const raw = readState('watchdog.pid', '');
+      if (!recordIsStale(parsePidRecord(raw), stateWrittenAt('watchdog.pid'))) return false;
+      if (readState('watchdog.pid', '') !== raw) return false;   // changed under us
+      clearState('watchdog.pid');
+    }
+  }
+  return false;
 }
 
 /**
@@ -200,11 +235,7 @@ async function main() {
   // someone ran --stop by hand.
   const existing = ownedPid('watchdog.pid');
   if (existing !== null && existing !== process.pid) process.exit(0);
-
-  // Normally the client has already recorded us, and `existing` is our own pid — in
-  // which case there is nothing to write and no lookup to pay for. Self-recording
-  // remains for the case where this was started some other way.
-  if (existing === null) writeState('watchdog.pid', formatPidRecord(process.pid));
+  if (!claimWatchdogSlot()) process.exit(0);         // someone beat us to it
 
   const idleMs = opts.idleTimeout * 1000;
   const ceilingMs = Math.max(idleMs * HARD_CEILING_MULTIPLIER, HARD_CEILING_FLOOR_MS);
