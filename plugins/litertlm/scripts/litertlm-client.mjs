@@ -30,9 +30,8 @@ import { pidAlive, reapMarkers } from './marker-state.mjs';
 // note above them explains which belongs where, and it is worth reading before
 // choosing one.
 import {
-  commandLaunches, forgetIdentities, formatPidRecord, identities, identity,
-  isRecordedProcess, looksLikeLitertLmServe, parsePidRecord, pidsOnPort, recordIsStale,
-  signallablePid, startToken,
+  commandLaunches, formatPidRecord, identities, identity, looksLikeLitertLmServe,
+  parsePidRecord, pidsOnPort, recordIsStale, resolveTargets, signallablePid, startToken,
 } from './process-identity.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -388,7 +387,11 @@ function startWatchdog(opts) {
     const child = spawn(
       process.execPath,
       [join(HERE, 'idle-watchdog.mjs'), '--port', String(opts.port),
-        '--idle-timeout', String(opts.idleTimeout)],
+        '--idle-timeout', String(opts.idleTimeout),
+        // So a `--stop` landing before this child has published its pid can still
+        // invalidate it. Without this the child is invisible to that stop and would
+        // publish a supervisor record over the state it had just cleared.
+        '--spawned-at', String(Date.now())],
       { detached: true, stdio: 'ignore' },
     );
     child.unref();
@@ -530,24 +533,15 @@ function classifyPortOwners(port) {
 }
 
 /**
- * Of `targets`, those the OS says are STILL the same process, asked afresh.
+ * Of `targets`, those still running as themselves — and those we could not judge.
  *
- * The cache is dropped first on purpose: it was populated before we signalled
- * anything, so without this it would keep describing processes that have since
- * exited and happily confirm their replacements.
- *
- * Deliberately does not intersect with the port. An earlier version did, and it made
- * "stopped listening" mean "exited" — a server that closes its socket on SIGTERM and
- * then hangs in teardown, still holding accelerator memory, would drop out of the set
- * and be reported as successfully stopped. The token already proves identity; the
- * socket adds nothing to that and subtracts the case that matters most.
+ * The rule is `resolveTargets`, in process-identity.mjs, so the watchdog applies the
+ * identical one. Deliberately does not intersect with the port: an earlier version
+ * did, and it made "stopped listening" mean "exited" — a server that closes its
+ * socket on SIGTERM and then hangs in teardown, still holding accelerator memory,
+ * would drop out of the set and be reported as successfully stopped.
  */
-function stillAlive(targets) {
-  const pids = targets.map((t) => t.pid);
-  forgetIdentities(pids);
-  identities(pids);
-  return targets.filter((t) => isRecordedProcess(t.pid, t.token)).map((t) => t.pid);
-}
+const stillAlive = (targets) => resolveTargets(targets);
 
 /**
  * Stop our server and watchdog — and nothing else.
@@ -578,7 +572,7 @@ async function stopProcesses(opts) {
   // spends two process lookups — seconds, on Windows — and a recorded process can
   // exit and have its number reissued inside that gap. Proving early and signalling
   // late is not proof; it is a stale claim with a delay in front of it.
-  let remaining = stillAlive(targets);
+  let { alive: remaining, unknown } = stillAlive(targets);
   const signalled = [...remaining];
 
   for (const pid of signalled) {
@@ -592,21 +586,22 @@ async function stopProcesses(opts) {
   if (signalled.length) {
     for (let i = 0; i < 20; i++) {
       await sleep(400);
-      remaining = stillAlive(targets);
-      if (!remaining.length) break;
+      ({ alive: remaining, unknown } = stillAlive(targets));
+      if (!remaining.length && !unknown.length) break;
       for (const pid of remaining) {
         try { process.kill(pid, process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL'); }
         catch { /* ignore */ }
       }
     }
     // One more check, after the last signal rather than before it. The loop refreshes
-    // `remaining` at the TOP, so a target that dies in response to the final
-    // iteration's signal would still be listed when the loop ends — reported as
-    // having refused to stop, and its state kept, when it had in fact just exited.
+    // at the TOP, so a target that dies in response to the final iteration's signal
+    // would still be listed when the loop ends — reported as having refused to stop,
+    // and its state kept, when it had in fact just exited.
     await sleep(200);
-    remaining = stillAlive(targets);
+    ({ alive: remaining, unknown } = stillAlive(targets));
   } else {
     remaining = [];
+    unknown = [];
   }
 
   clearInFlight(port);
@@ -617,7 +612,9 @@ async function stopProcesses(opts) {
   // destroyed the only evidence a retry could use: a target that has closed its
   // socket but is still alive is invisible to port discovery, so "inspect it, then
   // retry" left the user with nothing to inspect and nothing for the retry to find.
-  const survivors = new Set(remaining);
+  // An unjudgeable target counts as a survivor for state purposes: if we cannot say
+  // it exited, we must not throw away the identity needed to ask again.
+  const survivors = new Set([...remaining, ...unknown]);
   const kept = new Set();
   for (const name of PID_FILES) {
     const rec = recordedByName.get(name);
@@ -635,6 +632,13 @@ async function stopProcesses(opts) {
     writeState(port, 'server.pid', `${orphan.pid} ${orphan.token}`);
   }
 
+  // A tombstone, written last. A watchdog spawned before this stop may still be
+  // completing its own identity lookup and about to publish itself as supervisor of
+  // a server that no longer exists; it compares this against when it was spawned and
+  // stands down. Durable on purpose — an old stop is simply earlier than the next
+  // watchdog, so nothing has to remember to clear it.
+  writeState(port, 'stopped-at', Date.now());
+
   // The verdict is about the processes we signalled, never about the endpoint.
   //
   // Judging by the port reported failure for doing exactly the right thing — leaving
@@ -648,8 +652,9 @@ async function stopProcesses(opts) {
     signalled,
     strangers,
     surviving: remaining,
+    unknown,
     heldPort: ours.length > 0,
-    down: remaining.length === 0,
+    down: remaining.length === 0 && unknown.length === 0,
   };
 }
 
@@ -792,6 +797,27 @@ async function main() {
         ? `No server of this plugin's was running on port ${opts.port}; state cleared.\n`
         : 'Server was not running; state cleared.\n');
       noteStrangers();
+    } else if (!down) {
+      // Failure wins over every success message. This test used to sit BELOW the
+      // no-port branch, so targets that came only from the pid files, were off-port,
+      // and survived escalation printed "Stopped this plugin's processes" and exited
+      // 0 — reporting success for processes still running.
+      noteStrangers();
+      // Name them. A survivor may have closed its socket and so be invisible to any
+      // port-based look-up the reader would otherwise try, which is exactly why the
+      // state records were kept rather than cleared.
+      const parts = [];
+      if (surviving.length) {
+        parts.push(`pid ${surviving.join(', ')} did not stop. It is this plugin's process\n`
+          + '  and it is still running, so it may still hold accelerator memory even if it\n'
+          + '  has closed its socket.');
+      }
+      if (unknown.length) {
+        parts.push(`pid ${unknown.join(', ')} could not be identified — the process lookup\n`
+          + '  failed, so whether it exited is unknown. Treated as still running rather\n'
+          + '  than assumed gone.');
+      }
+      throw new Error(`${parts.join('\n  ')}\n  Inspect it, then retry.`);
     } else if (!heldPort) {
       // We stopped our own processes — a watchdog, a launcher stage — but the socket
       // was never ours. Saying "accelerator memory released" here would be a lie:
@@ -799,18 +825,9 @@ async function main() {
       process.stdout.write(
         `Stopped this plugin's processes on port ${opts.port}; state cleared.\n`);
       noteStrangers();
-    } else if (down) {
+    } else {
       process.stdout.write('Server stopped; accelerator memory released.\n');
       noteStrangers();
-    } else {
-      noteStrangers();
-      // Name the survivors. They may have closed their socket and so be invisible to
-      // any port-based look-up the reader would otherwise try — which is exactly why
-      // their state records were kept rather than cleared.
-      throw new Error(
-        `pid ${surviving.join(', ')} did not stop.\n`
-        + '  It is this plugin\'s process and it is still running, so it may still hold\n'
-        + '  accelerator memory even if it has closed its socket. Inspect it, then retry.');
     }
     return;
   }

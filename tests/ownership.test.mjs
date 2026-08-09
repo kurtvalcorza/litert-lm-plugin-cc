@@ -512,15 +512,20 @@ describe('the idle watchdog', () => {
       // and was simply killed by the escalation, so the watchdog correctly reported
       // success and the assertion failed. Both POSIX legs caught that.
       //
-      // pid 1 is the one process on a POSIX host that a normal user provably cannot
-      // signal: every kill returns EPERM, so `stillOurs` keeps reporting it and the
-      // watchdog runs out of attempts, which is exactly the branch under test.
+      // pid 1 is usually the one process a normal user cannot signal, which makes it
+      // the only way to stage a target that outlives escalation.
       //
-      // Skipped as root, where that guarantee evaporates and the signals would land
-      // on init. A test that can take down the machine if the suite happens to run
-      // privileged is not worth the coverage.
-      if (typeof process.getuid !== 'function' || process.getuid() === 0) {
-        t.skip('runs as root: signalling pid 1 would not fail harmlessly');
+      // "Usually" is not good enough, and `getuid() !== 0` does not establish it: in
+      // a rootless or user-namespaced container, init inside the namespace can share
+      // our uid and be perfectly signallable — at which point this test drives the
+      // watchdog into SIGKILLing it. So ask the kernel the exact question instead of
+      // inferring the answer from the uid. Signal 0 performs the permission check
+      // without delivering anything: EPERM means the process exists and we may not
+      // touch it, which is the only condition under which this is safe to run.
+      let refused = false;
+      try { process.kill(1, 0); } catch (err) { refused = err.code === 'EPERM'; }
+      if (!refused) {
+        t.skip('pid 1 is signallable here, so staging it would actually kill init');
         return;
       }
 

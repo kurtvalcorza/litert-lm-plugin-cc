@@ -457,6 +457,62 @@ export function signallablePid(record, writtenAtMs) {
   return isRecordedProcess(record.pid, record.token) ? record.pid : null;
 }
 
+/**
+ * Has this pid exited but not yet been reaped? Linux only; false elsewhere.
+ *
+ * Independent of the identity lookup on purpose — see `resolveTargets`, which needs
+ * to tell "this process is gone" from "I could not find out".
+ */
+export function isZombie(pid) {
+  if (process.platform !== 'linux') return false;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[0] === 'Z';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Sort `targets` into those still running as themselves and those we cannot judge.
+ *
+ * THREE STATES, NOT TWO. Every identity source collapses failure into the same
+ * `null` it uses for "no such process": PowerShell can fail to start, `ps` can be
+ * killed, a /proc read can hit EACCES. Treating that as proof of exit is a
+ * false-success generator — after we have signalled something, one transient
+ * subprocess failure would let both callers clear state, report the memory released,
+ * and destroy the identity needed to try again.
+ *
+ * So existence is settled by `kill(pid, 0)`, which needs no subprocess and no
+ * cooperation, and identity is used only to decide WHOSE process it is:
+ *
+ *   pid not alive, or a zombie   -> gone. Confirmed, and cheap to confirm.
+ *   identity matches the token   -> still ours. Signal it, keep chasing it.
+ *   identity contradicts it      -> gone; the number belongs to someone else now.
+ *   identity unavailable         -> UNKNOWN. Never signalled, never counted as done.
+ *
+ * `unknown` is deliberately not fatal on its own — it blocks the success verdict,
+ * not the attempt.
+ *
+ * One home for the rule because the client and the watchdog both need it, and this
+ * plugin's recurring defect is the second copy of a rule being the stale one.
+ */
+export function resolveTargets(targets) {
+  const pids = targets.map((t) => t.pid);
+  forgetIdentities(pids);            // a cache filled before we signalled is a liar
+  identities(pids);
+
+  const alive = [];
+  const unknown = [];
+  for (const t of targets) {
+    if (!pidAlive(t.pid) || isZombie(t.pid)) continue;
+    const seen = identity(t.pid);
+    if (seen === null) unknown.push(t.pid);
+    else if (seen.start === t.token) alive.push(t.pid);
+  }
+  return { alive, unknown };
+}
+
 /** Test seam: forget everything looked up so far. */
 export function _resetIdentityCache() {
   cache.clear();

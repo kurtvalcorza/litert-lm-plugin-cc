@@ -26,8 +26,8 @@ import { reapMarkers } from './marker-state.mjs';
 // client applied, so the supervisor could SIGTERM a bystander the client would have
 // refused to touch. One home, one rule, no weaker copy.
 import {
-  forgetIdentities, formatPidRecord, identities, isRecordedProcess, looksLikeLitertLmServe,
-  parsePidRecord, pidsOnPort, recordIsStale, signallablePid, startToken,
+  formatPidRecord, identities, looksLikeLitertLmServe, parsePidRecord, pidsOnPort,
+  resolveTargets, signallablePid, startToken,
 } from './process-identity.mjs';
 
 const POLL_INTERVAL_MS = 5000;
@@ -48,12 +48,17 @@ const HARD_CEILING_FLOOR_MS = 30 * 60 * 1000;
 const UNREACHABLE_TOLERANCE = 24;
 
 function parseArgs(argv) {
-  const opts = { port: 9379, idleTimeout: 900, host: '127.0.0.1' };
+  // `spawnedAt` defaults to now: started by hand, nothing can have stopped us before
+  // we existed. The client passes its own value so the comparison covers the whole
+  // window between the spawn and this process getting far enough to read state.
+  const opts = { port: 9379, idleTimeout: 900, host: '127.0.0.1', spawnedAt: Date.now() };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--port') opts.port = Number(argv[++i]);
     else if (argv[i] === '--idle-timeout') opts.idleTimeout = Number(argv[++i]);
     else if (argv[i] === '--host') opts.host = argv[++i];
+    else if (argv[i] === '--spawned-at') opts.spawnedAt = Number(argv[++i]);
   }
+  if (!Number.isFinite(opts.spawnedAt)) opts.spawnedAt = Date.now();
   return opts;
 }
 
@@ -119,8 +124,16 @@ function claimWatchdogSlot() {
     return true;
   } catch { /* someone holds the name; it may be stale */ }
 
+  // Reclaim when the incumbent cannot be PROVEN, not merely when it looks dead.
+  //
+  // `recordIsStale` is the cheap hygiene test, and it says "not stale" for a live pid
+  // written after boot — including one that was reused, whose token no longer
+  // matches. `main()` has already paid for the authority-grade answer by this point
+  // and knows the slot is unowned; falling back to the weaker test here threw that
+  // away and stood the new supervisor down in favour of a process that is not a
+  // watchdog at all. Off the interactive path, so the lookup costs nothing extra.
   const raw = readState('watchdog.pid', '');
-  if (!recordIsStale(parsePidRecord(raw), stateWrittenAt('watchdog.pid'))) return false;
+  if (signallablePid(parsePidRecord(raw), stateWrittenAt('watchdog.pid')) !== null) return false;
 
   const aside = statePath(`watchdog.pid.reclaim.${process.pid}`);
   try {
@@ -220,7 +233,7 @@ function terminateServer(targets) {
   // `server.pid` — seconds, on Windows — and a target that exits in that gap has its
   // number reissued. The client path was given this treatment; this one was not, so
   // the rule had two homes and only one of them was right. Again.
-  for (const pid of stillOurs(targets)) {
+  for (const pid of stillOurs(targets).alive) {
     try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
   }
 }
@@ -239,10 +252,10 @@ function terminateServer(targets) {
  * `stopped-idle` and walk away.
  */
 function stillOurs(targets) {
-  const pids = targets.map((t) => t.pid);
-  forgetIdentities(pids);
-  identities(pids);
-  return targets.filter((t) => isRecordedProcess(t.pid, t.token)).map((t) => t.pid);
+  const { alive, unknown } = resolveTargets(targets);
+  // `unknown` never gets signalled — we cannot prove it is ours — but it also cannot
+  // count as gone, so it is folded in wherever the answer decides "are we finished".
+  return { alive, unknown, outstanding: [...alive, ...unknown] };
 }
 
 function cleanupAndExit(code = 0) {
@@ -268,6 +281,23 @@ async function main() {
   // someone ran --stop by hand.
   const existing = ownedPid('watchdog.pid');
   if (existing !== null && existing !== process.pid) process.exit(0);
+
+  // A stop that happened after we were spawned invalidates us before we start.
+  //
+  // We are spawned detached, and publishing our pid costs an identity lookup —
+  // seconds on Windows. A `--stop` landing inside that window cannot see us: we are
+  // in no pid file yet, so it cannot include us in its target set, and we would then
+  // publish a supervisor record over the state it had just cleared.
+  //
+  // The test is a timestamp, NOT a reachability probe. Asking whether the server
+  // answers would reintroduce the confusion this whole file is built to avoid — a
+  // model switch makes it legitimately unreachable for tens of seconds, which is why
+  // UNREACHABLE_TOLERANCE exists, and a watchdog that stood down for that would leave
+  // the server it was spawned for unsupervised. `stopped-at` is durable and needs no
+  // clearing: an older stop is simply earlier than the next watchdog's spawn.
+  const stoppedAt = Number.parseInt(readState('stopped-at', ''), 10);
+  if (Number.isFinite(stoppedAt) && stoppedAt > opts.spawnedAt) process.exit(0);
+
   if (!claimWatchdogSlot()) process.exit(0);         // someone beat us to it
 
   const idleMs = opts.idleTimeout * 1000;
@@ -328,11 +358,11 @@ async function main() {
     for (let i = 0; i < 30; i++) {
       await sleep(500);
       const surviving = stillOurs(targets);
-      if (!surviving.length) break;
+      if (!surviving.outstanding.length) break;
       // Still running: escalate, but only on owners proven above AND re-proven now —
       // a process that inherited the pid we just killed must not inherit the SIGKILL
       // along with it, which a numeric check would wave straight through.
-      for (const pid of surviving) {
+      for (const pid of surviving.alive) {
         try { process.kill(pid, process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL'); }
         catch { /* ignore */ }
       }
@@ -342,14 +372,28 @@ async function main() {
     // refreshes at the top, so a target that dies in response to the final iteration
     // would still be listed when it ends.
     await sleep(200);
-    if (stillOurs(targets).length) {
+    const left = stillOurs(targets);
+    if (left.outstanding.length) {
       // Escalation did not finish the job — a process wedged in uninterruptible I/O,
-      // or one the OS refused to signal. Publish NOTHING: `stopped-idle` tells the
-      // next client that accelerator memory was released, and clearing `server.pid`
-      // destroys the identity a later attempt would need to find a target that is
-      // still alive but no longer listening. Standing down without a report leaves
-      // the next client free to reconcile and start a fresh supervisor, which will
-      // try again once the server goes idle.
+      // one the OS refused to signal, or one we could not identify at all. Publish
+      // NOTHING: `stopped-idle` tells the next client that accelerator memory was
+      // released, and clearing `server.pid` destroys the identity a later attempt
+      // would need to find a target that is still alive but no longer listening.
+      //
+      // Persist that identity if nothing already records it. The survivor is often
+      // the listener grandchild discovered from the port, which no pid file names —
+      // the client learned to write it, and a watchdog that only exits leaves the
+      // next attempt with nothing to find. The rule has to be symmetric or the
+      // recovery path depends on which component happened to fail.
+      const recorded = parsePidRecord(readState('server.pid', ''))?.pid ?? null;
+      const orphan = targets.find((t) => left.outstanding.includes(t.pid)
+        && t.pid !== recorded && t.token);
+      if (orphan !== undefined) {
+        writeState('server.pid', `${orphan.pid} ${orphan.token}`);
+      }
+
+      // Standing down without a report leaves the next client free to reconcile and
+      // start a fresh supervisor, which will try again once the server goes idle.
       cleanupAndExit(1);
     }
 
