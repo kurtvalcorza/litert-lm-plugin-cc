@@ -22,7 +22,8 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import {
-  chmodSync, copyFileSync, linkSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync,
+  chmodSync, copyFileSync, linkSync, mkdirSync, mkdtempSync, readFileSync, statSync,
+  writeFileSync,
 } from 'node:fs';
 import { after, describe, test } from 'node:test';
 import { tmpdir } from 'node:os';
@@ -78,13 +79,15 @@ async function waitFor(predicate, { timeout = 20_000, interval = 250 } = {}) {
   }
 }
 
-const recordedPid = (dir) => {
-  try {
-    return parsePidRecord(readFileSync(join(dir, 'watchdog.pid'), 'utf8'))?.pid ?? null;
-  } catch {
-    return null;
-  }
+const readIfPresent = (path) => {
+  try { return readFileSync(path, 'utf8'); } catch { return null; }
 };
+
+const recordedPid = (dir) =>
+  parsePidRecord(readIfPresent(join(dir, 'watchdog.pid')))?.pid ?? null;
+
+const recordedServerPid = (dir) =>
+  parsePidRecord(readIfPresent(join(dir, 'server.pid')))?.pid ?? null;
 
 const stateDir = (runtime, port) => {
   const dir = join(runtime, String(port));
@@ -469,7 +472,7 @@ describe('recording a process we spawned', () => {
     `, 'utf8');
   }
 
-  test('a launcher stage that exits during token capture is not recorded',
+  test('a launcher stage that exits leaves nothing signallable',
     { timeout: 90_000 }, async () => {
       const port = PORT.staleState + 10;
       const runtime = runtimeDir();
@@ -493,15 +496,36 @@ describe('recording a process we spawned', () => {
 
       // The grandchild serves, so the client should succeed...
       assert.equal(r.status, 0, `client should reach the fake server: ${r.stderr}`);
-      // ...but the pid it spawned is long gone, so nothing about it is recordable.
-      assert.throws(() => readFileSync(join(dir, 'server.pid'), 'utf8'),
-        'a launcher stage that has already exited must not be recorded as the server');
 
-      // And nothing of ours is on the port, so --stop must leave the grandchild be.
+      // ...and whatever it wrote about the launcher stage must not authorise a
+      // signal now that the stage is gone.
+      //
+      // Deliberately NOT "no record exists". Whether one exists is a race against
+      // how fast identity can be established: on Windows that is a PowerShell
+      // start-up, so the stage is already dead and nothing is recorded; on Linux it
+      // is a /proc read, so the stage is usually still alive and recording it is
+      // correct. Asserting absence encoded one platform's latency as the rule, and
+      // Linux duly failed it. What must hold everywhere is that a record left behind
+      // by a process that has since exited can never be signalled.
+      await waitFor(() => !alive(recordedServerPid(dir)));
+      const raw = readIfPresent(join(dir, 'server.pid'));
+      if (raw !== null) {
+        assert.equal(signallablePid(parsePidRecord(raw), statSync(join(dir, 'server.pid')).mtimeMs),
+          null, 'a record naming an exited launcher stage must not authorise a signal');
+      }
+
+      // And nothing of ours is on the port, so --stop must leave the grandchild be —
+      // AND must not call that a failure. It will have stopped our own watchdog, so
+      // something was signalled; the port staying busy is the stranger's business,
+      // not a failed shutdown. Judging success by "is the port silent" reported an
+      // error here for behaving correctly.
       const stop = runClient(['--stop', '--port', String(port)], runtime);
-      assert.equal(stop.status, 0);
+      assert.equal(stop.status, 0,
+        `stopping only our own processes is success, not failure: ${stop.stderr}`);
       assert.doesNotMatch(stop.stdout, /Server stopped/,
         'the fake grandchild is not a litert-lm serve and is not ours to claim');
+      assert.doesNotMatch(stop.stderr, /still responding/,
+        'a stranger that keeps answering is not evidence that we failed');
 
       for (const pid of pidsOnPort(port)) {
         try { process.kill(pid, 'SIGKILL'); } catch { /* ignore */ }

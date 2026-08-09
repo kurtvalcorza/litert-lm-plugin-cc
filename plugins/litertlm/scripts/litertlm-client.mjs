@@ -572,7 +572,19 @@ async function stopProcesses(opts) {
   for (const f of ['server.pid', 'watchdog.pid', 'in-flight', 'last-activity',
     'stopping', 'loaded-model', 'stopped-idle']) clearState(port, f);
 
-  return { signalled, strangers, down: !(await probe(opts, 1000)) };
+  // Whether the PORT fell silent only means something if we signalled whoever holds
+  // it. If the socket belongs to a stranger we deliberately left running, it will
+  // keep answering, and treating that as our failure reports an error for having
+  // done exactly the right thing — which is what it did, on Linux, the first time
+  // this ran there. Windows had passed the same case by accident: identity costs a
+  // PowerShell start-up there, so the watchdog had not yet published the pid that
+  // made this path reachable.
+  return {
+    signalled,
+    strangers,
+    heldPort: ours.length > 0,
+    down: ours.length > 0 ? !(await probe(opts, 1000)) : true,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -697,7 +709,7 @@ async function main() {
     // The probe reports; it does not authorise. Whether anything gets signalled is
     // decided inside stopProcesses, from process identity.
     const wasUp = await probe(opts);
-    const { signalled, strangers, down } = await stopProcesses(opts);
+    const { signalled, strangers, heldPort, down } = await stopProcesses(opts);
 
     const noteStrangers = () => {
       if (!strangers.length) return;
@@ -713,6 +725,13 @@ async function main() {
       process.stdout.write(strangers.length
         ? `No server of this plugin's was running on port ${opts.port}; state cleared.\n`
         : 'Server was not running; state cleared.\n');
+      noteStrangers();
+    } else if (!heldPort) {
+      // We stopped our own processes — a watchdog, a launcher stage — but the socket
+      // was never ours. Saying "accelerator memory released" here would be a lie:
+      // whatever is on that port still holds whatever it holds.
+      process.stdout.write(
+        `Stopped this plugin's processes on port ${opts.port}; state cleared.\n`);
       noteStrangers();
     } else if (down) {
       process.stdout.write('Server stopped; accelerator memory released.\n');
