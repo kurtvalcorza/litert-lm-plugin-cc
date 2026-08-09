@@ -600,8 +600,12 @@ async function stopProcesses(opts) {
     await sleep(200);
     ({ alive: remaining, unknown } = stillAlive(targets));
   } else {
+    // Nothing was signallable — but `unknown` is NOT cleared here. It was, and that
+    // turned "could not determine" straight back into "confirmed gone": with no
+    // signal to send, the whole unjudgeable set was discarded, the verdict came out
+    // clean, and the state was cleared. The one thing the three-state split exists to
+    // prevent, undone by the branch that runs when there is nothing to do.
     remaining = [];
-    unknown = [];
   }
 
   clearInFlight(port);
@@ -627,8 +631,14 @@ async function stopProcesses(opts) {
   // record would be cleared while `remaining` still pointed at it, and a retry could
   // find it neither by port (it may have closed the socket) nor by state. Write the
   // identity we proved, so the next run can act on the advice this one gives.
+  // Only into a slot nothing is already using. If the recorded launcher survived too,
+  // its record is in `server.pid` and overwriting it would trade one survivor's
+  // identity for another's — losing the very thing being preserved. There are two
+  // slots and no third, so when both are taken the extra survivor is reported rather
+  // than recorded; the error below names every one of them.
+  const serverSlotFree = !kept.has(recordedByName.get('server.pid')?.pid);
   const orphan = targets.find((t) => survivors.has(t.pid) && !kept.has(t.pid));
-  if (orphan !== undefined) {
+  if (orphan !== undefined && serverSlotFree) {
     writeState(port, 'server.pid', `${orphan.pid} ${orphan.token}`);
   }
 
@@ -791,17 +801,15 @@ async function main() {
         + '  If you meant to free the port, stop that process yourself, or use --port <n>.\n');
     };
 
-    if (!signalled.length) {
-      // Nothing provable was ours. Clearing state is still right and still done.
-      process.stdout.write(strangers.length
-        ? `No server of this plugin's was running on port ${opts.port}; state cleared.\n`
-        : 'Server was not running; state cleared.\n');
-      noteStrangers();
-    } else if (!down) {
-      // Failure wins over every success message. This test used to sit BELOW the
-      // no-port branch, so targets that came only from the pid files, were off-port,
-      // and survived escalation printed "Stopped this plugin's processes" and exited
-      // 0 — reporting success for processes still running.
+    // Failure is tested FIRST, ahead of every success message.
+    //
+    // It has been wrong twice in the other order. Below the no-port branch, off-port
+    // survivors printed "Stopped this plugin's processes" and exited 0. Below the
+    // nothing-signalled branch, a set that was entirely unjudgeable — nothing to
+    // signal, nothing proven gone — reported "Server was not running" and cleared the
+    // state. Both said the work was done because no branch above them had asked
+    // whether it was.
+    if (!down) {
       noteStrangers();
       // Name them. A survivor may have closed its socket and so be invisible to any
       // port-based look-up the reader would otherwise try, which is exactly why the
@@ -818,6 +826,13 @@ async function main() {
           + '  than assumed gone.');
       }
       throw new Error(`${parts.join('\n  ')}\n  Inspect it, then retry.`);
+    } else if (!signalled.length) {
+      // Nothing provable was ours, and nothing was left unjudged. Clearing state is
+      // still right and still done.
+      process.stdout.write(strangers.length
+        ? `No server of this plugin's was running on port ${opts.port}; state cleared.\n`
+        : 'Server was not running; state cleared.\n');
+      noteStrangers();
     } else if (!heldPort) {
       // We stopped our own processes — a watchdog, a launcher stage — but the socket
       // was never ours. Saying "accelerator memory released" here would be a lie:

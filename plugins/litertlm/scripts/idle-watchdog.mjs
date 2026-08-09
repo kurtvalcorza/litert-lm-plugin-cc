@@ -112,7 +112,19 @@ function stateWrittenAt(name) {
  * after deciding to stand down. That is what keeps "whoever wrote last is alive"
  * true, and it is why the client no longer publishes this record on our behalf.
  */
+/** Has a `--stop` landed since we were spawned? */
+function invalidatedByStop() {
+  const stoppedAt = Number.parseInt(readState('stopped-at', ''), 10);
+  return Number.isFinite(stoppedAt) && stoppedAt > opts.spawnedAt;
+}
+
 function publish(record) {
+  // Checked here, immediately before the write, and not only once at start-up.
+  // Everything between those two points is slow — establishing our own identity costs
+  // a process lookup, seconds on Windows — and a `--stop` landing inside it cannot
+  // see us, because we are in no pid file yet. Publishing afterwards would install a
+  // supervisor for a server that stop had already torn down.
+  if (invalidatedByStop()) throw new Error('stopped while claiming');
   mkdirSync(stateDir(opts.port), { recursive: true });
   writeFileSync(statePath('watchdog.pid'), record, { encoding: 'utf8', flag: 'wx' });
 }
@@ -295,10 +307,13 @@ async function main() {
   // UNREACHABLE_TOLERANCE exists, and a watchdog that stood down for that would leave
   // the server it was spawned for unsupervised. `stopped-at` is durable and needs no
   // clearing: an older stop is simply earlier than the next watchdog's spawn.
-  const stoppedAt = Number.parseInt(readState('stopped-at', ''), 10);
-  if (Number.isFinite(stoppedAt) && stoppedAt > opts.spawnedAt) process.exit(0);
-
+  if (invalidatedByStop()) process.exit(0);
   if (!claimWatchdogSlot()) process.exit(0);         // someone beat us to it
+
+  // And once more after publishing, because the claim itself is not instantaneous.
+  // A stop that landed while we were writing has already cleared the state it meant
+  // to clear, so withdraw rather than stand as supervisor over nothing.
+  if (invalidatedByStop()) cleanupAndExit(0);
 
   const idleMs = opts.idleTimeout * 1000;
   const ceilingMs = Math.max(idleMs * HARD_CEILING_MULTIPLIER, HARD_CEILING_FLOOR_MS);

@@ -186,6 +186,23 @@ describe('the record that says a process is ours', () => {
     assert.equal(signallablePid(record, 0), null, 'a pre-boot file names nobody now');
   });
 
+  // `kill(pid, 0)` fails two ways and they mean opposite things: ESRCH is "no such
+  // process", EPERM is "it exists and you may not touch it". Flattening them reported
+  // a plainly running process as dead, and everything downstream then concluded a
+  // target had exited — cleared its state, called the shutdown a success.
+  test('a process we may not signal is alive, not dead', () => {
+    const protectedPid = process.platform === 'win32' ? 4 : 1;
+    let code = null;
+    try { process.kill(protectedPid, 0); } catch (err) { code = err.code; }
+    if (code !== 'EPERM') {
+      // Nothing to assert against on a host where that pid is signallable or absent.
+      assert.equal(recordIsStale({ pid: 999_999, token: 'x' }, Date.now()), true);
+      return;
+    }
+    assert.equal(recordIsStale({ pid: protectedPid, token: 'x' }, Date.now()), false,
+      'EPERM means the process exists, so its record is not dead wood');
+  });
+
   test('rejects junk without throwing', () => {
     for (const raw of ['', '   ', 'not-a-pid', '-1', '0']) {
       assert.equal(parsePidRecord(raw), null, `parsePidRecord(${JSON.stringify(raw)})`);
@@ -514,6 +531,12 @@ describe('the idle watchdog', () => {
       //
       // pid 1 is usually the one process a normal user cannot signal, which makes it
       // the only way to stage a target that outlives escalation.
+      //
+      // This only became true once `pidAlive` stopped treating EPERM as death. Before
+      // that, pid 1 was classified as gone, so it never entered the target set at all
+      // and this test passed through the empty-targets branch instead — green, and
+      // exercising nothing it claimed to. A test can be wrong in the same direction
+      // as the code it is guarding.
       //
       // "Usually" is not good enough, and `getuid() !== 0` does not establish it: in
       // a rootless or user-namespaced container, init inside the namespace can share

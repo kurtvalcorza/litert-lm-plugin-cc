@@ -18,6 +18,7 @@ different ports never share state.
 | `in-flight.d/<pid>-<ts>` | **directory of marker files** | client, one per request | watchdog |
 | `stopping` | empty; presence is the signal | watchdog, before terminating | client |
 | `stopped-idle` | epoch ms | watchdog, before exiting | client (consumes) |
+| `stopped-at` | epoch ms | client, at the end of `--stop` | watchdog, before claiming |
 | `loaded-model` | model id | client, after a successful request | client |
 
 **Why files, not one document**: single-fact files make every read and write atomic enough
@@ -68,6 +69,25 @@ stale, so reclamation cannot delete a live winner.
 **Shutdown is judged by the processes signalled, never by the port.** The socket is an endpoint;
 targets are processes. A stranger that holds or takes the port keeps answering, and treating
 that as failure reports an error for correctly leaving it alone.
+
+**`stopped-at` is a tombstone, and the only state file that is never cleared.** A watchdog is
+spawned detached and cannot publish its pid until it has established its own identity — a
+process lookup, seconds on Windows. A `--stop` arriving inside that window cannot see it: it is
+in no pid file yet, so it cannot be a target, and it would go on to install itself as supervisor
+of a server that has just been torn down. The watchdog therefore compares this stamp against
+when it was spawned (`--spawned-at`), before claiming and again after, and stands down if a stop
+has intervened.
+
+It is deliberately a timestamp rather than a reachability check. "The server does not answer"
+and "the server is gone" are different claims — a model switch produces the first for tens of
+seconds, which is what `UNREACHABLE_TOLERANCE` exists for — and a watchdog that stood down for
+an unanswered probe would abandon the server it was spawned to supervise. Nothing needs to clear
+this file: an older stop is simply earlier than the next watchdog's spawn.
+
+**Existence is `kill(pid, 0)`, and `EPERM` means alive.** That call has two distinct failures.
+`ESRCH` is "no such process"; `EPERM` is "it exists and you may not touch it". Flattening them
+reports a running process as dead, which lets every downstream decision conclude a target
+exited. Whether we may signal something is a separate question, settled by identity.
 
 ## Default values
 
