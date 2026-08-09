@@ -421,6 +421,44 @@ describe('--stop', () => {
         'once the target is gone, so is its record');
     });
 
+  // THE FAILURE PATH ITSELF. Until this existed, no test had ever reached it on any
+  // platform — and it contained a `ReferenceError`, because the variable the error
+  // message reads was never destructured out of the result. Thirty tests green on
+  // three operating systems, and `--stop` crashed instead of reporting on every
+  // failure. Coverage of the happy path says nothing about the path that runs when
+  // things go wrong, which is the one users meet on their worst day.
+  //
+  // Staged with a process we provably cannot signal: pid 1 on POSIX, pid 4 (the
+  // Windows System process) on Windows. Both answer EPERM, so escalation exhausts
+  // itself against something that will not die and cannot be harmed.
+  test('reports a failure rather than crashing on one', { timeout: 90_000 },
+    async (t) => {
+      const protectedPid = process.platform === 'win32' ? 4 : 1;
+      let code = null;
+      try { process.kill(protectedPid, 0); } catch (err) { code = err.code; }
+      if (code !== 'EPERM') {
+        t.skip(`pid ${protectedPid} is signallable here; staging it would do real harm`);
+        return;
+      }
+
+      const port = PORT.reuse + 80;
+      const runtime = runtimeDir();
+      const dir = stateDir(runtime, port);
+      writeFileSync(join(dir, 'server.pid'), formatPidRecord(protectedPid), 'utf8');
+
+      const r = runClient(['--stop', '--port', String(port)], runtime);
+
+      assert.notEqual(r.status, 0, 'a target that never stops is a failure');
+      assert.doesNotMatch(r.stderr, /ReferenceError|is not defined/,
+        'the failure path must report, not throw');
+      assert.match(r.stderr, new RegExp(`${protectedPid}`),
+        'and it must name the process that survived');
+      assert.ok(readIfPresent(join(dir, 'server.pid')),
+        'keeping the identity a retry needs');
+      assert.equal(readIfPresent(join(dir, 'stopped-at')), null,
+        'a stop that failed must not disband the supervision it could not replace');
+    });
+
   test('still clears stale state when nothing provable is ours', async () => {
     const port = PORT.staleState;
     const runtime = runtimeDir();

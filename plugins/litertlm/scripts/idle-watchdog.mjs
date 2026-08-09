@@ -131,6 +131,14 @@ function publish(record) {
 
 function claimWatchdogSlot() {
   const record = formatPidRecord(process.pid);       // one lookup, not one per attempt
+
+  // A record with no token is one nobody can ever act on. `formatPidRecord` falls
+  // back to a bare pid when the identity lookup fails, and `signallablePid` refuses
+  // exactly that — so publishing it would install a supervisor that a later `--stop`
+  // is structurally unable to signal, and the slot would stay occupied by something
+  // unkillable until the pid died on its own. Better to claim nothing: the next
+  // client sees no supervisor and spawns one whose lookup may well succeed.
+  if (parsePidRecord(record)?.token == null) return false;
   try {
     publish(record);
     return true;
@@ -222,13 +230,19 @@ async function serverReachable() {
 function ourTargets() {
   const listening = pidsOnPort(opts.port);
   identities(listening);                              // one lookup for all of them
+
+  // A listener we could not describe is NOT a stranger. `looksLikeLitertLmServe`
+  // returns false both for "definitely something else" and for "the lookup failed",
+  // and collapsing those let a real server on our port fall out of the model —
+  // never signalled, and never counted against calling the shutdown done.
+  const unidentified = listening.filter((pid) => identity(pid) === null);
   const targets = listening.filter(looksLikeLitertLmServe)
     .map((pid) => ({ pid, token: startToken(pid) }));
   const recorded = ownedPid('server.pid');
   if (recorded !== null && !targets.some((t) => t.pid === recorded)) {
     targets.push({ pid: recorded, token: startToken(recorded) });
   }
-  return targets;
+  return { targets, unidentified };
 }
 
 /**
@@ -361,8 +375,13 @@ async function main() {
     // bookkeeping: clearing state and writing `stopped-idle` would record that we
     // released accelerator memory we never held, and the next client would be told a
     // server had been idle-stopped when it is still running and still unsupervised.
-    const targets = ourTargets();
-    if (!targets.length) cleanupAndExit(0);
+    const { targets, unidentified } = ourTargets();
+    // Nothing provable AND nothing unprovable: genuinely not ours, stand down clean.
+    // An unidentified listener is not that — it is a question we failed to answer,
+    // and answering it wrong in the reassuring direction is what publishes a stop
+    // that never happened.
+    if (!targets.length && !unidentified.length) cleanupAndExit(0);
+    if (!targets.length) cleanupAndExit(1);
 
     // Signal before acting, so a client cannot connect to a dying server (FR-025).
     writeState('stopping', Date.now());
@@ -388,6 +407,7 @@ async function main() {
     // would still be listed when it ends.
     await sleep(200);
     const left = stillOurs(targets);
+    left.outstanding = [...new Set([...left.outstanding, ...unidentified])];
     if (left.outstanding.length) {
       // Escalation did not finish the job — a process wedged in uninterruptible I/O,
       // one the OS refused to signal, or one we could not identify at all. Publish
@@ -400,10 +420,16 @@ async function main() {
       // the client learned to write it, and a watchdog that only exits leaves the
       // next attempt with nothing to find. The rule has to be symmetric or the
       // recovery path depends on which component happened to fail.
+      // Only into a slot nothing is already using. If the recorded launcher is itself
+      // among the survivors, `server.pid` is already carrying an identity worth
+      // keeping, and replacing it with the listener's would trade one survivor for
+      // another rather than preserve both. The client makes the same choice; there is
+      // one slot, so the second survivor is left to the next attempt's discovery.
       const recorded = parsePidRecord(readState('server.pid', ''))?.pid ?? null;
+      const recordedSurvived = recorded !== null && left.outstanding.includes(recorded);
       const orphan = targets.find((t) => left.outstanding.includes(t.pid)
         && t.pid !== recorded && t.token);
-      if (orphan !== undefined) {
+      if (orphan !== undefined && !recordedSurvived) {
         writeState('server.pid', `${orphan.pid} ${orphan.token}`);
       }
 

@@ -173,7 +173,7 @@ function stateWrittenAt(port, name) {
  * Nothing recorded means `--stop` falls back to socket-owner discovery, which is
  * the right answer when we have nothing trustworthy to say.
  */
-async function recordSpawnedPid(port, name, child, exe) {
+async function recordSpawnedPid(port, name, child, exe, spawnedAt) {
   clearState(port, name);
   if (!child.pid) return false;
 
@@ -195,6 +195,13 @@ async function recordSpawnedPid(port, name, child, exe) {
   // of this guard looked correct while doing nothing.
   await sleep(50);
   if (child.exitCode !== null || child.signalCode !== null) return false;
+
+  // A `--stop` that landed while we were starting has already returned, reporting
+  // that nothing of ours is running. Publishing now would contradict it and leave a
+  // record of a server the user was told had been stopped. Same tombstone the
+  // watchdog uses, same reason: whoever stopped could not see us yet.
+  const stoppedAt = Number.parseInt(readState(port, 'stopped-at', ''), 10);
+  if (Number.isFinite(stoppedAt) && stoppedAt > spawnedAt) return false;
 
   writeState(port, name, formatPidRecord(child.pid));
   return true;
@@ -355,11 +362,24 @@ async function probe(opts, timeoutMs = 2000) {
 async function awaitNotStopping(opts) {
   if (readState(opts.port, 'stopping') === null) return false;
   process.stderr.write('[litertlm] server is shutting down; waiting for it to exit...\n');
-  for (let i = 0; i < 40; i++) {
+
+  // Wait on the WATCHDOG, not on a stopwatch.
+  //
+  // This used to give up after a flat 20s, which is shorter than a shutdown can
+  // legitimately take: the watchdog escalates for 30 rounds and re-establishes
+  // identity each time, and on Windows a single lookup can cost a second. Past the
+  // deadline the client cleared the handshake and started a second server while the
+  // first was still being torn down — the exact race `stopping` exists to prevent,
+  // reintroduced by the timeout meant to protect against a dead watchdog.
+  //
+  // The real question is whether anyone is still working on it, and that is a
+  // liveness question with a free answer. The long cap is only a backstop against a
+  // handshake nobody owns at all.
+  for (let i = 0; i < 600; i++) {                                   // 5 minutes
     await sleep(500);
     if (readState(opts.port, 'stopping') === null) return true;
+    if (staleRecord(opts.port, 'watchdog.pid')) break;              // its author is gone
   }
-  // Stale marker from a watchdog that died mid-shutdown: clear it and continue.
   clearState(opts.port, 'stopping');
   clearState(opts.port, 'server.pid');
   return true;
@@ -473,6 +493,7 @@ async function ensureServer(opts) {
   }
 
   let child;
+  const spawnedAt = Date.now();
   try {
     child = spawn(exe, ['serve', '--host', opts.host, '--port', String(opts.port)],
       { detached: true, stdio: 'ignore', windowsHide: true });
@@ -487,7 +508,7 @@ async function ensureServer(opts) {
   // Record the identity now, while the process is still the one we just spawned —
   // and only if the OS still says so. Asked for later, the answer could already be
   // about whoever inherited the pid.
-  await recordSpawnedPid(opts.port, 'server.pid', child, exe);
+  await recordSpawnedPid(opts.port, 'server.pid', child, exe, spawnedAt);
   // Prune, not wipe: another client may have acquired a marker against this same
   // new server between our spawn and this line.
   pruneInFlight(opts.port);
@@ -520,16 +541,35 @@ async function ensureServer(opts) {
  * with no entry in our state. See process-identity.mjs for why descent from our
  * recorded pid was considered and rejected.
  */
+/**
+ * Split the port's listeners three ways: ours, someone else's, and undetermined.
+ *
+ * The third bucket is not pedantry. Deciding ownership from a command line requires
+ * READING the command line, and that read can fail — PowerShell may not start, `ps`
+ * may be killed. A failed read used to come back as `false`, which is
+ * indistinguishable from "definitely not litert-lm", so a genuine server on our port
+ * was filed as a stranger and left out of the shutdown model altogether: not
+ * signalled, not chased, and not counted against success.
+ *
+ * Unidentified owners are never signalled — we cannot prove they are ours — but they
+ * do block the success verdict, because "I could not tell" is not "it is not mine".
+ */
 function classifyPortOwners(port) {
   const listening = pidsOnPort(port);
   identities(listening);                              // one lookup for all of them
-  // Keep each owner's start token, not just its number. Escalation happens after we
-  // have already killed things, and by then a pid we proved is a pid that may have
-  // been reissued — the number alone stops meaning anything the moment it dies.
-  const ours = listening.filter(looksLikeLitertLmServe)
-    .map((pid) => ({ pid, token: startToken(pid) }));
-  const ourSet = new Set(ours.map((o) => o.pid));
-  return { ours, strangers: listening.filter((p) => !ourSet.has(p)) };
+
+  const ours = [];
+  const strangers = [];
+  const unidentified = [];
+  for (const pid of listening) {
+    if (identity(pid) === null) unidentified.push(pid);
+    // Keep each owner's start token, not just its number. Escalation happens after we
+    // have already killed things, and by then a pid we proved is a pid that may have
+    // been reissued — the number alone stops meaning anything the moment it dies.
+    else if (looksLikeLitertLmServe(pid)) ours.push({ pid, token: startToken(pid) });
+    else strangers.push(pid);
+  }
+  return { ours, strangers, unidentified };
 }
 
 /**
@@ -559,7 +599,7 @@ async function stopProcesses(opts) {
   const PID_FILES = ['watchdog.pid', 'server.pid'];
   const recordedByName = ownedPids(port, PID_FILES);
   const recorded = [...recordedByName.values()];
-  const { ours, strangers } = classifyPortOwners(port);
+  const { ours, strangers, unidentified } = classifyPortOwners(port);
 
   // One set of targets, each carrying the token that identifies it.
   const targets = [];
@@ -599,6 +639,7 @@ async function stopProcesses(opts) {
     // and its state kept, when it had in fact just exited.
     await sleep(200);
     ({ alive: remaining, unknown } = stillAlive(targets));
+    unknown = [...new Set([...unknown, ...unidentified])];
   } else {
     // Nothing was signallable — but `unknown` is NOT cleared here. It was, and that
     // turned "could not determine" straight back into "confirmed gone": with no
@@ -606,6 +647,7 @@ async function stopProcesses(opts) {
     // clean, and the state was cleared. The one thing the three-state split exists to
     // prevent, undone by the branch that runs when there is nothing to do.
     remaining = [];
+    unknown = [...new Set([...unknown, ...unidentified])];
   }
 
   clearInFlight(port);
@@ -642,12 +684,19 @@ async function stopProcesses(opts) {
     writeState(port, 'server.pid', `${orphan.pid} ${orphan.token}`);
   }
 
-  // A tombstone, written last. A watchdog spawned before this stop may still be
-  // completing its own identity lookup and about to publish itself as supervisor of
-  // a server that no longer exists; it compares this against when it was spawned and
-  // stands down. Durable on purpose — an old stop is simply earlier than the next
-  // watchdog, so nothing has to remember to clear it.
-  writeState(port, 'stopped-at', Date.now());
+  // A tombstone, written last and ONLY on success. A watchdog spawned before this
+  // stop may still be completing its own identity lookup and about to publish itself
+  // as supervisor of a server that no longer exists; it compares this against when it
+  // was spawned and stands down. Durable on purpose — an old stop is simply earlier
+  // than the next watchdog, so nothing has to remember to clear it.
+  //
+  // Writing it after a FAILED stop was worse than not writing it: the server is still
+  // running, and the pending watchdog we just invalidated was the thing that would
+  // have gone on supervising it. A stop that did not stop anything must not disband
+  // the supervision it could not replace.
+  if (remaining.length === 0 && unknown.length === 0) {
+    writeState(port, 'stopped-at', Date.now());
+  }
 
   // The verdict is about the processes we signalled, never about the endpoint.
   //
@@ -790,7 +839,8 @@ async function main() {
     // The probe reports; it does not authorise. Whether anything gets signalled is
     // decided inside stopProcesses, from process identity.
     const wasUp = await probe(opts);
-    const { signalled, strangers, surviving, heldPort, down } = await stopProcesses(opts);
+    const { signalled, strangers, surviving, unknown, heldPort, down } =
+      await stopProcesses(opts);
 
     const noteStrangers = () => {
       if (!strangers.length) return;
