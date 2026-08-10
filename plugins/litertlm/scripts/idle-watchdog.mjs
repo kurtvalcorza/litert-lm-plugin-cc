@@ -26,7 +26,7 @@ import { reapMarkers } from './marker-state.mjs';
 // client applied, so the supervisor could SIGTERM a bystander the client would have
 // refused to touch. One home, one rule, no weaker copy.
 import {
-  formatPidRecord, identities, looksLikeLitertLmServe, parsePidRecord, pidsOnPort,
+  formatPidRecord, identifyPortOwners, looksLikeLitertLmServe, parsePidRecord,
   resolveTargets, signallablePid, startToken,
 } from './process-identity.mjs';
 
@@ -228,16 +228,11 @@ async function serverReachable() {
  * Anything unprovable is left running.
  */
 function ourTargets() {
-  const listening = pidsOnPort(opts.port);
-  identities(listening);                              // one lookup for all of them
-
-  // A listener we could not describe is NOT a stranger. `looksLikeLitertLmServe`
-  // returns false both for "definitely something else" and for "the lookup failed",
-  // and collapsing those let a real server on our port fall out of the model —
-  // never signalled, and never counted against calling the shutdown done.
-  const unidentified = listening.filter((pid) => identity(pid) === null);
-  const targets = listening.filter(looksLikeLitertLmServe)
-    .map((pid) => ({ pid, token: startToken(pid) }));
+  // Same helper the client uses, so the port is re-asked AFTER identification and a
+  // pid reissued mid-lookup to a litert-lm on another port cannot be adopted as
+  // ours. A listener we could not describe lands in `unidentified` rather than being
+  // filed as a stranger, because "the lookup failed" is not "definitely not mine".
+  const { ours: targets, unidentified } = identifyPortOwners(opts.port, looksLikeLitertLmServe);
   const recorded = ownedPid('server.pid');
   if (recorded !== null && !targets.some((t) => t.pid === recorded)) {
     targets.push({ pid: recorded, token: startToken(recorded) });
@@ -379,13 +374,14 @@ async function main() {
     // Nothing provable AND nothing unprovable: genuinely not ours, stand down clean.
     if (!targets.length && !unidentified.length) cleanupAndExit(0);
 
-    // Unidentified means a question we failed to answer, and the previous version
-    // answered it by LEAVING — exiting non-zero, which clears `watchdog.pid` and
-    // hands a still-live server back to nobody. A transient PowerShell or `ps`
-    // failure would therefore cost the server its supervisor permanently. Staying
-    // and asking again next poll costs one cycle; leaving costs the thing this
-    // process exists for.
-    if (!targets.length) continue;
+    // ANY unidentified listener defers the whole attempt, not just the case where
+    // nothing else was found. Proceeding with a partial picture meant signalling the
+    // proven targets, folding the unidentified one into the failure verdict, and then
+    // exiting — which clears `watchdog.pid` and leaves that listener alive with no
+    // supervisor at all. The previous guard only covered an empty target set, so the
+    // mixed case walked straight past it. Waiting one poll costs a cycle; leaving
+    // costs the thing this process exists for.
+    if (unidentified.length) continue;
 
     // Signal before acting, so a client cannot connect to a dying server (FR-025).
     writeState('stopping', Date.now());
@@ -435,6 +431,15 @@ async function main() {
         && t.pid !== recorded && t.token);
       if (orphan !== undefined && !recordedSurvived) {
         writeState('server.pid', `${orphan.pid} ${orphan.token}`);
+      }
+
+      // And every survivor into the same list the client keeps, not just the one the
+      // single `server.pid` slot could hold. Writing only that slot meant a second
+      // survivor — a launcher and a listener both refusing to die — was recorded
+      // nowhere at all, and the next `--stop` could rediscover only one of them.
+      const outstanding = targets.filter((t) => left.outstanding.includes(t.pid) && t.token);
+      if (outstanding.length) {
+        writeState('survivors', outstanding.map((t) => `${t.pid} ${t.token}`).join('\n'));
       }
 
       // Standing down without a report leaves the next client free to reconcile and

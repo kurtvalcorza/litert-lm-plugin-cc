@@ -40,11 +40,49 @@ const SCRIPTS = join(dirname(fileURLToPath(import.meta.url)), '..', 'plugins', '
 const CLIENT = join(SCRIPTS, 'litertlm-client.mjs');
 const WATCHDOG = join(SCRIPTS, 'idle-watchdog.mjs');
 
-// Ports nothing else on a developer machine is likely to want. Each test gets its
-// own, so a leftover process from a failed run cannot poison the next test.
+/**
+ * Ports proven free at start-up, not assumed free.
+ *
+ * These tests are destructive by design: they drive the real `--stop` and the real
+ * watchdog, and the production logic will correctly identify and signal a genuine
+ * `litert-lm serve` on whatever port it is pointed at. Hard-coded numbers made that
+ * a hazard rather than a hypothetical — a developer already serving on one of them,
+ * or a second test run in parallel, would have had it terminated. A scratch state
+ * directory does not help, because ownership is decided from the process, not the
+ * state.
+ *
+ * So each port is bound here, checked, and released. Anything already listening is
+ * skipped rather than trusted.
+ */
+function reservePort(from) {
+  for (let candidate = from; candidate < from + 400; candidate += 1) {
+    const probe = spawnSync(process.execPath, ['-e', `
+      const { createServer } = require('node:http');
+      const s = createServer(() => {});
+      s.on('error', () => process.exit(1));
+      s.listen(${candidate}, '127.0.0.1', () => s.close(() => process.exit(0)));
+    `], { encoding: 'utf8', windowsHide: true });
+    if (probe.status === 0) return candidate;
+  }
+  throw new Error(`no free port found from ${from}`);
+}
+
+// Every port a test binds is reserved here. Deriving one arithmetically (`base + 40`)
+// looked harmless and was not: the derived number was never probed, so it carried the
+// exact hazard the reservation exists to remove.
 const PORT = {
-  stranger: 9931, reuse: 9932, watchdogStranger: 9933, watchdogPid: 9934,
-  staleState: 9935, discovery: 9936,
+  stranger: reservePort(19301),
+  reuse: reservePort(19311),
+  watchdogStranger: reservePort(19321),
+  watchdogPid: reservePort(19331),
+  staleState: reservePort(19341),
+  discovery: reservePort(19351),
+  stubborn: reservePort(19361),
+  failurePath: reservePort(19371),
+  fakeLauncher: reservePort(19381),
+  claimant: reservePort(19391),
+  staleSlot: reservePort(19401),
+  watchdogSurvivor: reservePort(19411),
 };
 
 const spawned = [];
@@ -390,7 +428,7 @@ describe('--stop', () => {
         t.skip('SIGTERM cannot be trapped on Windows, so escalation is unobservable');
         return;
       }
-      const port = PORT.reuse + 40;
+      const port = PORT.stubborn;
       const runtime = runtimeDir();
       const dir = stateDir(runtime, port);
 
@@ -441,7 +479,7 @@ describe('--stop', () => {
         return;
       }
 
-      const port = PORT.reuse + 80;
+      const port = PORT.failurePath;
       const runtime = runtimeDir();
       const dir = stateDir(runtime, port);
       writeFileSync(join(dir, 'server.pid'), formatPidRecord(protectedPid), 'utf8');
@@ -537,7 +575,7 @@ describe('the idle watchdog', () => {
   // no watchdog at all. The claim must be exclusive, not a plain write.
   test('a losing claimant never overwrites a live watchdog record', { timeout: 30_000 },
     async () => {
-      const port = PORT.watchdogPid + 40;
+      const port = PORT.claimant;
       const runtime = runtimeDir();
       const dir = stateDir(runtime, port);
 
@@ -601,7 +639,7 @@ describe('the idle watchdog', () => {
         return;
       }
 
-      const port = PORT.watchdogStranger + 40;
+      const port = PORT.watchdogSurvivor;
       const runtime = runtimeDir();
       const dir = stateDir(runtime, port);
 
@@ -636,7 +674,7 @@ describe('the idle watchdog', () => {
   // by a crashed watchdog has to be reclaimable, or no watchdog ever starts on this
   // port again and the server holds accelerator memory until someone runs --stop.
   test('a stale record does not lock the slot', { timeout: 30_000 }, async () => {
-    const port = PORT.watchdogPid + 60;
+    const port = PORT.staleSlot;
     const runtime = runtimeDir();
     const dir = stateDir(runtime, port);
     writeFileSync(join(dir, 'watchdog.pid'), '999999 pretend-token', 'utf8');
@@ -708,7 +746,7 @@ describe('recording a process we spawned', () => {
 
   test('a launcher stage that exits leaves nothing signallable',
     { timeout: 90_000 }, async () => {
-      const port = PORT.staleState + 10;
+      const port = PORT.fakeLauncher;
       const runtime = runtimeDir();
       const dir = join(runtime, String(port));
       const binDir = join(runtime, 'bin');

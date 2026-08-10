@@ -458,22 +458,6 @@ export function signallablePid(record, writtenAtMs) {
 }
 
 /**
- * Has this pid exited but not yet been reaped? Linux only; false elsewhere.
- *
- * Independent of the identity lookup on purpose — see `resolveTargets`, which needs
- * to tell "this process is gone" from "I could not find out".
- */
-export function isZombie(pid) {
-  if (process.platform !== 'linux') return false;
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-    return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[0] === 'Z';
-  } catch {
-    return false;
-  }
-}
-
-/**
  * Sort `targets` into those still running as themselves and those we cannot judge.
  *
  * THREE STATES, NOT TWO. Every identity source collapses failure into the same
@@ -497,6 +481,37 @@ export function isZombie(pid) {
  * One home for the rule because the client and the watchdog both need it, and this
  * plugin's recurring defect is the second copy of a rule being the stale one.
  */
+/**
+ * Who owns this port, identified, and still owning it once identified.
+ *
+ * The order matters and used to be wrong. `pidsOnPort` yields numbers; establishing
+ * what those numbers ARE takes a process lookup, seconds on Windows. In that gap the
+ * listener can exit and its number be reissued — and if the new holder is another
+ * `litert-lm serve` on a DIFFERENT port, it passes the command-line test, its token
+ * is captured, and every later revalidation faithfully confirms the wrong process.
+ * `--stop` would then terminate a server on a port it was never asked about.
+ *
+ * So the port is re-asked after the identification, and only pids present in both
+ * snapshots are admitted. A listener that left in between is not ours to signal, and
+ * one that arrived in between has not been identified yet.
+ */
+export function identifyPortOwners(port, isOurs) {
+  const before = pidsOnPort(port);
+  identities(before);
+  const after = new Set(pidsOnPort(port));
+
+  const ours = [];
+  const strangers = [];
+  const unidentified = [];
+  for (const pid of before) {
+    if (!after.has(pid)) continue;                  // no longer holds this port
+    if (identity(pid) === null) unidentified.push(pid);
+    else if (isOurs(pid)) ours.push({ pid, token: startToken(pid) });
+    else strangers.push(pid);
+  }
+  return { ours, strangers, unidentified };
+}
+
 export function resolveTargets(targets) {
   const pids = targets.map((t) => t.pid);
   forgetIdentities(pids);            // a cache filled before we signalled is a liar
@@ -505,7 +520,7 @@ export function resolveTargets(targets) {
   const alive = [];
   const unknown = [];
   for (const t of targets) {
-    if (!pidAlive(t.pid) || isZombie(t.pid)) continue;
+    if (!pidAlive(t.pid)) continue;             // covers zombies; see marker-state
     const seen = identity(t.pid);
     if (seen === null) unknown.push(t.pid);
     else if (seen.start === t.token) alive.push(t.pid);

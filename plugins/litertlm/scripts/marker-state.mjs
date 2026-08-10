@@ -20,7 +20,7 @@
  * Node standard library only (constitution, Principle III).
  */
 
-import { readdirSync, rmSync } from 'node:fs';
+import { readdirSync, readFileSync, rmSync } from 'node:fs';
 import { uptime } from 'node:os';
 import { join } from 'node:path';
 
@@ -60,9 +60,29 @@ export function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
-    return true;
   } catch (err) {
-    return err.code === 'EPERM';
+    if (err.code !== 'EPERM') return false;
+  }
+  return !isZombie(pid);
+}
+
+/**
+ * Has this pid exited but not yet been reaped? Linux only; false elsewhere.
+ *
+ * Folded into `pidAlive` rather than bolted onto individual callers, because a
+ * zombie is dead by every meaning this codebase has for the word: it holds no
+ * memory, owns no socket, and answers no request. Checking it in only some places
+ * is how a terminated watchdog kept its `watchdog.pid` forever under a container
+ * PID 1 that does not reap — the shutdown path knew it was gone, the hygiene path
+ * did not, and no replacement supervisor was ever started.
+ */
+export function isZombie(pid) {
+  if (process.platform !== 'linux') return false;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[0] === 'Z';
+  } catch {
+    return false;
   }
 }
 

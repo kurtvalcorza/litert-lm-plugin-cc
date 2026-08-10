@@ -30,8 +30,9 @@ import { pidAlive, reapMarkers } from './marker-state.mjs';
 // note above them explains which belongs where, and it is worth reading before
 // choosing one.
 import {
-  commandLaunches, formatPidRecord, identities, identity, looksLikeLitertLmServe,
-  parsePidRecord, pidsOnPort, recordIsStale, resolveTargets, signallablePid, startToken,
+  commandLaunches, formatPidRecord, identifyPortOwners, identities, identity,
+  looksLikeLitertLmServe, parsePidRecord, recordIsStale, resolveTargets, signallablePid,
+  startToken,
 } from './process-identity.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -241,9 +242,17 @@ function ownedPids(port, names) {
   // Returns the record, not a bare number. A pid on its own stops meaning anything
   // the moment its process exits, so anything that will act on this later has to
   // carry the token and re-check — see `stillAlive`.
+  //
+  // A record whose lookup FAILED is kept too, and marked. Dropping it here was the
+  // same three-state mistake one level up from where it was fixed: `signallablePid`
+  // returns null both for "the token contradicts this process" and for "I could not
+  // read the process", and the omitted record never reached `resolveTargets` to be
+  // called unknown. Its only identity was then cleared and the stop reported success
+  // while an off-port process might still be holding accelerator memory.
   const owned = new Map();
   for (const [name, rec] of records) {
     if (signallablePid(rec, stateWrittenAt(port, name)) !== null) owned.set(name, rec);
+    else if (identity(rec.pid) === null) owned.set(name, { ...rec, unresolved: true });
   }
   return owned;
 }
@@ -380,8 +389,14 @@ async function awaitNotStopping(opts) {
     if (readState(opts.port, 'stopping') === null) return true;
     if (staleRecord(opts.port, 'watchdog.pid')) break;              // its author is gone
   }
+
+  // The handshake is released, because nobody is left to release it. `server.pid` is
+  // NOT — a dead supervisor is not evidence that the shutdown it was performing
+  // finished. If the watchdog died after the server closed its listener but before it
+  // exited, clearing the record here would delete the only identity of a process
+  // still holding accelerator memory, and the next start would launch a second server
+  // beside it. What we know is that supervision ended, not that teardown completed.
   clearState(opts.port, 'stopping');
-  clearState(opts.port, 'server.pid');
   return true;
 }
 
@@ -463,18 +478,39 @@ function resolveLitertLm() {
  * and any listener on the port we can prove is a litert-lm serve. Everything else is
  * left exactly as found — a cancelled start is not a licence to tidy up the machine.
  */
-async function cancelStartedServer(opts, child) {
+async function cancelStartedServer(opts, child, spawnedAt) {
   const port = opts.port;
-  const mine = [];
+
+  // Start from the one thing we know is ours: the process we spawned. Its listener
+  // descendants are discovered each pass rather than snapshotted once — the whole
+  // reason socket discovery exists is that signalling the launcher does not reach
+  // the grandchild that holds the port, and that grandchild may not have bound yet
+  // when cancellation begins. A single snapshot at the top would miss it entirely.
+  const mine = new Map();
   if (child.pid) {
     const token = startToken(child.pid);
-    if (token) mine.push({ pid: child.pid, token });
+    if (token) mine.set(child.pid, { pid: child.pid, token });
   }
-  mine.push(...classifyPortOwners(port).ours);
 
-  for (let i = 0; i < 20; i++) {
-    const { alive } = resolveTargets(mine);
-    if (!alive.length) break;
+  let conclusive = false;
+  for (let i = 0; i < 25; i++) {
+    // Only listeners that arrived on OUR watch. A newer invocation may legitimately
+    // have started after the stop, and killing its listener would make this
+    // cancellation destroy a start it has no claim over. `stopped-at` moving again
+    // is the signal that someone else now owns this port.
+    const stoppedAt = Number.parseInt(readState(port, 'stopped-at', ''), 10);
+    if (!Number.isFinite(stoppedAt) || stoppedAt < spawnedAt) break;
+
+    for (const owner of classifyPortOwners(port).ours) {
+      if (!mine.has(owner.pid)) mine.set(owner.pid, owner);
+    }
+
+    const { alive, unknown } = resolveTargets([...mine.values()]);
+    // `unknown` is not "gone". Ending the loop on a transient lookup failure would
+    // let this report "nothing is left running" while the overtaken server carried
+    // on coming up, unrecorded — the exact outcome cancellation exists to prevent.
+    if (!alive.length && !unknown.length) { conclusive = true; break; }
+
     for (const pid of alive) {
       try { process.kill(pid, i === 0 || process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL'); }
       catch { /* already gone */ }
@@ -482,8 +518,19 @@ async function cancelStartedServer(opts, child) {
     await sleep(400);
   }
 
-  clearState(port, 'server.pid');
   clearState(port, 'loaded-model');
+  if (conclusive) {
+    clearState(port, 'server.pid');
+    return true;
+  }
+
+  // Could not finish. Leave the identity behind so `--stop` can pick it up, rather
+  // than reporting a clean cancellation we did not achieve.
+  const left = [...mine.values()].filter((t) => t.token);
+  if (left.length) {
+    writeState(port, 'survivors', left.map((t) => `${t.pid} ${t.token}`).join('\n'));
+  }
+  return false;
 }
 
 async function ensureServer(opts) {
@@ -557,10 +604,13 @@ async function ensureServer(opts) {
     // undo itself, not just stay quiet about it.
     const stoppedAt = Number.parseInt(readState(opts.port, 'stopped-at', ''), 10);
     if (Number.isFinite(stoppedAt) && stoppedAt > spawnedAt) {
-      await cancelStartedServer(opts, child);
-      throw new Error(
-        'the server start was cancelled by a --stop that ran at the same time.\n'
-        + '  Nothing is left running. Retry if you did want it started.');
+      const clean = await cancelStartedServer(opts, child, spawnedAt);
+      throw new Error(clean
+        ? 'the server start was cancelled by a --stop that ran at the same time.\n'
+          + '  Nothing is left running. Retry if you did want it started.'
+        : 'the server start was cancelled by a --stop that ran at the same time,\n'
+          + '  but it could not be confirmed torn down. Its identity has been recorded;\n'
+          + '  run --stop again to finish the job.');
     }
 
     const up = await probe(opts);
@@ -600,23 +650,7 @@ async function ensureServer(opts) {
  * Unidentified owners are never signalled — we cannot prove they are ours — but they
  * do block the success verdict, because "I could not tell" is not "it is not mine".
  */
-function classifyPortOwners(port) {
-  const listening = pidsOnPort(port);
-  identities(listening);                              // one lookup for all of them
-
-  const ours = [];
-  const strangers = [];
-  const unidentified = [];
-  for (const pid of listening) {
-    if (identity(pid) === null) unidentified.push(pid);
-    // Keep each owner's start token, not just its number. Escalation happens after we
-    // have already killed things, and by then a pid we proved is a pid that may have
-    // been reissued — the number alone stops meaning anything the moment it dies.
-    else if (looksLikeLitertLmServe(pid)) ours.push({ pid, token: startToken(pid) });
-    else strangers.push(pid);
-  }
-  return { ours, strangers, unidentified };
-}
+const classifyPortOwners = (port) => identifyPortOwners(port, looksLikeLitertLmServe);
 
 /**
  * Of `targets`, those still running as themselves — and those we could not judge.
@@ -659,11 +693,17 @@ async function stopProcesses(opts) {
     .filter((rec) => rec !== null && rec.token !== null
       && !recordIsStale(rec, stateWrittenAt(port, 'survivors')));
 
-  // One set of targets, each carrying the token that identifies it.
+  // The SERVER targets. The watchdog is deliberately not among them — see below.
+  const watchdogRecord = recordedByName.get('watchdog.pid') ?? null;
   const targets = [];
   for (const t of [...recorded, ...ours, ...carried]) {
+    if (t.pid === watchdogRecord?.pid) continue;
     if (!targets.some((seen) => seen.pid === t.pid)) targets.push(t);
   }
+
+  // A recorded target we could not look up at all is unknown, not absent.
+  const unresolvedRecords = [...recorded, ...(watchdogRecord ? [watchdogRecord] : [])]
+    .filter((r) => r.unresolved).map((r) => r.pid);
 
   // Refuse to tear down a system we cannot see all of.
   //
@@ -712,7 +752,7 @@ async function stopProcesses(opts) {
     // and its state kept, when it had in fact just exited.
     await sleep(200);
     ({ alive: remaining, unknown } = stillAlive(targets));
-    unknown = [...new Set([...unknown, ...unidentified])];
+    unknown = [...new Set([...unknown, ...unidentified, ...unresolvedRecords])];
   } else {
     // Nothing was signallable — but `unknown` is NOT cleared here. It was, and that
     // turned "could not determine" straight back into "confirmed gone": with no
@@ -720,7 +760,22 @@ async function stopProcesses(opts) {
     // clean, and the state was cleared. The one thing the three-state split exists to
     // prevent, undone by the branch that runs when there is nothing to do.
     remaining = [];
-    unknown = [...new Set([...unknown, ...unidentified])];
+    unknown = [...new Set([...unknown, ...unidentified, ...unresolvedRecords])];
+  }
+
+  // The watchdog goes LAST, and only once the server is confirmed gone.
+  //
+  // It used to be signalled in the same first volley as the server. If the server
+  // then survived escalation, the command reported failure correctly — but the
+  // supervisor was already dead, so nothing remained to retry the idle shutdown and
+  // the memory stayed held until a human noticed. Killing the thing whose job is to
+  // clean up, before knowing whether the cleanup succeeded, is backwards.
+  const serverGone = remaining.length === 0 && unknown.length === 0;
+  if (serverGone && watchdogRecord !== null && !watchdogRecord.unresolved) {
+    const { alive: watchdogAlive } = stillAlive([watchdogRecord]);
+    for (const pid of watchdogAlive) {
+      try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
+    }
   }
 
   clearInFlight(port);
@@ -737,7 +792,11 @@ async function stopProcesses(opts) {
   const kept = new Set();
   for (const name of PID_FILES) {
     const rec = recordedByName.get(name);
-    if (rec !== undefined && survivors.has(rec.pid)) kept.add(rec.pid);
+    // The watchdog we chose not to signal keeps its record too. Clearing it would
+    // orphan a live supervisor: still running, but invisible to the next client,
+    // which would start a second one and leave this one de-supervising nothing.
+    const spared = name === 'watchdog.pid' && !serverGone && rec !== undefined;
+    if (rec !== undefined && (survivors.has(rec.pid) || spared)) kept.add(rec.pid);
     else clearState(port, name);
   }
 
