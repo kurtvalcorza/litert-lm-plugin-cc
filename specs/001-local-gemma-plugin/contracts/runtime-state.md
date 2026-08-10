@@ -19,7 +19,8 @@ different ports never share state.
 | `stopping` | empty; presence is the signal | watchdog, before terminating | client |
 | `stopped-idle` | epoch ms | watchdog, before exiting | client (consumes) |
 | `stopped-at` | epoch ms | client, at the end of a SUCCESSFUL `--stop` | watchdog and client, before publishing |
-| `survivors` | `<pid> <start-token>` per line | client, when a stop fails | client, on the next stop |
+| `survivors` | `<pid> <start-token>` per line | client and watchdog, when a stop fails | client, on the next stop |
+| `starting` | `<spawned-at-ms> <client-pid>` | client, before spawning a server | a cancelling start, as its generation |
 | `loaded-model` | model id | client, after a successful request | client |
 
 **Why files, not one document**: single-fact files make every read and write atomic enough
@@ -96,10 +97,30 @@ identified, `--stop` signals nothing and clears nothing. Signalling only what is
 take out the watchdog — a recorded target — and then fail on the server, leaving it running with
 nobody supervising it. A refusal can be retried; an unsupervised server can only be noticed.
 
-**A cancelled start undoes itself.** A `--stop` that lands while a server is coming up cancels
-that start, and the starting client tears down what it spawned rather than merely declining to
-record it. Staying quiet while the server came up anyway produced the worse of the two outcomes:
-running, unrecorded, and harder to find than if nothing had been suppressed.
+**A cancelled start undoes itself, within its own generation.** A `--stop` that lands while a
+server is coming up cancels that start, and the starting client tears down what it spawned
+rather than merely declining to record it. Staying quiet while the server came up anyway
+produced the worse of the two outcomes: running, unrecorded, and harder to find than if nothing
+had been suppressed.
+
+`starting` is what makes "its own" meaningful. `stopped-at` cannot serve as the boundary,
+because a newer start does not write it: after (start A, stop S, start B, A notices S), every
+cancellation pass in A still saw the same stamp and would adopt B's listener, letting a
+cancelled start kill a valid newer one. Each start claims `starting`; a cancelling start that
+finds the claim is no longer its own stops reaching for listeners and cleans up only the child
+it spawned.
+
+Cancellation also requires **quiescence rather than one empty sample**. The launcher exits
+before the detached descendant it spawned has bound the socket, so a single pass can see no live
+process and no listener while the grandchild is still on its way up. Consecutive empty
+observations are required before a cancellation is called complete — a heuristic, not a proof,
+and it is written down as one.
+
+**A teardown that lost its supervisor is unfinished, not finished.** If the watchdog dies
+mid-shutdown, `stopping` is released but `server.pid` is preserved, and the next start must
+consult it. An old server that closed its listener without exiting is invisible to an endpoint
+probe, so starting beside it would lose the only identity of a process that may still hold
+accelerator memory. The start refuses and names the pid.
 
 **Existence is `kill(pid, 0)`, and `EPERM` means alive.** That call has two distinct failures.
 `ESRCH` is "no such process"; `EPERM` is "it exists and you may not touch it". Flattening them

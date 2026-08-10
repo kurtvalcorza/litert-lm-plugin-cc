@@ -493,23 +493,41 @@ async function cancelStartedServer(opts, child, spawnedAt) {
   }
 
   let conclusive = false;
+  let quiet = 0;
   for (let i = 0; i < 25; i++) {
-    // Only listeners that arrived on OUR watch. A newer invocation may legitimately
-    // have started after the stop, and killing its listener would make this
-    // cancellation destroy a start it has no claim over. `stopped-at` moving again
-    // is the signal that someone else now owns this port.
-    const stoppedAt = Number.parseInt(readState(port, 'stopped-at', ''), 10);
-    if (!Number.isFinite(stoppedAt) || stoppedAt < spawnedAt) break;
+    // Only listeners belonging to OUR start generation.
+    //
+    // The previous guard compared `stopped-at`, and that was not a generation at
+    // all: a newer `ensureServer` does not write it, so after (A spawns, S stops,
+    // B starts, A notices) every cancellation pass still saw the same stamp and
+    // happily adopted B's listener — letting a cancelled start kill a valid newer
+    // one. `starting` is written by each start and names the generation that owns
+    // the port right now; when it is no longer ours, we stop reaching for listeners
+    // and clean up only the child we spawned.
+    const claim = Number.parseInt(readState(port, 'starting', ''), 10);
+    const generationIsOurs = claim === spawnedAt;
 
-    for (const owner of classifyPortOwners(port).ours) {
-      if (!mine.has(owner.pid)) mine.set(owner.pid, owner);
+    if (generationIsOurs) {
+      for (const owner of classifyPortOwners(port).ours) {
+        if (!mine.has(owner.pid)) mine.set(owner.pid, owner);
+      }
     }
 
     const { alive, unknown } = resolveTargets([...mine.values()]);
     // `unknown` is not "gone". Ending the loop on a transient lookup failure would
     // let this report "nothing is left running" while the overtaken server carried
     // on coming up, unrecorded — the exact outcome cancellation exists to prevent.
-    if (!alive.length && !unknown.length) { conclusive = true; break; }
+    if (!alive.length && !unknown.length) {
+      // One empty sample is not quiescence. The launcher exits before the detached
+      // descendant it spawned has bound the socket, so a single pass can see no live
+      // process AND no listener while the grandchild is still on its way up. Require
+      // the picture to stay empty across consecutive passes before believing it.
+      quiet += 1;
+      if (quiet >= 3 || !generationIsOurs) { conclusive = true; break; }
+      await sleep(400);
+      continue;
+    }
+    quiet = 0;
 
     for (const pid of alive) {
       try { process.kill(pid, i === 0 || process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL'); }
@@ -519,6 +537,11 @@ async function cancelStartedServer(opts, child, spawnedAt) {
   }
 
   clearState(port, 'loaded-model');
+  // Release the generation claim only if it is still ours; a newer start owns it now
+  // and must not have its claim cleared by an older invocation tidying up.
+  if (Number.parseInt(readState(port, 'starting', ''), 10) === spawnedAt) {
+    clearState(port, 'starting');
+  }
   if (conclusive) {
     clearState(port, 'server.pid');
     return true;
@@ -542,6 +565,36 @@ async function ensureServer(opts) {
   if (existing) {
     startWatchdog(opts);              // adopt a server nothing is supervising
     return { models: existing, started: false };
+  }
+
+  // A teardown that lost its supervisor is unfinished, not finished.
+  //
+  // `awaitNotStopping` preserves `server.pid` when the watchdog dies mid-shutdown,
+  // and that record was documentary only: nothing consulted it here, so an old
+  // server that had closed its listener but not exited was invisible to the probe
+  // above, and this went on to spawn a second one beside it and overwrite the record
+  // — losing the only identity of a process that may still hold accelerator memory.
+  //
+  // Refusing is the conservative half of the fix. Taking over the teardown from here
+  // would be the ambitious one, and the last four rounds of this change are a
+  // reasonable argument against inventing more lifecycle machinery in the same
+  // breath. The message says exactly what to run.
+  if (wasStopping) {
+    const held = ['server.pid', 'survivors'].flatMap((name) => {
+      const raw = readState(opts.port, name, '');
+      return String(raw).split('\n').map(parsePidRecord)
+        .filter((rec) => rec !== null && rec.token !== null
+          && !recordIsStale(rec, stateWrittenAt(opts.port, name)));
+    });
+    const { alive, unknown } = resolveTargets(held);
+    if (alive.length || unknown.length) {
+      throw new Error(
+        `pid ${[...alive, ...unknown].join(', ')} is left over from a shutdown that did `
+        + 'not finish.\n'
+        + '  It is this plugin\'s process and may still hold accelerator memory even\n'
+        + '  though it has stopped listening. Starting a second server beside it would\n'
+        + '  lose track of it. Run --stop first, then retry.');
+    }
   }
 
   // Distinguish a restart-after-idle from a first-ever start (FR-025). The watchdog
@@ -571,6 +624,12 @@ async function ensureServer(opts) {
 
   let child;
   const spawnedAt = Date.now();
+  // Claim the port for THIS start. `cancelStartedServer` uses it as the generation
+  // boundary: a later start overwrites the claim, and an earlier one that is
+  // cancelling then knows to stop reaching for listeners it can no longer attribute
+  // to itself. Overwritten rather than exclusively created — the newest start is the
+  // one that owns the port, and an abandoned claim must not lock the port out.
+  writeState(opts.port, 'starting', `${spawnedAt} ${process.pid}`);
   try {
     child = spawn(exe, ['serve', '--host', opts.host, '--port', String(opts.port)],
       { detached: true, stdio: 'ignore', windowsHide: true });
@@ -614,8 +673,13 @@ async function ensureServer(opts) {
     }
 
     const up = await probe(opts);
-    if (up) { startWatchdog(opts); return { models: up, started: true }; }
+    if (up) {
+      clearState(opts.port, 'starting');     // this generation is no longer starting
+      startWatchdog(opts);
+      return { models: up, started: true };
+    }
   }
+  clearState(opts.port, 'starting');
 
   throw new Error(
     `the litert-lm server did not become reachable on ${baseUrl(opts)} within `
