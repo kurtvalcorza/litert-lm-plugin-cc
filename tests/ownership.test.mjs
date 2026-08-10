@@ -83,6 +83,7 @@ const PORT = {
   claimant: reservePort(19391),
   staleSlot: reservePort(19401),
   watchdogSurvivor: reservePort(19411),
+  leftover: reservePort(19421),
 };
 
 const spawned = [];
@@ -805,6 +806,50 @@ describe('recording a process we spawned', () => {
       assert.ok(await waitFor(() => !alive(leaked)),
         'the detached fixture must not outlive the test');
     });
+});
+
+describe('starting beside a leftover', () => {
+  /**
+   * The refusal must not depend on this invocation having SEEN the handshake.
+   *
+   * It used to: the guard sat behind `wasStopping`, which is only true when
+   * `stopping` was still present when this process arrived. But `reconcileState`
+   * runs first and clears `stopping` the moment the watchdog's record is stale — so
+   * a client arriving after the supervisor had already died found no handshake,
+   * skipped the check entirely, and started a second server beside a process that
+   * may still hold accelerator memory, overwriting its only identity.
+   *
+   * Staged without any `stopping` file for exactly that reason. The leftover here is
+   * alive and NOT listening, which is what makes it invisible to the endpoint probe
+   * and is the only reason the recorded identity matters at all.
+   */
+  test('refuses when a recorded server is alive but no longer listening', async (t) => {
+    const port = PORT.leftover;
+    const runtime = runtimeDir();
+    const dir = stateDir(runtime, port);
+
+    const leftover = await startBystander();
+    const token = startToken(leftover.pid);
+    if (token === null) {
+      t.skip('cannot establish process identity on this host');
+      return;
+    }
+    writeFileSync(join(dir, 'server.pid'), `${leftover.pid} ${token}`, 'utf8');
+
+    const r = runClient(['--list', '--port', String(port)], runtime);
+
+    assert.notEqual(r.status, 0,
+      `starting beside a live leftover must fail, not succeed: ${r.stdout}`);
+    assert.match(r.stderr, /left over from a shutdown that did not finish/,
+      'the refusal must name its reason, not fail for some unrelated one');
+    assert.match(r.stderr, new RegExp(`\\b${leftover.pid}\\b`),
+      'the message must name the pid, since finding it is the whole point');
+
+    // The record is the thing being protected: a refusal that erased it would be no
+    // better than the start that used to overwrite it.
+    assert.equal(readFileSync(join(dir, 'server.pid'), 'utf8').trim(),
+      `${leftover.pid} ${token}`, 'the leftover identity must survive the refusal');
+  });
 });
 
 describe('the launched-executable check', () => {

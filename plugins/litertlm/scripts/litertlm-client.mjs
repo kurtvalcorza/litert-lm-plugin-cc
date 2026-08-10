@@ -472,6 +472,24 @@ function resolveLitertLm() {
 }
 
 /**
+ * Release the `starting` claim, and ONLY if this invocation still holds it.
+ *
+ * Every exit from a start has to go through here rather than clearing the file
+ * directly. A newer start overwrites the claim while an older one is still polling,
+ * and the older one then reaches its own exit — success, timeout, or cancellation —
+ * and erased a generation that was not its own. The damage is not the missing file:
+ * `cancelStartedServer` reads the claim to decide whether it still owns the port, so
+ * a wrongly-cleared claim makes the newer start look foreign to its own cancellation,
+ * which then takes the child-only path and can call success before the descendant it
+ * was supposed to wait for has even bound.
+ */
+function releaseStartClaim(port, spawnedAt) {
+  if (Number.parseInt(readState(port, 'starting', ''), 10) === spawnedAt) {
+    clearState(port, 'starting');
+  }
+}
+
+/**
  * Undo a start that a concurrent `--stop` cancelled.
  *
  * Only touches what this invocation is responsible for: the launcher we spawned,
@@ -537,13 +555,20 @@ async function cancelStartedServer(opts, child, spawnedAt) {
   }
 
   clearState(port, 'loaded-model');
-  // Release the generation claim only if it is still ours; a newer start owns it now
-  // and must not have its claim cleared by an older invocation tidying up.
-  if (Number.parseInt(readState(port, 'starting', ''), 10) === spawnedAt) {
-    clearState(port, 'starting');
-  }
+  releaseStartClaim(port, spawnedAt);
   if (conclusive) {
-    clearState(port, 'server.pid');
+    // Clear `server.pid` only while it still names something of OURS.
+    //
+    // The generation boundary stopped this from SIGNALLING a newer start's listener
+    // and then deleted its record anyway: once B has taken the claim, A reaches
+    // `!generationIsOurs`, calls itself conclusive as soon as its own launcher is
+    // gone, and wiped the identity B had just published — losing a live server to
+    // the cleanup rather than to the kill. Not signalling a process whose only
+    // identity you then discard is not restraint.
+    const rec = parsePidRecord(readState(port, 'server.pid', ''));
+    if (rec === null || mine.has(rec.pid) || rec.pid === child.pid) {
+      clearState(port, 'server.pid');
+    }
     return true;
   }
 
@@ -575,26 +600,33 @@ async function ensureServer(opts) {
   // above, and this went on to spawn a second one beside it and overwrite the record
   // — losing the only identity of a process that may still hold accelerator memory.
   //
+  // Deliberately NOT gated on `wasStopping`. That gate looked equivalent and was not:
+  // `reconcileState` above clears `stopping` the moment the watchdog's record is
+  // stale, so an invocation arriving after the supervisor had already died saw no
+  // handshake at all, `awaitNotStopping` returned false, and the leftover it was
+  // meant to catch walked straight past it. The question "is one of our processes
+  // still holding memory" does not depend on which invocation happened to observe
+  // the handshake — and when nothing is recorded the check costs nothing, because
+  // an empty target list performs no identity lookup.
+  //
   // Refusing is the conservative half of the fix. Taking over the teardown from here
   // would be the ambitious one, and the last four rounds of this change are a
   // reasonable argument against inventing more lifecycle machinery in the same
   // breath. The message says exactly what to run.
-  if (wasStopping) {
-    const held = ['server.pid', 'survivors'].flatMap((name) => {
-      const raw = readState(opts.port, name, '');
-      return String(raw).split('\n').map(parsePidRecord)
-        .filter((rec) => rec !== null && rec.token !== null
-          && !recordIsStale(rec, stateWrittenAt(opts.port, name)));
-    });
-    const { alive, unknown } = resolveTargets(held);
-    if (alive.length || unknown.length) {
-      throw new Error(
-        `pid ${[...alive, ...unknown].join(', ')} is left over from a shutdown that did `
-        + 'not finish.\n'
-        + '  It is this plugin\'s process and may still hold accelerator memory even\n'
-        + '  though it has stopped listening. Starting a second server beside it would\n'
-        + '  lose track of it. Run --stop first, then retry.');
-    }
+  const held = ['server.pid', 'survivors'].flatMap((name) => {
+    const raw = readState(opts.port, name, '');
+    return String(raw).split('\n').map(parsePidRecord)
+      .filter((rec) => rec !== null && rec.token !== null
+        && !recordIsStale(rec, stateWrittenAt(opts.port, name)));
+  });
+  const leftover = resolveTargets(held);
+  if (leftover.alive.length || leftover.unknown.length) {
+    throw new Error(
+      `pid ${[...leftover.alive, ...leftover.unknown].join(', ')} is left over from a `
+      + 'shutdown that did not finish.\n'
+      + '  It is this plugin\'s process and may still hold accelerator memory even\n'
+      + '  though it has stopped listening. Starting a second server beside it would\n'
+      + '  lose track of it. Run --stop first, then retry.');
   }
 
   // Distinguish a restart-after-idle from a first-ever start (FR-025). The watchdog
@@ -674,12 +706,12 @@ async function ensureServer(opts) {
 
     const up = await probe(opts);
     if (up) {
-      clearState(opts.port, 'starting');     // this generation is no longer starting
+      releaseStartClaim(opts.port, spawnedAt);   // ours only — a newer start may own it
       startWatchdog(opts);
       return { models: up, started: true };
     }
   }
-  clearState(opts.port, 'starting');
+  releaseStartClaim(opts.port, spawnedAt);
 
   throw new Error(
     `the litert-lm server did not become reachable on ${baseUrl(opts)} within `
@@ -834,12 +866,36 @@ async function stopProcesses(opts) {
   // supervisor was already dead, so nothing remained to retry the idle shutdown and
   // the memory stayed held until a human noticed. Killing the thing whose job is to
   // clean up, before knowing whether the cleanup succeeded, is backwards.
+  //
+  // And its fate counts. Signalling it and moving on took the same shortcut this
+  // whole change exists to remove: the lookup's `unknown` bucket was destructured
+  // away, no liveness check followed the SIGTERM, and the command then cleared
+  // `watchdog.pid`, wrote the success tombstone, and reported both processes
+  // confirmed exited on the strength of the server's result alone. A supervisor that
+  // ignored the signal was left running with its identity deleted.
   const serverGone = remaining.length === 0 && unknown.length === 0;
   if (serverGone && watchdogRecord !== null && !watchdogRecord.unresolved) {
-    const { alive: watchdogAlive } = stillAlive([watchdogRecord]);
-    for (const pid of watchdogAlive) {
+    let watchdogState = stillAlive([watchdogRecord]);
+    for (const pid of watchdogState.alive) {
       try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
     }
+    if (watchdogState.alive.length || watchdogState.unknown.length) {
+      // Same discipline as the server above: chase it, then re-ask after the last
+      // signal rather than before it.
+      for (let i = 0; i < 20; i++) {
+        await sleep(400);
+        watchdogState = stillAlive([watchdogRecord]);
+        if (!watchdogState.alive.length && !watchdogState.unknown.length) break;
+        for (const pid of watchdogState.alive) {
+          try { process.kill(pid, process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL'); }
+          catch { /* ignore */ }
+        }
+      }
+      await sleep(200);
+      watchdogState = stillAlive([watchdogRecord]);
+    }
+    remaining = [...new Set([...remaining, ...watchdogState.alive])];
+    unknown = [...new Set([...unknown, ...watchdogState.unknown])];
   }
 
   clearInFlight(port);
@@ -881,8 +937,12 @@ async function stopProcesses(opts) {
   }
 
   // And every survivor, without the two-slot ceiling, so a retry can find all of
-  // them rather than only whichever one happened to fit.
-  const stillHere = targets.filter((t) => survivors.has(t.pid) && t.token);
+  // them rather than only whichever one happened to fit. A watchdog that outlived
+  // its SIGTERM belongs in that list too: it is not among `targets` — deliberately,
+  // so the server volley never reaches it — but it is one of this plugin's processes
+  // and a retry has to be able to find it.
+  const stillHere = [...targets, ...(watchdogRecord ? [watchdogRecord] : [])]
+    .filter((t) => survivors.has(t.pid) && t.token);
   if (stillHere.length) {
     writeState(port, 'survivors', stillHere.map((t) => `${t.pid} ${t.token}`).join('\n'));
   } else {

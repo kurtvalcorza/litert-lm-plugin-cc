@@ -110,6 +110,17 @@ cancelled start kill a valid newer one. Each start claims `starting`; a cancelli
 finds the claim is no longer its own stops reaching for listeners and cleans up only the child
 it spawned.
 
+**Only the claim's owner may release it, and a cancelled generation clears only its own
+records.** Both are the same mistake in different clothes: an older invocation tidying up state
+that now belongs to a newer one. An older start that reaches its own exit — success, timeout,
+or cancellation — used to clear `starting` unconditionally, which erased the newer start's
+claim and left that start looking foreign to its own cancellation, so it took the child-only
+path and could declare success before its descendant bound. Likewise a cancelling start that
+had lost the generation still deleted the shared `server.pid`, discarding the identity the
+newer start had just published. Not signalling a process whose only identity you then discard
+is not restraint. Every release compares the claim first, and `server.pid` is cleared only
+while it still names one of the cancelling invocation's own targets.
+
 Cancellation also requires **quiescence rather than one empty sample**. The launcher exits
 before the detached descendant it spawned has bound the socket, so a single pass can see no live
 process and no listener while the grandchild is still on its way up. Consecutive empty
@@ -121,6 +132,22 @@ mid-shutdown, `stopping` is released but `server.pid` is preserved, and the next
 consult it. An old server that closed its listener without exiting is invisible to an endpoint
 probe, so starting beside it would lose the only identity of a process that may still hold
 accelerator memory. The start refuses and names the pid.
+
+That check is **not** conditional on having observed `stopping`. Gating it on the handshake
+looked equivalent and was not: reconciliation clears `stopping` as soon as the watchdog's
+record is stale, so an invocation arriving after the supervisor had already died saw no
+handshake, skipped the check, and started beside the leftover anyway. Whether one of this
+plugin's processes is still holding memory does not depend on which invocation happened to
+witness the handshake. The check is free when nothing is recorded — an empty target list
+performs no identity lookup.
+
+**A stop succeeds only when the watchdog is confirmed gone too.** The watchdog is signalled
+last and only once the server is proven down, but its own outcome then has to reach the
+verdict. Discarding its `unknown` bucket and sending one un-followed-up `SIGTERM` meant the
+command cleared `watchdog.pid`, wrote the success tombstone, and reported both processes exited
+on the strength of the server's result alone — leaving a supervisor that ignored the signal
+running with its identity deleted. It is chased and re-checked on the same terms as the server,
+and a survivor keeps its record and lands in `survivors` like any other.
 
 **Existence is `kill(pid, 0)`, and `EPERM` means alive.** That call has two distinct failures.
 `ESRCH` is "no such process"; `EPERM` is "it exists and you may not touch it". Flattening them
