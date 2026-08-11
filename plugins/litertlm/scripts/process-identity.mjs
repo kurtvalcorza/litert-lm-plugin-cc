@@ -45,7 +45,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 
 // The boot-session test and pid liveness already have a home; ownership builds on
 // them rather than restating them. marker-state imports nothing from here, so this
@@ -74,6 +74,22 @@ const cache = new Map();
 
 /** Collapse whitespace so a wrapped or padded command line still matches. */
 const flatten = (s) => (s ?? '').replace(/\s+/g, ' ').trim();
+
+/**
+ * Run a query tool and return its stdout, or '' if it could not run at all.
+ *
+ * Shared by socket discovery and the process-table walk. A tool that is absent, or
+ * that the OS refuses to start, is indistinguishable from one that found nothing —
+ * which is why every caller here treats an empty answer as "I could not tell" and
+ * never as "there is nothing there".
+ */
+function run(cmd, args) {
+  try {
+    return spawnSync(cmd, args, { encoding: 'utf8', windowsHide: true }).stdout ?? '';
+  } catch {
+    return '';
+  }
+}
 
 function inspectWindows(pids) {
   const filter = pids.map((p) => `ProcessId=${p}`).join(' or ');
@@ -295,14 +311,6 @@ export function addressServes(listenAddress, host) {
  * quietly do nothing.
  */
 function listenersOnPort(port) {
-  const run = (cmd, args) => {
-    try {
-      return spawnSync(cmd, args, { encoding: 'utf8', windowsHide: true }).stdout ?? '';
-    } catch {
-      return '';
-    }
-  };
-
   if (process.platform === 'win32') {
     return parseGetNetTcpConnection(run('powershell.exe', ['-NoProfile', '-Command',
       `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue `
@@ -388,6 +396,114 @@ export function pidsOnPort(port, host = null) {
     if (addressServes(address, host)) pids.add(pid);
   }
   return [...pids];
+}
+
+// ---------------------------------------------------------------------------
+// Descent
+//
+// WHY THIS IS HERE AT ALL, GIVEN THE FILE HEADER REJECTS ANCESTRY.
+//
+// That rejection is about OWNERSHIP: `--stop` must be able to stop a server this
+// plugin adopted but did not start, so requiring descent from our recorded pid would
+// refuse exactly the servers `ensureServer` is designed to take over. Nothing here
+// changes that — `--stop` still identifies socket owners by their command line.
+//
+// Cancellation is a different question with a different answer. There, we DID spawn
+// the launcher moments ago, and "descended from the process I just started" is a
+// stronger claim than any command line: it cannot be forged by a bystander and needs
+// no heuristic. It is also the only thing that can see a descendant which has not
+// bound a socket yet, which is the gap a listener-based search cannot close.
+// ---------------------------------------------------------------------------
+
+/** pid -> ppid, for every process the platform will describe. */
+function parentsWindows() {
+  const out = run('powershell.exe', ['-NoProfile', '-Command',
+    'Get-CimInstance Win32_Process -ErrorAction SilentlyContinue '
+    + '| ForEach-Object { ($_.ProcessId, $_.ParentProcessId) -join [char]9 }']);
+  const parents = new Map();
+  for (const line of out.split(/\r?\n/)) {
+    const [pidStr, ppidStr] = line.split('\t');
+    const pid = Number.parseInt(pidStr, 10);
+    const ppid = Number.parseInt(ppidStr, 10);
+    if (Number.isInteger(pid) && Number.isInteger(ppid)) parents.set(pid, ppid);
+  }
+  return parents;
+}
+
+/**
+ * Linux: field 4 of /proc/<pid>/stat. No subprocess, so this is cheap enough to do
+ * on every poll — which matters, because the whole point is to catch a short-lived
+ * intermediate before it exits.
+ *
+ * `comm` (field 2) is parenthesised and may contain spaces and parentheses, so the
+ * fields are counted from the LAST ')', exactly as `inspectLinux` does.
+ */
+function parentsLinux() {
+  const parents = new Map();
+  let entries;
+  try { entries = readdirSync('/proc'); } catch { return parents; }
+  for (const name of entries) {
+    const pid = Number.parseInt(name, 10);
+    if (!Number.isInteger(pid) || String(pid) !== name) continue;
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+      const ppid = Number.parseInt(fields[1], 10);          // field 4, 1-indexed
+      if (Number.isInteger(ppid)) parents.set(pid, ppid);
+    } catch { /* it exited between the readdir and the read */ }
+  }
+  return parents;
+}
+
+/** macOS and other POSIX: one `ps` for the whole table. */
+function parentsPosixPs() {
+  const parents = new Map();
+  for (const line of run('ps', ['-Ao', 'pid=,ppid=']).split('\n')) {
+    const m = line.trim().match(/^(\d+)\s+(\d+)$/);
+    if (m === null) continue;
+    parents.set(Number.parseInt(m[1], 10), Number.parseInt(m[2], 10));
+  }
+  return parents;
+}
+
+export function processParents() {
+  if (process.platform === 'win32') return parentsWindows();
+  if (process.platform === 'linux') return parentsLinux();
+  return parentsPosixPs();
+}
+
+/**
+ * Every process descended from `roots`, transitively, in the CURRENT process table.
+ *
+ * TWO THINGS THIS DOES NOT DO, both deliberate:
+ *
+ * 1. It does not remember. A detached grandchild is reparented to init the moment
+ *    its parent exits, and after that no snapshot can connect it to us. So a single
+ *    late call finds nothing useful — the caller has to sample WHILE the intermediate
+ *    is alive and accumulate what it sees. That is the whole reason sampling happens
+ *    during the startup poll rather than only at cancellation.
+ *
+ * 2. It does not vouch for a dead root. A ppid is a number, and the number of an
+ *    exited process gets reissued like any other; "child of pid 4123" means nothing
+ *    once 4123 has died and been handed to someone else. The caller must pass only
+ *    roots it has just confirmed alive, which is what makes the link trustworthy —
+ *    a live pid cannot be simultaneously held by anything else.
+ */
+export function descendantsOf(roots) {
+  const parents = processParents();
+  const known = new Set(roots);
+  const found = new Set();
+
+  // Fixed point rather than one pass: the table is in no particular order, so a
+  // grandchild can be visited before the child that links it to us.
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const [pid, ppid] of parents) {
+      if (known.has(pid) || found.has(pid)) continue;
+      if (known.has(ppid) || found.has(ppid)) { found.add(pid); grew = true; }
+    }
+  }
+  return [...found];
 }
 
 /** The token to store alongside a pid so it can be re-identified later. */

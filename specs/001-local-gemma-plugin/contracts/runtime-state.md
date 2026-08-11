@@ -178,11 +178,40 @@ the clear, re-checked immediately before the write, and checked once more afterw
 the claim moved in that last gap, the record is withdrawn only while the bytes on disk are
 still the ones this invocation wrote.
 
-Cancellation also requires **quiescence rather than one empty sample**. The launcher exits
-before the detached descendant it spawned has bound the socket, so a single pass can see no live
-process and no listener while the grandchild is still on its way up. Consecutive empty
-observations are required before a cancellation is called complete — a heuristic, not a proof,
-and it is written down as one.
+**Cancellation tracks descendants, and does not wait to be shown a socket.** The launcher exits
+before the detached descendant it spawned has bound anything, and that descendant then spends
+tens of seconds initialising an engine — so for the whole of that window, every "who holds the
+port" question truthfully answers "nobody" while a process that will shortly serve is very much
+alive. Consecutive empty observations were the only defence, and they bought about 800ms: three
+samples, two 400ms waits. The descendant bound anyway, unrecorded, which is precisely what
+cancelling exists to prevent.
+
+The start therefore walks the process table from the pid it spawned and accumulates everything
+descended from it, sampling from the moment of the spawn and throughout the startup poll. This
+is **not** the ancestry test that ownership rejected, and the distinction is the whole reason it
+is admissible here: `--stop` must be able to stop a server this plugin *adopted*, so requiring
+descent there would refuse exactly the servers `ensureServer` is designed to take over.
+Cancellation is the opposite situation — we spawned the launcher moments ago, and "descended
+from the process I just started" is a stronger claim than any command line, one no bystander can
+forge and no heuristic has to guess at.
+
+Two properties make it sound. **It must sample early and keep sampling**, because a detached
+grandchild is reparented to init the moment its parent exits and no later walk can recover the
+relationship — verified directly: a three-level tree yields two descendants while the middle
+stage lives and *zero* once it exits. And **a root must be alive to vouch for anything**, since
+the ppid of an exited process names whoever the OS has since handed that number to; only live
+roots are used, which is what makes the link trustworthy.
+
+Descent gets a process into the set; it never authorises a signal. Every member carries the
+token captured when it was first seen and is re-proved before each signal, so a reissued pid
+drops out like any other. The quiescence counter stays as a backstop for the one case descent
+cannot cover — a grandchild spawned after the last sample *and* after its parent had exited —
+rather than as the primary evidence.
+
+Sampling is throttled by what a walk costs: Linux reads `/proc` and starts nothing, Windows means
+a PowerShell start-up (~930ms, blocking the loop the readiness probe shares) and so samples every
+3s. On that platform the launcher stages were observed alive together for the whole start, so the
+slower cadence still catches the intermediate long before it exits.
 
 **A teardown that lost its supervisor is unfinished, not finished.** If the watchdog dies
 mid-shutdown, `stopping` is released but `server.pid` is preserved, and the next start must

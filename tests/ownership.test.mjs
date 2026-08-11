@@ -90,6 +90,7 @@ const PORT = {
   abandonedClaim: reservePort(19451),
   preBootClaim: reservePort(19461),
   watchdogTombstone: reservePort(19471),
+  preBindCancel: reservePort(19481),
 };
 
 const spawned = [];
@@ -1197,6 +1198,113 @@ describe('a start that is still in progress', () => {
       assert.notEqual(r.status, 0);
       assert.match(r.stderr, /left over from a shutdown that did not finish/,
         'a pre-boot claim is a stale file, not an active generation');
+    });
+});
+
+describe('cancelling a start whose descendant has not bound yet', () => {
+  /**
+   * The hard case, and the one a listener-based search cannot see.
+   *
+   * A launcher stage hands off to a detached descendant and exits. That descendant
+   * spends tens of seconds initialising an engine before it binds anything, so for
+   * that whole window every "who holds the port" question truthfully answers
+   * "nobody" — while a process that will shortly serve is very much alive.
+   *
+   * Cancellation used to call that quiescence: three empty samples, two 400ms waits,
+   * roughly 800ms of silence treated as proof that nothing was left running. The
+   * descendant then bound anyway, unrecorded, which is the exact outcome cancelling
+   * exists to prevent.
+   *
+   * Timings here are chosen so the ONLY way to pass is to have tracked the descendant
+   * while its parent was alive: the stage exits at 1.5s, the stop lands at 3s, so by
+   * the time cancellation runs the parent link is gone and a fresh walk finds nothing.
+   * Accumulation during the startup poll is the whole answer.
+   */
+  function installHandoffLitertLm(binDir, workDir, port) {
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(workDir, { recursive: true });
+
+    const exe = join(binDir, process.platform === 'win32' ? 'litert-lm.exe' : 'litert-lm');
+    try { linkSync(process.execPath, exe); } catch { copyFileSync(process.execPath, exe); }
+    if (process.platform !== 'win32') chmodSync(exe, 0o755);
+
+    // Binds only after a long delay — an engine warming up, not a fast HTTP server.
+    writeFileSync(join(workDir, 'grandchild.js'), `
+      const { createServer } = require('node:http');
+      const { writeFileSync } = require('node:fs');
+      const { join } = require('node:path');
+      writeFileSync(join(__dirname, 'grandchild.pid'), String(process.pid), 'utf8');
+      setTimeout(() => {
+        createServer((req, res) => {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ object: 'list', data: [{ id: 'fake' }] }));
+        }).listen(${port}, '127.0.0.1');
+      }, 10000);
+      setInterval(() => {}, 1000);
+    `, 'utf8');
+
+    // Alive briefly, then gone — the three real stages were observed coexisting, and
+    // this reproduces that before collapsing to the orphaned-descendant state.
+    writeFileSync(join(workDir, 'serve'), `
+      const { spawn } = require('node:child_process');
+      const { join } = require('node:path');
+      spawn(process.execPath, [join(__dirname, 'grandchild.js')],
+        { detached: true, stdio: 'ignore' }).unref();
+      setTimeout(() => process.exit(0), 1500);
+    `, 'utf8');
+  }
+
+  test('kills a descendant that is alive but has not yet bound', { timeout: 120_000 },
+    async () => {
+      const port = PORT.preBindCancel;
+      const runtime = runtimeDir();
+      const workDir = join(runtime, 'work');
+      const binDir = join(runtime, 'bin');
+      installHandoffLitertLm(binDir, workDir, port);
+
+      const sep = process.platform === 'win32' ? ';' : ':';
+      const client = reap(spawn(process.execPath,
+        [CLIENT, '--list', '--port', String(port), '--idle-timeout', '0'], {
+          cwd: workDir,
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: {
+            ...process.env,
+            LITERT_LM_PLUGIN_RUNTIME: runtime,
+            PATH: `${binDir}${sep}${process.env.PATH ?? ''}`,
+            Path: `${binDir}${sep}${process.env.Path ?? ''}`,
+          },
+        }));
+      let stderr = '';
+      client.stderr.setEncoding('utf8');
+      client.stderr.on('data', (d) => { stderr += d; });
+      const finished = new Promise((r) => client.on('close', (status) => r(status)));
+
+      const pidFile = join(workDir, 'grandchild.pid');
+      assert.ok(await waitFor(() => readIfPresent(pidFile) !== null),
+        'the descendant should have been spawned');
+      const grandchild = Number.parseInt(readIfPresent(pidFile), 10);
+      assert.ok(alive(grandchild), 'and should be running but not yet listening');
+
+      // Long enough that the launcher stage has exited: from here the only way to
+      // know the descendant exists is to have seen it while its parent was alive.
+      await sleep(3000);
+
+      const stop = runClient(['--stop', '--port', String(port)], runtime);
+      assert.equal(stop.status, 0, `--stop should succeed: ${stop.stderr}`);
+
+      const status = await finished;
+      assert.notEqual(status, 0, 'a cancelled start must fail, not quietly succeed');
+      assert.match(stderr, /cancelled by a --stop/);
+
+      // THE ASSERTION. Reporting a clean cancellation is only honest if the
+      // descendant is actually gone; the old code reported exactly this while the
+      // process went on to bind the port seconds later.
+      assert.ok(await waitFor(() => !alive(grandchild), { timeout: 30_000 }),
+        'a descendant that had not bound yet must still be stopped by cancellation');
+
+      assert.doesNotMatch(stderr, /could not be confirmed torn down/,
+        'and having tracked it, cancellation should be able to confirm the teardown');
     });
 });
 

@@ -30,9 +30,9 @@ import { BOOT_TIME_MS, pidAlive, reapMarkers } from './marker-state.mjs';
 // note above them explains which belongs where, and it is worth reading before
 // choosing one.
 import {
-  commandLaunches, formatPidRecord, identifyPortOwners, identities, identity,
-  looksLikeLitertLmServe, parsePidRecord, recordIsStale, resolveTargets, signallablePid,
-  startToken,
+  commandLaunches, descendantsOf, formatPidRecord, identifyPortOwners, identities,
+  identity, looksLikeLitertLmServe, parsePidRecord, recordIsStale, resolveTargets,
+  signallablePid, startToken,
 } from './process-identity.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -574,25 +574,95 @@ function releaseStartClaim(port, spawnedAt) {
 }
 
 /**
+ * How often to walk the process table, set by what a walk costs here.
+ *
+ * Linux reads /proc and starts nothing, so it can sample at the poll rate. Windows
+ * means a PowerShell start-up, measured at ~930ms and blocking the event loop, so
+ * sampling every 750ms poll would starve the readiness probe it shares the loop with.
+ * `ps` on macOS sits between the two and is treated as the cheap case.
+ *
+ * The Windows rate is the one place this is a compromise rather than a free choice,
+ * and it is a survivable one: on that platform the launcher stages coexist for the
+ * whole start (litert-lm.exe -> uv shim -> python were observed alive together), so
+ * a 3s cadence still catches the intermediate long before it exits.
+ */
+const DESCENDANT_SAMPLE_MS = process.platform === 'win32' ? 3000 : 250;
+
+/**
+ * The set of processes this start is responsible for.
+ *
+ * Seeded with the launcher we spawned and grown by sampling the process table while
+ * that launcher — or something already known to descend from it — is still alive.
+ *
+ * ACCUMULATION IS THE POINT. A detached grandchild is reparented to init the instant
+ * its parent exits, so a single walk at cancellation time finds nothing: by then the
+ * only evidence of the relationship is gone. Sampling during the startup poll catches
+ * the link while it still exists, and what is captured stays captured.
+ *
+ * Every member carries the token taken when it was first seen, so membership never
+ * outlives the process itself: `resolveTargets` re-proves each one before any signal,
+ * and a pid that has been reissued fails that comparison and drops out. Descent gets
+ * a process INTO the set; it never authorises a signal on its own.
+ */
+function startGeneration(launcherPid) {
+  const mine = new Map();
+  let lastSample = 0;
+
+  const admit = (pid) => {
+    if (mine.has(pid)) return;
+    const token = startToken(pid);
+    if (token) mine.set(pid, { pid, token });
+  };
+  if (launcherPid) admit(launcherPid);
+
+  return {
+    members: () => [...mine.values()],
+    has: (pid) => mine.has(pid),
+    adopt(owner) { if (!mine.has(owner.pid)) mine.set(owner.pid, owner); },
+
+    /**
+     * Walk the process table and admit anything descended from a LIVE member.
+     *
+     * Live is not a formality. A ppid naming an exited process names whoever the OS
+     * has since handed that number to, so descent from a dead member is not evidence
+     * of anything — and admitting on it would let this set grow to include strangers,
+     * which is the failure the whole module exists to prevent, arriving by a new road.
+     */
+    sample(force = false) {
+      if (!force && Date.now() - lastSample < DESCENDANT_SAMPLE_MS) return;
+      lastSample = Date.now();
+      const live = [...mine.keys()].filter((pid) => pidAlive(pid));
+      if (!live.length) return;
+      for (const pid of descendantsOf(live)) admit(pid);
+    },
+  };
+}
+
+/**
  * Undo a start that a concurrent `--stop` cancelled.
  *
  * Only touches what this invocation is responsible for: the launcher we spawned,
- * and any listener on the port we can prove is a litert-lm serve. Everything else is
- * left exactly as found — a cancelled start is not a licence to tidy up the machine.
+ * everything `generation` has observed descending from it, and any listener on the
+ * port we can prove is a litert-lm serve. Everything else is left exactly as found —
+ * a cancelled start is not a licence to tidy up the machine.
+ *
+ * DESCENT IS WHAT MAKES THE VERDICT MEAN ANYTHING. Listener discovery can only see a
+ * process that has already bound, and the whole difficulty here is the descendant
+ * that has NOT: the launcher exits, its grandchild is still initialising an engine,
+ * and every search that asks "who holds the port" truthfully answers "nobody". The
+ * quiescence counter below used to be the only thing standing between that and a
+ * report of "nothing is left running" — three samples, two 400ms waits, about 800ms
+ * of silence treated as proof. A litert-lm descendant binds after engine init, which
+ * is tens of seconds, so that window could be missed by two orders of magnitude.
+ *
+ * `generation` closes it from the other side: the descendant was admitted while its
+ * parent was still alive, long before it binds anything, so it is already a target
+ * when cancellation starts. The counter stays, now as a backstop for the one case
+ * descent cannot cover — a grandchild spawned in the gap after the last sample and
+ * after its parent had exited — rather than as the primary evidence.
  */
-async function cancelStartedServer(opts, child, spawnedAt) {
+async function cancelStartedServer(opts, generation, child, spawnedAt) {
   const port = opts.port;
-
-  // Start from the one thing we know is ours: the process we spawned. Its listener
-  // descendants are discovered each pass rather than snapshotted once — the whole
-  // reason socket discovery exists is that signalling the launcher does not reach
-  // the grandchild that holds the port, and that grandchild may not have bound yet
-  // when cancellation begins. A single snapshot at the top would miss it entirely.
-  const mine = new Map();
-  if (child.pid) {
-    const token = startToken(child.pid);
-    if (token) mine.set(child.pid, { pid: child.pid, token });
-  }
 
   let conclusive = false;
   let quiet = 0;
@@ -608,13 +678,16 @@ async function cancelStartedServer(opts, child, spawnedAt) {
     // and clean up only the child we spawned.
     const generationIsOurs = ownsStartClaim(port, spawnedAt);
 
+    // Descent is sampled unconditionally: it asks about OUR processes and cannot
+    // reach a newer start's, so the generation boundary has nothing to protect here.
+    // Listener adoption is gated, because the port is shared and a newer start's
+    // socket would otherwise be adopted by a cancellation that has already lost it.
+    generation.sample(true);
     if (generationIsOurs) {
-      for (const owner of classifyPortOwners(opts).ours) {
-        if (!mine.has(owner.pid)) mine.set(owner.pid, owner);
-      }
+      for (const owner of classifyPortOwners(opts).ours) generation.adopt(owner);
     }
 
-    const { alive, unknown } = resolveTargets([...mine.values()]);
+    const { alive, unknown } = resolveTargets(generation.members());
     // `unknown` is not "gone". Ending the loop on a transient lookup failure would
     // let this report "nothing is left running" while the overtaken server carried
     // on coming up, unrecorded — the exact outcome cancellation exists to prevent.
@@ -649,7 +722,7 @@ async function cancelStartedServer(opts, child, spawnedAt) {
     // the cleanup rather than to the kill. Not signalling a process whose only
     // identity you then discard is not restraint.
     const rec = parsePidRecord(readState(port, 'server.pid', ''));
-    if (rec === null || mine.has(rec.pid) || rec.pid === child.pid) {
+    if (rec === null || generation.has(rec.pid) || rec.pid === child.pid) {
       clearState(port, 'server.pid');
     }
     return true;
@@ -657,7 +730,7 @@ async function cancelStartedServer(opts, child, spawnedAt) {
 
   // Could not finish. Leave the identity behind so `--stop` can pick it up, rather
   // than reporting a clean cancellation we did not achieve.
-  const left = [...mine.values()].filter((t) => t.token);
+  const left = generation.members().filter((t) => t.token);
   if (left.length) {
     writeState(port, 'survivors', left.map((t) => `${t.pid} ${t.token}`).join('\n'));
   }
@@ -814,7 +887,18 @@ async function ensureServer(opts) {
   // Record the identity now, while the process is still the one we just spawned —
   // and only if the OS still says so. Asked for later, the answer could already be
   // about whoever inherited the pid.
+  // Start tracking descendants NOW, not when cancellation begins.
+  //
+  // The link between our launcher and the process that will actually serve exists
+  // only while the launcher is alive — a detached grandchild is reparented to init
+  // the moment its parent exits, and no later walk can recover the relationship. The
+  // first sample is forced and immediate for exactly that reason: on Linux a stage
+  // that hands off and exits can be gone within milliseconds of `recordSpawnedPid`.
+  const generation = startGeneration(child.pid);
+  generation.sample(true);
+
   await recordSpawnedPid(opts.port, 'server.pid', child, exe, spawnedAt);
+  generation.sample(true);      // again, now that the identity lookup has cost us time
   // Prune, not wipe: another client may have acquired a marker against this same
   // new server between our spawn and this line.
   pruneInFlight(opts.port);
@@ -823,6 +907,11 @@ async function ensureServer(opts) {
   const deadline = Date.now() + opts.startupTimeoutMs;
   while (Date.now() < deadline) {
     await sleep(750);
+
+    // Keep watching the tree while the server comes up. Throttled by
+    // DESCENDANT_SAMPLE_MS rather than run every pass, because on Windows a walk is a
+    // PowerShell start-up that blocks the loop this probe shares.
+    generation.sample();
 
     // A concurrent `--stop` cancels this start, and cancelling has to mean stopping.
     //
@@ -833,7 +922,7 @@ async function ensureServer(opts) {
     // undo itself, not just stay quiet about it.
     const stoppedAt = Number.parseInt(readState(opts.port, 'stopped-at', ''), 10);
     if (Number.isFinite(stoppedAt) && stoppedAt > spawnedAt) {
-      const clean = await cancelStartedServer(opts, child, spawnedAt);
+      const clean = await cancelStartedServer(opts, generation, child, spawnedAt);
       throw new Error(clean
         ? 'the server start was cancelled by a --stop that ran at the same time.\n'
           + '  Nothing is left running. Retry if you did want it started.'
