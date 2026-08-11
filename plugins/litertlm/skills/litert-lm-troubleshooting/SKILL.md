@@ -349,7 +349,34 @@ If `--stop` says nothing was running while a server clearly is, check that the l
 is `litert-lm` — `Get-NetTCPConnection -LocalPort 9379 -State Listen` on Windows, `lsof -i :9379`
 elsewhere.
 
+Check the **local address** in that output as well, not just the port. Ownership is scoped to
+the address this plugin talks to (`127.0.0.1` unless you changed it), because two servers can
+hold one port on different interfaces at once. A `litert-lm serve --host 0.0.0.0` started by
+hand is covered — a wildcard bind does answer loopback — but one bound to a specific LAN address
+is a different server and is deliberately left alone.
+
 `--idle-timeout 0` disables automatic shutdown entirely.
+
+### "another invocation is already starting the server"
+
+Two calls arrived while the server was cold. Starting takes tens of seconds, so the second one
+waits for the first rather than launching a competing server; the message is progress, not an
+error, and the request proceeds normally once the socket answers.
+
+If it instead reports that a start **has not become reachable** within the startup timeout, the
+first start is wedged rather than slow. Nothing has been changed, so retrying is safe. Run
+`--stop` only if retrying keeps landing on the same message: during a healthy start that is the
+one command that will break it.
+
+### "pid … is left over from a shutdown that did not finish"
+
+One of this plugin's processes is still alive but no longer listening — usually a server that
+closed its socket and hung in teardown while still holding accelerator memory. Starting a second
+server beside it would lose track of the first, so the start refuses and names the pid.
+
+Run `--stop`, which can find it by the recorded identity even though it is off the port, then
+retry. This is distinct from the message above: that one means a start is *in progress*, this
+one means a shutdown *ended badly*.
 
 ---
 

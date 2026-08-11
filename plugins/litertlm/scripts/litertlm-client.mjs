@@ -23,7 +23,7 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 // The marker rule lives in one file so this and the watchdog cannot drift apart.
-import { pidAlive, reapMarkers } from './marker-state.mjs';
+import { BOOT_TIME_MS, pidAlive, reapMarkers } from './marker-state.mjs';
 
 // Ownership — who we are allowed to signal — is defined once, for the same reason.
 // `recordIsStale` and `signallablePid` answer deliberately different questions; the
@@ -155,6 +155,47 @@ function stateWrittenAt(port, name) {
 }
 
 /**
+ * The `starting` claim on this port: which generation owns it, and who published it.
+ *
+ * Written by `ensureServer` as `<spawnedAt> <pid>`. The pid is what makes the claim
+ * falsifiable — a start that crashes cannot release its own claim, and without a way
+ * to tell an abandoned claim from a live one the file would lock the port out of
+ * every future start.
+ */
+function readStartClaim(port) {
+  const m = String(readState(port, 'starting', '')).trim().match(/^(\d+)(?:\s+(\d+))?$/);
+  if (m === null) return null;
+  return {
+    spawnedAt: Number.parseInt(m[1], 10),
+    pid: m[2] === undefined ? null : Number.parseInt(m[2], 10),
+  };
+}
+
+/**
+ * The claim, but only if someone is still behind it.
+ *
+ * Hygiene-grade on purpose, and that is the right grade here: this decides whether to
+ * WAIT, never whether to signal. The two questions are separated for a reason (see
+ * the note in process-identity.mjs), and paying for identity on the warm start path
+ * would buy nothing — the worst case of getting this wrong is a bounded wait that
+ * ends in the same refusal it would have reached immediately.
+ *
+ * A claim with no pid is treated as abandoned. Only this version writes the file and
+ * it always writes the pid, so a claim without one came from somewhere we cannot
+ * reason about, and the safe reading is the one that does not block.
+ */
+function liveStartClaim(port) {
+  const claim = readStartClaim(port);
+  if (claim === null || claim.pid === null) return null;
+  const writtenAt = stateWrittenAt(port, 'starting');
+  if (writtenAt !== null && writtenAt < BOOT_TIME_MS) return null;   // predates this boot
+  return pidAlive(claim.pid) ? claim : null;
+}
+
+/** Does this invocation's generation still own the claim? */
+const ownsStartClaim = (port, spawnedAt) => readStartClaim(port)?.spawnedAt === spawnedAt;
+
+/**
  * Record a process we just spawned, with the token that re-identifies it.
  *
  * Establishing identity is not instantaneous — on Windows it starts PowerShell,
@@ -173,8 +214,18 @@ function stateWrittenAt(port, name) {
  *
  * Nothing recorded means `--stop` falls back to socket-owner discovery, which is
  * the right answer when we have nothing trustworthy to say.
+ *
+ * BOTH ENDS ARE GATED ON THE `starting` CLAIM, and the opening one matters as much as
+ * the closing one. `server.pid` is a single shared slot: a newer start publishes into
+ * it, so an older generation that cleared the slot on the way in erased an identity
+ * that was never its own — a live server left unrecorded by the act of recording
+ * something else. And publishing is not instantaneous either. Everything between the
+ * two gates costs real time (a process lookup is seconds on Windows), which is
+ * precisely the window in which the claim changes hands, so ownership is re-asked
+ * immediately before the write rather than assumed to have survived it.
  */
 async function recordSpawnedPid(port, name, child, exe, spawnedAt) {
+  if (!ownsStartClaim(port, spawnedAt)) return false;
   clearState(port, name);
   if (!child.pid) return false;
 
@@ -204,7 +255,21 @@ async function recordSpawnedPid(port, name, child, exe, spawnedAt) {
   const stoppedAt = Number.parseInt(readState(port, 'stopped-at', ''), 10);
   if (Number.isFinite(stoppedAt) && stoppedAt > spawnedAt) return false;
 
-  writeState(port, name, formatPidRecord(child.pid));
+  // Warm — `identity(child.pid)` above already paid for it — so the gap between this
+  // check and the write is a couple of syscalls rather than a PowerShell start-up.
+  const record = formatPidRecord(child.pid);
+  if (!ownsStartClaim(port, spawnedAt)) return false;
+  writeState(port, name, record);
+
+  // And once more afterwards, because "check then write" is two operations and a
+  // newer generation can land between them. If it did, ours is the stale record and
+  // has to go — but only while the bytes on disk are still the ones we wrote. If the
+  // newer start has already published its own, removing it would repeat the mistake
+  // this whole function is gated to prevent, one step further along.
+  if (!ownsStartClaim(port, spawnedAt)) {
+    if (readState(port, name, '') === record) clearState(port, name);
+    return false;
+  }
   return true;
 }
 
@@ -423,6 +488,10 @@ function startWatchdog(opts) {
       process.execPath,
       [join(HERE, 'idle-watchdog.mjs'), '--port', String(opts.port),
         '--idle-timeout', String(opts.idleTimeout),
+        // The watchdog decides socket ownership by local address as well as port, so
+        // it has to be told the same address this client talks to. Left to its own
+        // default it would judge a different socket from the one being supervised.
+        '--host', opts.host,
         // So a `--stop` landing before this child has published its pid can still
         // invalidate it. Without this the child is invisible to that stop and would
         // publish a supervisor record over the state it had just cleared.
@@ -484,9 +553,7 @@ function resolveLitertLm() {
  * was supposed to wait for has even bound.
  */
 function releaseStartClaim(port, spawnedAt) {
-  if (Number.parseInt(readState(port, 'starting', ''), 10) === spawnedAt) {
-    clearState(port, 'starting');
-  }
+  if (ownsStartClaim(port, spawnedAt)) clearState(port, 'starting');
 }
 
 /**
@@ -522,11 +589,10 @@ async function cancelStartedServer(opts, child, spawnedAt) {
     // one. `starting` is written by each start and names the generation that owns
     // the port right now; when it is no longer ours, we stop reaching for listeners
     // and clean up only the child we spawned.
-    const claim = Number.parseInt(readState(port, 'starting', ''), 10);
-    const generationIsOurs = claim === spawnedAt;
+    const generationIsOurs = ownsStartClaim(port, spawnedAt);
 
     if (generationIsOurs) {
-      for (const owner of classifyPortOwners(port).ours) {
+      for (const owner of classifyPortOwners(opts).ours) {
         if (!mine.has(owner.pid)) mine.set(owner.pid, owner);
       }
     }
@@ -581,6 +647,40 @@ async function cancelStartedServer(opts, child, spawnedAt) {
   return false;
 }
 
+/**
+ * Wait out another invocation's start rather than mistaking it for debris.
+ *
+ * A start is not atomic: `server.pid` is published seconds before the socket answers,
+ * so between those two moments the state on disk looks exactly like the wreckage of a
+ * shutdown that did not finish — a live, recorded, provably-ours pid with nothing
+ * listening. The leftover check below read it that way and told the user to run
+ * `--stop`, which is the one thing that would actually break the valid start in
+ * progress.
+ *
+ * `starting` already distinguishes the two, and it is the file that exists to say
+ * which generation owns the port right now. A live claim means the pid is a server on
+ * its way up, not a corpse.
+ *
+ * Bounded by the same `startupTimeoutMs` the start itself gets, and re-reads the claim
+ * each pass: a claim that disappears means that start finished or gave up, and the
+ * caller should go back to judging the state on its merits. A NEWER claim replacing
+ * the one we first saw is still an active start, so any live claim keeps us waiting.
+ */
+async function awaitConcurrentStart(opts) {
+  if (liveStartClaim(opts.port) === null) return null;
+  process.stderr.write('[litertlm] another invocation is already starting the server; '
+    + 'waiting for it rather than starting a second one...\n');
+
+  const deadline = Date.now() + opts.startupTimeoutMs;
+  while (Date.now() < deadline) {
+    await sleep(500);
+    const up = await probe(opts);
+    if (up) return up;
+    if (liveStartClaim(opts.port) === null) return null;
+  }
+  return null;
+}
+
 async function ensureServer(opts) {
   reconcileState(opts.port, await probe(opts, 1000));
 
@@ -590,6 +690,15 @@ async function ensureServer(opts) {
   if (existing) {
     startWatchdog(opts);              // adopt a server nothing is supervising
     return { models: existing, started: false };
+  }
+
+  // Before reading the state as debris, ask whether it belongs to a start that is
+  // still happening. Ordered ahead of the leftover check deliberately: the two
+  // situations produce identical state files and only `starting` tells them apart.
+  const adopted = await awaitConcurrentStart(opts);
+  if (adopted) {
+    startWatchdog(opts);
+    return { models: adopted, started: false };
   }
 
   // A teardown that lost its supervisor is unfinished, not finished.
@@ -621,6 +730,18 @@ async function ensureServer(opts) {
   });
   const leftover = resolveTargets(held);
   if (leftover.alive.length || leftover.unknown.length) {
+    // A claim that is STILL live here means the wait above ran out of patience, not
+    // that anything died badly. Saying "run --stop" would be advice to break a valid
+    // start, so the two verdicts are reported as the different things they are.
+    const claim = liveStartClaim(opts.port);
+    if (claim !== null) {
+      throw new Error(
+        `another invocation (pid ${claim.pid}) is still starting a server on `
+        + `${baseUrl(opts)}, and it has not become reachable within `
+        + `${opts.startupTimeoutMs / 1000}s.\n`
+        + '  Nothing here is stale, so nothing has been changed. Retry in a moment.\n'
+        + '  If that start is wedged rather than slow, stop it with --stop first.');
+    }
     throw new Error(
       `pid ${[...leftover.alive, ...leftover.unknown].join(', ')} is left over from a `
       + 'shutdown that did not finish.\n'
@@ -745,8 +866,13 @@ async function ensureServer(opts) {
  *
  * Unidentified owners are never signalled — we cannot prove they are ours — but they
  * do block the success verdict, because "I could not tell" is not "it is not mine".
+ *
+ * Scoped to `opts.host` as well as the port. A second litert-lm server bound to
+ * another local address on the same port passes the command-line test and is not
+ * ours by any reading; the port number alone could not say so.
  */
-const classifyPortOwners = (port) => identifyPortOwners(port, looksLikeLitertLmServe);
+const classifyPortOwners = (opts) =>
+  identifyPortOwners(opts.port, looksLikeLitertLmServe, opts.host);
 
 /**
  * Of `targets`, those still running as themselves — and those we could not judge.
@@ -775,7 +901,7 @@ async function stopProcesses(opts) {
   const PID_FILES = ['watchdog.pid', 'server.pid'];
   const recordedByName = ownedPids(port, PID_FILES);
   const recorded = [...recordedByName.values()];
-  const { ours, strangers, unidentified } = classifyPortOwners(port);
+  const { ours, strangers, unidentified } = classifyPortOwners(opts);
 
   // Survivors of a PREVIOUS failed stop, which the two pid slots could not hold.
   //
@@ -797,9 +923,18 @@ async function stopProcesses(opts) {
     if (!targets.some((seen) => seen.pid === t.pid)) targets.push(t);
   }
 
-  // A recorded target we could not look up at all is unknown, not absent.
-  const unresolvedRecords = [...recorded, ...(watchdogRecord ? [watchdogRecord] : [])]
-    .filter((r) => r.unresolved).map((r) => r.pid);
+  // A recorded target we could not look up at all is unknown, not absent — but that
+  // is a verdict about a MOMENT, and it is deliberately not cached here.
+  //
+  // It used to be. The pids whose first lookup failed were collected once, before any
+  // signal, and unconditionally folded back into `unknown` at the end. A lookup that
+  // failed transiently and then succeeded — the process identified, signalled, and
+  // confirmed gone by the escalation loop — was still reported as unjudgeable, so a
+  // completed stop came out as a failure, kept state it should have cleared, and told
+  // the user to inspect a pid that no longer exists. `resolveTargets` re-asks the OS
+  // on every pass and already returns a fresh `unknown`; a second, staler opinion
+  // could only ever contradict it. The one target that never reaches those passes is
+  // the watchdog, and it gets its own fresh check below rather than a remembered one.
 
   // Refuse to tear down a system we cannot see all of.
   //
@@ -848,15 +983,18 @@ async function stopProcesses(opts) {
     // and its state kept, when it had in fact just exited.
     await sleep(200);
     ({ alive: remaining, unknown } = stillAlive(targets));
-    unknown = [...new Set([...unknown, ...unidentified, ...unresolvedRecords])];
   } else {
     // Nothing was signallable — but `unknown` is NOT cleared here. It was, and that
     // turned "could not determine" straight back into "confirmed gone": with no
     // signal to send, the whole unjudgeable set was discarded, the verdict came out
     // clean, and the state was cleared. The one thing the three-state split exists to
     // prevent, undone by the branch that runs when there is nothing to do.
+    //
+    // What `unknown` holds here is the verdict `stillAlive(targets)` reached moments
+    // ago, which is the freshest one available: nothing has been signalled, so nothing
+    // about those processes can have changed because of us.
     remaining = [];
-    unknown = [...new Set([...unknown, ...unidentified, ...unresolvedRecords])];
+    unknown = [...new Set(unknown)];
   }
 
   // The watchdog goes LAST, and only once the server is confirmed gone.
@@ -873,8 +1011,14 @@ async function stopProcesses(opts) {
   // `watchdog.pid`, wrote the success tombstone, and reported both processes
   // confirmed exited on the strength of the server's result alone. A supervisor that
   // ignored the signal was left running with its identity deleted.
+  //
+  // A record whose earlier lookup failed is NOT skipped here. It used to be, and the
+  // skip was what made that failure permanent: the record could never be re-judged, so
+  // it went to the verdict as unjudgeable however long the process had been gone.
+  // `stillAlive` drops the identity cache and asks the OS again, which answers all
+  // three cases properly — gone, ours and signallable, or still unreadable.
   const serverGone = remaining.length === 0 && unknown.length === 0;
-  if (serverGone && watchdogRecord !== null && !watchdogRecord.unresolved) {
+  if (serverGone && watchdogRecord !== null) {
     let watchdogState = stillAlive([watchdogRecord]);
     for (const pid of watchdogState.alive) {
       try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
