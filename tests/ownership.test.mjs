@@ -89,6 +89,7 @@ const PORT = {
   concurrentStart: reservePort(19441),
   abandonedClaim: reservePort(19451),
   preBootClaim: reservePort(19461),
+  watchdogTombstone: reservePort(19471),
 };
 
 const spawned = [];
@@ -719,6 +720,38 @@ describe('the idle watchdog', () => {
       try { responder.kill('SIGKILL'); } catch { /* ignore */ }
     });
 
+  // A stop can land AFTER a watchdog has published, and the two start-up checks
+  // cannot see it: the tombstone is written last, at the very end of `--stop`, so a
+  // watchdog that published anywhere inside that command checked a `stopped-at` that
+  // did not exist yet. It then went on supervising a server that had been torn down,
+  // and — because it stayed the registered supervisor — the next client saw a live
+  // `watchdog.pid`, declined to spawn one, and had its server adopted by this process
+  // under the previous invocation's idle-timeout.
+  test('stands down when a stop lands after it has published', { timeout: 60_000 },
+    async () => {
+      const port = PORT.watchdogTombstone;
+      const runtime = runtimeDir();
+      const dir = stateDir(runtime, port);
+      const spawnedAt = Date.now();
+
+      const watchdog = reap(spawn(process.execPath,
+        [WATCHDOG, '--port', String(port), '--idle-timeout', '900',
+          '--spawned-at', String(spawnedAt)],
+        { stdio: 'ignore', windowsHide: true,
+          env: { ...process.env, LITERT_LM_PLUGIN_RUNTIME: runtime } }));
+
+      assert.ok(await waitFor(() => recordedPid(dir) === watchdog.pid),
+        'the watchdog should hold the slot before the stop arrives');
+
+      // A `--stop` completes and writes its tombstone, as it does last of all.
+      writeFileSync(join(dir, 'stopped-at'), String(spawnedAt + 1000), 'utf8');
+
+      assert.ok(await waitFor(() => watchdog.exitCode !== null, { timeout: 40_000 }),
+        'a superseded supervisor must stand down, not supervise a torn-down server');
+      assert.equal(readIfPresent(join(dir, 'watchdog.pid')), null,
+        'and release the slot, so the next client is free to start a fresh one');
+    });
+
   // The other half of an exclusive claim: it must not become a lock. A record left
   // by a crashed watchdog has to be reclaimable, or no watchdog ever starts on this
   // port again and the server holds accelerator memory until someone runs --stop.
@@ -967,6 +1000,12 @@ describe('scoping socket ownership to the local address', () => {
       ['::1', '127.0.0.1'],          // a v6 loopback is not reachable over v4
       ['127.0.0.1', '::1'],
       ['0.0.0.0', '::1'],            // a v4 wildcard does not answer v6 callers
+      // And the converse, which is NOT symmetric-looking until you ask why: `::`
+      // is dual-stack only when IPV6_V6ONLY is off, and no OS query here reports
+      // that. An IPv6-only listener admitted to a v4 client is the cross-interface
+      // kill this filter exists to prevent, so an unprovable wildcard is excluded.
+      ['::', '127.0.0.1'],
+      ['0:0:0:0:0:0:0:0', '127.0.0.1'],
     ]) {
       assert.equal(addressServes(address, host), false, `${address} vs ${host}`);
     }
@@ -977,7 +1016,7 @@ describe('scoping socket ownership to the local address', () => {
       ['127.0.0.1', '127.0.0.1'],
       ['0.0.0.0', '127.0.0.1'],
       ['*', '127.0.0.1'],
-      ['::', '127.0.0.1'],              // dual-stack, so it answers v4 too
+      ['::', '::1'],                    // a wildcard does serve its own family
       ['[::1]', '::1'],                 // ss and lsof bracket v6 addresses
       ['::ffff:127.0.0.1', '127.0.0.1'],
       ['fe80::1%lo0', 'fe80::1'],       // a scope id names an interface, not an address
@@ -993,6 +1032,9 @@ describe('scoping socket ownership to the local address', () => {
     assert.equal(addressServes('127.0.0.1', 'localhost'), true);
     assert.equal(addressServes('::1', 'localhost'), true);
     assert.equal(addressServes('192.168.1.5', 'localhost'), false);
+    // A name can resolve to either family, so neither wildcard can be ruled out.
+    assert.equal(addressServes('0.0.0.0', 'localhost'), true);
+    assert.equal(addressServes('::', 'localhost'), true);
   });
 
   // Not evidence of a foreign bind — the absence of evidence. Dropping these would

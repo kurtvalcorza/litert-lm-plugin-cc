@@ -192,8 +192,25 @@ function liveStartClaim(port) {
   return pidAlive(claim.pid) ? claim : null;
 }
 
-/** Does this invocation's generation still own the claim? */
-const ownsStartClaim = (port, spawnedAt) => readStartClaim(port)?.spawnedAt === spawnedAt;
+/**
+ * Does this invocation's generation still own the claim?
+ *
+ * BOTH FIELDS, because a millisecond is not an identity. This compared `spawnedAt`
+ * alone, and `spawnedAt` is `Date.now()`: two clients that both find no claim and
+ * then stamp the same millisecond write different records that compare equal, so each
+ * reads the OTHER's claim as its own. The older one may then clear or overwrite the
+ * newer one's `server.pid`, release a claim it does not hold, or adopt its listener
+ * while cancelling — every failure the claim was introduced to prevent, reachable
+ * through a tie the comparison could not see.
+ *
+ * The pid is what breaks the tie. Only the process that wrote the claim can match it,
+ * and a claim is always written with `process.pid`, so a collision on the timestamp
+ * alone no longer collides on the generation.
+ */
+const ownsStartClaim = (port, spawnedAt) => {
+  const claim = readStartClaim(port);
+  return claim !== null && claim.spawnedAt === spawnedAt && claim.pid === process.pid;
+};
 
 /**
  * Record a process we just spawned, with the token that re-identifies it.
@@ -916,7 +933,7 @@ async function stopProcesses(opts) {
       && !recordIsStale(rec, stateWrittenAt(port, 'survivors')));
 
   // The SERVER targets. The watchdog is deliberately not among them — see below.
-  const watchdogRecord = recordedByName.get('watchdog.pid') ?? null;
+  let watchdogRecord = recordedByName.get('watchdog.pid') ?? null;
   const targets = [];
   for (const t of [...recorded, ...ours, ...carried]) {
     if (t.pid === watchdogRecord?.pid) continue;
@@ -1018,6 +1035,29 @@ async function stopProcesses(opts) {
   // `stillAlive` drops the identity cache and asks the OS again, which answers all
   // three cases properly — gone, ours and signallable, or still unreadable.
   const serverGone = remaining.length === 0 && unknown.length === 0;
+
+  // The slot is RE-READ here rather than taken from the snapshot at the top.
+  //
+  // A watchdog spawned before this stop can publish DURING it. It is in no pid file
+  // when `ownedPids` runs, so the snapshot says there is no supervisor; its own two
+  // invalidation checks pass because the tombstone they look for is written last, at
+  // the end of this function. The stop then signalled nothing, cleared `watchdog.pid`
+  // — destroying the identity of a process it had never seen — and reported both
+  // processes confirmed gone while a live supervisor went on running.
+  //
+  // Everything below already knows how to chase and re-check a watchdog record, so
+  // the fix is to give it the current one. The watchdog now re-checks the tombstone on
+  // every poll as well; that closes the same hole from the other side, and neither
+  // makes the other redundant — this one keeps the VERDICT honest, that one bounds how
+  // long a superseded supervisor lives.
+  if (watchdogRecord === null) {
+    const late = pidRecord(port, 'watchdog.pid');
+    if (late !== null && late.token !== null
+      && !recordIsStale(late, stateWrittenAt(port, 'watchdog.pid'))) {
+      watchdogRecord = late;
+    }
+  }
+
   if (serverGone && watchdogRecord !== null) {
     let watchdogState = stillAlive([watchdogRecord]);
     for (const pid of watchdogState.alive) {
@@ -1055,7 +1095,12 @@ async function stopProcesses(opts) {
   const survivors = new Set([...remaining, ...unknown]);
   const kept = new Set();
   for (const name of PID_FILES) {
-    const rec = recordedByName.get(name);
+    // The watchdog's record comes from `watchdogRecord`, not the opening snapshot: a
+    // supervisor that published mid-stop is absent from the snapshot, and reading the
+    // slot from there would clear the identity of a process that is still running.
+    const rec = name === 'watchdog.pid'
+      ? (watchdogRecord ?? undefined)
+      : recordedByName.get(name);
     // The watchdog we chose not to signal keeps its record too. Clearing it would
     // orphan a live supervisor: still running, but invisible to the next client,
     // which would start a second one and leave this one de-supervising nothing.

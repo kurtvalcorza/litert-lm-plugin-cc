@@ -240,9 +240,20 @@ function normaliseAddress(addr) {
  * its command line and signal it, which is the same class of accident as killing a
  * bystander by pid: the identity test passed, the location test was never asked.
  *
- * Wildcards are a match, because they genuinely serve our host: a socket on
- * `0.0.0.0` receives what we send to 127.0.0.1, and `::` is dual-stack by default on
- * every platform this runs on, so it serves both families.
+ * A WILDCARD SERVES ITS OWN FAMILY, AND ONLY ITS OWN. `::` is dual-stack on some
+ * hosts and IPv6-only on others — it turns on `IPV6_V6ONLY`, which none of the three
+ * platform queries below reports, so we cannot tell the two apart from here. An
+ * earlier version read `::` as serving everything on the grounds that dual-stack is
+ * the common default. That admits an IPv6-only `litert-lm serve` on `:::9379` as the
+ * owner of a socket a client on 127.0.0.1 cannot reach, and `--stop` would then
+ * terminate it: precisely the cross-interface kill this function exists to prevent,
+ * reintroduced by the case meant to be generous. Unprovable is excluded, as
+ * everywhere else in this module — the cost is a hand-started server on `::` being
+ * reported as a stranger and left running, which is visible and recoverable.
+ *
+ * `localhost` is the exception, and not a grudging one: it is a NAME that resolves to
+ * either family depending on the resolver, so neither wildcard can be ruled out and
+ * both are accepted.
  *
  * `host` of null means the caller wants every listener regardless of address.
  *
@@ -260,13 +271,15 @@ export function addressServes(listenAddress, host) {
   if (a === '' || a === '*') return true;
   const h = normaliseAddress(host);
   if (a === h) return true;
-  if (a === '0.0.0.0') return !h.includes(':');      // v4 wildcard, v4 callers only
-  if (a === '::' || a === '0:0:0:0:0:0:0:0') return true;          // dual-stack
-  // `localhost` is a NAME, and it resolves to either loopback address depending on
-  // the host's resolver. A literal address is compared literally: a listener on ::1
-  // is unreachable from a client configured with 127.0.0.1, so it is not ours.
-  if (h === 'localhost') return a === '127.0.0.1' || a === '::1';
-  return false;
+
+  const isWildcard = a === '0.0.0.0' || a === '::' || a === '0:0:0:0:0:0:0:0';
+  if (!isWildcard) {
+    // A literal address is compared literally: a listener on ::1 is unreachable from
+    // a client configured with 127.0.0.1, so it is not ours however loopback it looks.
+    return h === 'localhost' && (a === '127.0.0.1' || a === '::1');
+  }
+  if (h === 'localhost') return true;                  // either family may be the one
+  return h.includes(':') ? a !== '0.0.0.0' : a === '0.0.0.0';
 }
 
 /**

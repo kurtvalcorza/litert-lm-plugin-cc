@@ -78,10 +78,20 @@ the same port on different local addresses at once — ours on `127.0.0.1:9379`,
 `ss`) reports both. Matching on the number alone therefore let the command-line test prove a
 second, unrelated litert-lm "ours" and signal it: identity passed, location was never asked.
 Discovery now reads the local address alongside the pid and keeps only listeners that would
-answer the host this client talks to. Wildcards count, because they genuinely do answer it
-(`0.0.0.0` serves v4 callers, `::` is dual-stack); a literal host is compared literally, since a
+answer the host this client talks to. A literal host is compared literally, since a
 socket on `::1` is unreachable from a client configured with `127.0.0.1`. The watchdog is passed
 `--host` for the same reason — supervising the socket we talk to means asking about that socket.
+
+**A wildcard serves its own family, and only its own.** `0.0.0.0` answers v4 callers; `::`
+answers v6 callers. Reading `::` as dual-stack — true on many hosts, and the obvious
+generalisation — was wrong: dual-stack depends on `IPV6_V6ONLY`, which none of the three
+platform queries reports. An IPv6-only `litert-lm serve` on `:::9379` would then be admitted as
+the owner of a socket a `127.0.0.1` client cannot reach, and `--stop` would terminate it —
+exactly the cross-interface kill the filter exists to prevent, reintroduced by the case meant to
+be generous. Unprovable is excluded, as everywhere else here. The cost is a hand-started server
+on `::` being reported as a stranger and left running, which is visible and recoverable.
+`localhost` is the one exception, and not a grudging one: it is a name that resolves to either
+family, so neither wildcard can be ruled out and both are accepted.
 
 An address the platform query did not yield is treated as a match. That is the absence of
 evidence, not evidence of a foreign bind, and dropping such a listener would silently disarm
@@ -95,6 +105,18 @@ in no pid file yet, so it cannot be a target, and it would go on to install itse
 of a server that has just been torn down. The watchdog therefore compares this stamp against
 when it was spawned (`--spawned-at`), before claiming and again after, and stands down if a stop
 has intervened.
+
+**The comparison is repeated on every poll, not only at start-up.** A stop can land *after* a
+watchdog has published: the tombstone is written last, at the very end of `--stop`, so a
+watchdog that published anywhere inside that command passed both of its start-up checks against
+a `stopped-at` that did not yet exist. It then supervised a server that had already been torn
+down and — worse — stayed the registered supervisor, so the next client saw a live
+`watchdog.pid`, declined to spawn one, and had its server adopted by a process running under the
+previous invocation's idle-timeout. `--stop` closes the same hole from its own side by re-reading
+the `watchdog.pid` slot before the success verdict rather than trusting the snapshot it took at
+the start; neither check makes the other redundant. The client's keeps the *verdict* honest — a
+stop must not report both processes gone while a supervisor it never saw is running — and the
+watchdog's bounds how long a superseded supervisor lives.
 
 It is deliberately a timestamp rather than a reachability check. "The server does not answer"
 and "the server is gone" are different claims — a model switch produces the first for tens of
@@ -136,6 +158,14 @@ had lost the generation still deleted the shared `server.pid`, discarding the id
 newer start had just published. Not signalling a process whose only identity you then discard
 is not restraint. Every release compares the claim first, and `server.pid` is cleared only
 while it still names one of the cancelling invocation's own targets.
+
+**The generation is `<spawned-at-ms> <client-pid>`, and ownership compares both.** The timestamp
+alone is not an identity: it is `Date.now()`, so two clients that both find no claim and then
+stamp the same millisecond write different records that compare equal, and each reads the
+other's claim as its own. The older one could then clear or overwrite the newer one's
+`server.pid`, release a claim it did not hold, or adopt its listener while cancelling — every
+failure the claim exists to prevent, reached through a tie the comparison could not see. The pid
+breaks the tie, because only the process that wrote a claim can match it.
 
 **Recording a spawned pid is gated on the claim at both ends, and the opening gate matters as
 much as the closing one.** `server.pid` is a single shared slot. Recording used to clear it on

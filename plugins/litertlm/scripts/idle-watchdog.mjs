@@ -340,6 +340,18 @@ async function main() {
     const owner = parsePidRecord(readState('watchdog.pid', ''));
     if (owner?.pid !== process.pid) process.exit(0);
 
+    // A stop can also land AFTER we published, and the two checks at start-up cannot
+    // see it. The tombstone is written last, at the very end of a successful `--stop`,
+    // so a watchdog that published anywhere inside that command passed both of its
+    // checks against a `stopped-at` that did not exist yet. It then supervised a
+    // server the stop had already torn down — and, worse, stayed the registered
+    // supervisor, so the next client saw a live `watchdog.pid`, declined to spawn one,
+    // and its server was adopted by this process under the previous invocation's
+    // idle-timeout. The predicate is the same one used at start-up and needs no
+    // clearing: a watchdog spawned after the stop has a later `spawnedAt` and is
+    // untouched by it.
+    if (invalidatedByStop()) cleanupAndExit(0);
+
     // A model switch tears the engine down and re-initialises it, so the server is
     // legitimately unreachable for tens of seconds *while a request is in flight*.
     // Treating the first failed probe as "gone" would abandon supervision at the
