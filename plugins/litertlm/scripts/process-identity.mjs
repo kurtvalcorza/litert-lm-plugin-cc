@@ -214,16 +214,74 @@ export function forgetIdentities(pids) {
 // ---------------------------------------------------------------------------
 
 /**
- * litert-lm is a multi-stage launcher: the pid we spawned is not the process that
- * ends up holding the socket, so the recorded pid alone can never stop the server.
- * Asking the OS who owns the port is the only reliable answer.
+ * Reduce a listen address to a comparable form.
+ *
+ * The three OS queries spell the same socket three ways — `[::1]`, `::1`, and
+ * `::ffff:127.0.0.1` are all real output — so they are normalised before any of them
+ * is compared. Scope ids (`fe80::1%lo0`) name an interface, not an address, and are
+ * dropped for the same reason.
+ */
+function normaliseAddress(addr) {
+  let a = String(addr ?? '').trim().toLowerCase();
+  if (a.startsWith('[') && a.endsWith(']')) a = a.slice(1, -1);
+  const scope = a.indexOf('%');
+  if (scope !== -1) a = a.slice(0, scope);
+  if (a.startsWith('::ffff:')) a = a.slice(7);
+  return a;
+}
+
+/**
+ * Would a listener bound to `listenAddress` answer a request we send to `host`?
+ *
+ * A PORT IS NOT A SOCKET. Two servers may hold the same port on different local
+ * addresses at once — ours on 127.0.0.1:9379 and another litert-lm on
+ * 192.168.1.5:9379 — and every OS query below reports both. Matching on the number
+ * alone therefore let `--stop` prove a second, unrelated litert-lm server "ours" by
+ * its command line and signal it, which is the same class of accident as killing a
+ * bystander by pid: the identity test passed, the location test was never asked.
+ *
+ * Wildcards are a match, because they genuinely serve our host: a socket on
+ * `0.0.0.0` receives what we send to 127.0.0.1, and `::` is dual-stack by default on
+ * every platform this runs on, so it serves both families.
+ *
+ * `host` of null means the caller wants every listener regardless of address.
+ *
+ * An address we could not READ is a match too, and that is deliberate. An unreadable
+ * address is not evidence of a foreign bind — it is the absence of evidence — and
+ * treating it as a mismatch would silently drop a genuine server on a host whose
+ * `ss` output we failed to parse, leaving `--stop` doing nothing at all. The command
+ * line still has to prove ownership before anything is signalled, so this filter
+ * only ever narrows a set that is already gated; it is not the thing standing
+ * between us and a stranger.
+ */
+export function addressServes(listenAddress, host) {
+  if (host === null || host === undefined) return true;
+  const a = normaliseAddress(listenAddress);
+  if (a === '' || a === '*') return true;
+  const h = normaliseAddress(host);
+  if (a === h) return true;
+  if (a === '0.0.0.0') return !h.includes(':');      // v4 wildcard, v4 callers only
+  if (a === '::' || a === '0:0:0:0:0:0:0:0') return true;          // dual-stack
+  // `localhost` is a NAME, and it resolves to either loopback address depending on
+  // the host's resolver. A literal address is compared literally: a listener on ::1
+  // is unreachable from a client configured with 127.0.0.1, so it is not ours.
+  if (h === 'localhost') return a === '127.0.0.1' || a === '::1';
+  return false;
+}
+
+/**
+ * Every listening socket on `port`, as `{ pid, address }`.
+ *
+ * `address` is the LOCAL address the socket is bound to, or null when the platform
+ * query did not give us one. Separated from the filtering below so the parsing and
+ * the policy are testable apart from each other.
  *
  * On Linux `lsof` is tried first and `ss` second. Minimal container and CI images
  * routinely ship iproute2 without lsof, and with only lsof the discovery silently
  * returned nothing — which reads exactly like "the port is free" and makes `--stop`
  * quietly do nothing.
  */
-export function pidsOnPort(port) {
+function listenersOnPort(port) {
   const run = (cmd, args) => {
     try {
       return spawnSync(cmd, args, { encoding: 'utf8', windowsHide: true }).stdout ?? '';
@@ -232,26 +290,90 @@ export function pidsOnPort(port) {
     }
   };
 
-  const pids = new Set();
-  const collect = (text, re) => {
-    for (const m of text.matchAll(re)) {
-      const n = Number.parseInt(m[1], 10);
-      if (Number.isInteger(n) && n > 0) pids.add(n);
-    }
-  };
-
   if (process.platform === 'win32') {
-    collect(run('powershell.exe', ['-NoProfile', '-Command',
+    return parseGetNetTcpConnection(run('powershell.exe', ['-NoProfile', '-Command',
       `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue `
-      + '| Select-Object -ExpandProperty OwningProcess']), /^\s*(\d+)\s*$/gm);
-    return [...pids];
+      + '| ForEach-Object { ($_.LocalAddress, $_.OwningProcess) -join [char]9 }']));
   }
 
-  collect(run('lsof', ['-ti', `tcp:${port}`, '-sTCP:LISTEN']), /^\s*(\d+)\s*$/gm);
-  if (pids.size) return [...pids];
+  // `-F pn` is lsof's machine-readable mode: `p<pid>` opens a process set and each
+  // `n<addr>:<port>` under it is one of its sockets. The previous `-ti` form printed
+  // pids alone, which is why there was no address to check.
+  const viaLsof = parseLsofFields(
+    run('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-F', 'pn']));
+  if (viaLsof.length) return viaLsof;
 
-  // `ss -ltnp` prints owners as: users:(("python",pid=68056,fd=7))
-  collect(run('ss', ['-ltnp', 'sport', `= :${port}`]), /pid=(\d+)/g);
+  return parseSs(run('ss', ['-ltnp', 'sport', `= :${port}`]));
+}
+
+/** `<LocalAddress>\t<OwningProcess>`, one line per listening socket. */
+function parseGetNetTcpConnection(out) {
+  const found = [];
+  for (const line of out.split(/\r?\n/)) {
+    const [address, pidStr] = line.split('\t');
+    const pid = Number.parseInt(pidStr, 10);
+    if (Number.isInteger(pid) && pid > 0) found.push({ pid, address: address.trim() });
+  }
+  return found;
+}
+
+/** lsof `-F pn`: a `p<pid>` line, then one `n<addr>:<port>` line per socket. */
+function parseLsofFields(out) {
+  const found = [];
+  let pid = null;
+  for (const line of out.split('\n')) {
+    if (line.startsWith('p')) {
+      const n = Number.parseInt(line.slice(1), 10);
+      pid = Number.isInteger(n) && n > 0 ? n : null;
+    } else if (line.startsWith('n') && pid !== null) {
+      found.push({ pid, address: stripPort(line.slice(1)) });
+    }
+  }
+  return found;
+}
+
+/**
+ * `ss -ltnp` rows: `LISTEN 0 128 127.0.0.1:9379 0.0.0.0:* users:(("python",pid=68056,fd=7))`
+ *
+ * The header row carries no `pid=` and so is skipped by the same test that finds the
+ * owners. One row can name several pids when a socket is shared across forked
+ * workers; they all share the row's local address.
+ */
+function parseSs(out) {
+  const found = [];
+  for (const line of out.split('\n')) {
+    const owners = [...line.matchAll(/pid=(\d+)/g)];
+    if (!owners.length) continue;
+    const address = stripPort(line.trim().split(/\s+/)[3] ?? '');
+    for (const m of owners) {
+      const pid = Number.parseInt(m[1], 10);
+      if (Number.isInteger(pid) && pid > 0) found.push({ pid, address });
+    }
+  }
+  return found;
+}
+
+/** `127.0.0.1:9379` -> `127.0.0.1`; `[::1]:9379` -> `[::1]`; `*:9379` -> `*`. */
+function stripPort(endpoint) {
+  const s = String(endpoint ?? '').trim();
+  const colon = s.lastIndexOf(':');
+  return colon === -1 ? s : s.slice(0, colon);
+}
+
+/**
+ * litert-lm is a multi-stage launcher: the pid we spawned is not the process that
+ * ends up holding the socket, so the recorded pid alone can never stop the server.
+ * Asking the OS who owns the port is the only reliable answer.
+ *
+ * Scoped to the local address we are actually talking to, not to the port number —
+ * see `addressServes`. Pass `host` of null only when the question really is "who
+ * holds this port at all", which is what the test suite asks.
+ */
+export function pidsOnPort(port, host = null) {
+  const pids = new Set();
+  for (const { pid, address } of listenersOnPort(port)) {
+    if (addressServes(address, host)) pids.add(pid);
+  }
   return [...pids];
 }
 
@@ -494,11 +616,15 @@ export function signallablePid(record, writtenAtMs) {
  * So the port is re-asked after the identification, and only pids present in both
  * snapshots are admitted. A listener that left in between is not ours to signal, and
  * one that arrived in between has not been identified yet.
+ *
+ * `host` scopes both snapshots to the local address this client actually talks to. A
+ * litert-lm server bound to another interface on the same port passes the command
+ * line test and is emphatically not ours; without the address it was signalled.
  */
-export function identifyPortOwners(port, isOurs) {
-  const before = pidsOnPort(port);
+export function identifyPortOwners(port, isOurs, host = null) {
+  const before = pidsOnPort(port, host);
   identities(before);
-  const after = new Set(pidsOnPort(port));
+  const after = new Set(pidsOnPort(port, host));
 
   const ours = [];
   const strangers = [];
@@ -527,6 +653,20 @@ export function resolveTargets(targets) {
   }
   return { alive, unknown };
 }
+
+/**
+ * Test seam: the three platform output parsers.
+ *
+ * Exposed because each one can only be exercised on the host whose tool produces it,
+ * and CI covers three platforms with one tool each. Captured real output run through
+ * these is the only way the `ss` shape gets checked from a machine with lsof, and the
+ * Windows shape from anywhere but Windows.
+ */
+export const _parsers = {
+  getNetTcpConnection: parseGetNetTcpConnection,
+  lsof: parseLsofFields,
+  ss: parseSs,
+};
 
 /** Test seam: forget everything looked up so far. */
 export function _resetIdentityCache() {

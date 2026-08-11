@@ -232,7 +232,12 @@ function ourTargets() {
   // pid reissued mid-lookup to a litert-lm on another port cannot be adopted as
   // ours. A listener we could not describe lands in `unidentified` rather than being
   // filed as a stranger, because "the lookup failed" is not "definitely not mine".
-  const { ours: targets, unidentified } = identifyPortOwners(opts.port, looksLikeLitertLmServe);
+  //
+  // Scoped to `opts.host` too — the same address this watchdog probes for liveness.
+  // A litert-lm bound to another interface on this port is a different server, and
+  // supervising the socket we talk to means asking about that socket, not the number.
+  const { ours: targets, unidentified } =
+    identifyPortOwners(opts.port, looksLikeLitertLmServe, opts.host);
   const recorded = ownedPid('server.pid');
   if (recorded !== null && !targets.some((t) => t.pid === recorded)) {
     targets.push({ pid: recorded, token: startToken(recorded) });

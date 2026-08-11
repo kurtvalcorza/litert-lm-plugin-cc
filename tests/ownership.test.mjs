@@ -23,7 +23,7 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import {
   chmodSync, copyFileSync, linkSync, mkdirSync, mkdtempSync, readFileSync, statSync,
-  writeFileSync,
+  utimesSync, writeFileSync,
 } from 'node:fs';
 import { after, describe, test } from 'node:test';
 import { tmpdir } from 'node:os';
@@ -32,8 +32,9 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import {
-  commandLaunches, formatPidRecord, identity, isLitertLmServeCommand, parsePidRecord,
-  pidsOnPort, recordIsStale, signallablePid, startToken,
+  _parsers, addressServes, commandLaunches, formatPidRecord, identity,
+  isLitertLmServeCommand, parsePidRecord, pidsOnPort, recordIsStale, signallablePid,
+  startToken,
 } from '../plugins/litertlm/scripts/process-identity.mjs';
 
 const SCRIPTS = join(dirname(fileURLToPath(import.meta.url)), '..', 'plugins', 'litertlm', 'scripts');
@@ -84,6 +85,10 @@ const PORT = {
   staleSlot: reservePort(19401),
   watchdogSurvivor: reservePort(19411),
   leftover: reservePort(19421),
+  twoInterfaces: reservePort(19431),
+  concurrentStart: reservePort(19441),
+  abandonedClaim: reservePort(19451),
+  preBootClaim: reservePort(19461),
 };
 
 const spawned = [];
@@ -179,6 +184,49 @@ const runClient = (args, runtime) => spawnSync(process.execPath, [CLIENT, ...arg
   windowsHide: true,
   env: { ...process.env, LITERT_LM_PLUGIN_RUNTIME: runtime },
 });
+
+/**
+ * The same client, but running concurrently with the test.
+ *
+ * Needed wherever the assertion is about what the client does WHILE something else
+ * happens — waiting out another start, for instance. `spawnSync` can only show the
+ * aftermath, and the aftermath of a wait and of a refusal-then-retry look alike.
+ */
+function startClient(args, runtime) {
+  const child = reap(spawn(process.execPath, [CLIENT, ...args], {
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, LITERT_LM_PLUGIN_RUNTIME: runtime },
+  }));
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (d) => { stdout += d; });
+  child.stderr.on('data', (d) => { stderr += d; });
+  const done = new Promise((resolve) => {
+    child.on('close', (status) => resolve({ status, stdout, stderr }));
+  });
+  return { child, done };
+}
+
+/** A plain listener on a named local address — no protocol, just a bound socket. */
+async function startListener(port, address) {
+  const src = `
+    import { createServer } from 'node:http';
+    const s = createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ object: 'list', data: [] }));
+    });
+    s.on('error', () => process.exit(1));
+    s.listen(${port}, ${JSON.stringify(address)});
+    setInterval(() => {}, 1000);
+  `;
+  const child = reap(spawn(process.execPath, ['--input-type=module', '-e', src],
+    { stdio: 'ignore', windowsHide: true }));
+  await sleep(1200);
+  return alive(child.pid) ? child : null;
+}
 
 /**
  * Can this host discover who owns a socket at all?
@@ -904,6 +952,209 @@ describe('the launched-executable check', () => {
         `a shebang launcher must be recognised as launching itself: ${seen.cmdline}`);
 
       try { child.kill('SIGKILL'); } catch { /* ignore */ }
+    });
+});
+
+describe('scoping socket ownership to the local address', () => {
+  // A port is a number; a socket is an address AND a number. Two servers can hold the
+  // same port on different local addresses at once, and every OS query reports both —
+  // so a second litert-lm bound to another interface passed the command-line test and
+  // was signalled by a `--stop` that was never asked about it.
+  test('a listener on another interface does not serve our host', () => {
+    for (const [address, host] of [
+      ['192.168.1.5', '127.0.0.1'],
+      ['10.0.0.2', '127.0.0.1'],
+      ['::1', '127.0.0.1'],          // a v6 loopback is not reachable over v4
+      ['127.0.0.1', '::1'],
+      ['0.0.0.0', '::1'],            // a v4 wildcard does not answer v6 callers
+    ]) {
+      assert.equal(addressServes(address, host), false, `${address} vs ${host}`);
+    }
+  });
+
+  test('an exact match and a wildcard both serve it', () => {
+    for (const [address, host] of [
+      ['127.0.0.1', '127.0.0.1'],
+      ['0.0.0.0', '127.0.0.1'],
+      ['*', '127.0.0.1'],
+      ['::', '127.0.0.1'],              // dual-stack, so it answers v4 too
+      ['[::1]', '::1'],                 // ss and lsof bracket v6 addresses
+      ['::ffff:127.0.0.1', '127.0.0.1'],
+      ['fe80::1%lo0', 'fe80::1'],       // a scope id names an interface, not an address
+      ['192.168.1.5', '192.168.1.5'],
+    ]) {
+      assert.equal(addressServes(address, host), true, `${address} vs ${host}`);
+    }
+  });
+
+  // `localhost` is a name and resolves to either loopback address; a literal is
+  // compared literally, or the check would wave through a socket we cannot reach.
+  test('localhost accepts either loopback, a literal accepts only itself', () => {
+    assert.equal(addressServes('127.0.0.1', 'localhost'), true);
+    assert.equal(addressServes('::1', 'localhost'), true);
+    assert.equal(addressServes('192.168.1.5', 'localhost'), false);
+  });
+
+  // Not evidence of a foreign bind — the absence of evidence. Dropping these would
+  // silently disarm `--stop` on any host whose output we failed to parse, and the
+  // command line still has to prove ownership before anything is signalled.
+  test('an unreadable address, and no host at all, both match', () => {
+    assert.equal(addressServes('', '127.0.0.1'), true);
+    assert.equal(addressServes(null, '127.0.0.1'), true);
+    assert.equal(addressServes('192.168.1.5', null), true);
+  });
+
+  // Each of these tools exists on exactly one of the three platforms CI runs, so the
+  // other two shapes can only ever be checked against captured output.
+  test('parses real Get-NetTCPConnection output', () => {
+    assert.deepEqual(_parsers.getNetTcpConnection('127.0.0.1\t68056\r\n::\t4\r\n'),
+      [{ pid: 68056, address: '127.0.0.1' }, { pid: 4, address: '::' }]);
+  });
+
+  test('parses real lsof -F pn output', () => {
+    assert.deepEqual(
+      _parsers.lsof('p68056\nn127.0.0.1:9379\np72608\nn[::1]:9379\nn*:9379\n'),
+      [{ pid: 68056, address: '127.0.0.1' },
+        { pid: 72608, address: '[::1]' },
+        { pid: 72608, address: '*' }]);
+  });
+
+  test('parses real ss -ltnp output, header and shared sockets included', () => {
+    const out = 'State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process\n'
+      + 'LISTEN 0      128    127.0.0.1:9379      0.0.0.0:*  users:(("python",pid=68056,fd=7))\n'
+      + 'LISTEN 0      128    [::1]:9379          [::]:*     '
+      + 'users:(("nginx",pid=901,fd=6),("nginx",pid=902,fd=6))\n';
+    assert.deepEqual(_parsers.ss(out), [
+      { pid: 68056, address: '127.0.0.1' },
+      { pid: 901, address: '[::1]' },
+      { pid: 902, address: '[::1]' },
+    ]);
+  });
+
+  // And the same claim against the real OS, because the parsers above are only worth
+  // anything if the tools are actually being asked for an address.
+  test('finds only the listener bound to the address we talk to', { timeout: 60_000 },
+    async (t) => {
+      if (!(await canDiscoverPortOwners())) {
+        t.skip('no socket-owner discovery on this host (needs lsof or ss)');
+        return;
+      }
+      const port = PORT.twoInterfaces;
+      const ours = await startListener(port, '127.0.0.1');
+      assert.ok(ours, 'the loopback listener should have bound');
+
+      // A second loopback address is the portable way to stage "same port, different
+      // interface" without touching a real network. Linux gives the whole 127/8 range
+      // by default; elsewhere it needs an alias that this test will not create.
+      const other = await startListener(port, '127.0.0.2');
+      if (other === null) {
+        t.skip('no second loopback address on this host');
+        return;
+      }
+
+      assert.deepEqual(pidsOnPort(port, '127.0.0.1'), [ours.pid],
+        'only the listener we can actually reach counts as holding our socket');
+      assert.ok(pidsOnPort(port, '127.0.0.2').includes(other.pid),
+        'and asking about the other address finds the other one');
+      const both = pidsOnPort(port, null);
+      assert.ok(both.includes(ours.pid) && both.includes(other.pid),
+        'a null host still means "whoever holds this port"');
+    });
+});
+
+describe('a start that is still in progress', () => {
+  /**
+   * Stage the exact state a valid start publishes before its socket answers.
+   *
+   * A start is not atomic: `server.pid` names a live, provable process for seconds
+   * before anything is listening. That is byte-for-byte the state a shutdown leaves
+   * when it fails halfway, and only `starting` says which of the two it is.
+   */
+  async function stageStartInProgress(port, runtime, claimPid) {
+    const dir = stateDir(runtime, port);
+    const launcher = await startBystander();
+    const token = startToken(launcher.pid);
+    if (token === null) return null;
+    writeFileSync(join(dir, 'server.pid'), `${launcher.pid} ${token}`, 'utf8');
+    writeFileSync(join(dir, 'starting'),
+      `${Date.now()} ${claimPid ?? launcher.pid}`, 'utf8');
+    return { dir, launcher };
+  }
+
+  // THE DEFECT. A second client arriving mid-start read the first one's record as
+  // wreckage and told the user to run `--stop` — the one action that would have
+  // broken the perfectly valid start it was looking at.
+  test('waits for a live claim instead of calling it leftover debris',
+    { timeout: 90_000 }, async (t) => {
+      const port = PORT.concurrentStart;
+      const runtime = runtimeDir();
+      const staged = await stageStartInProgress(port, runtime, null);
+      if (staged === null) {
+        t.skip('cannot establish process identity on this host');
+        return;
+      }
+
+      const client = startClient(
+        ['--list', '--port', String(port), '--idle-timeout', '0'], runtime);
+
+      // Long enough that a client which was going to refuse has already done so.
+      await sleep(3000);
+      assert.equal(client.child.exitCode, null,
+        'it must still be waiting, not have refused a start that is in progress');
+
+      // Now the start it was waiting for finishes and the socket answers.
+      const server = await startStranger(port);
+      const r = await client.done;
+
+      assert.equal(r.status, 0, `the waiting client should adopt the server: ${r.stderr}`);
+      assert.match(r.stderr, /already starting the server/,
+        'and should say why it waited');
+      assert.doesNotMatch(r.stderr, /left over from a shutdown/,
+        'a start in progress is not the wreckage of one that failed');
+      assert.match(r.stdout, /someone-elses-model/, 'it should have reached the server');
+
+      try { server.kill('SIGKILL'); } catch { /* ignore */ }
+    });
+
+  // The other half: the wait must not swallow the guard it sits in front of. A claim
+  // whose author is gone is an abandoned file, and the record beside it really is
+  // leftover — refusing is still the right answer.
+  test('still refuses when the claim has been abandoned', { timeout: 60_000 },
+    async (t) => {
+      const port = PORT.abandonedClaim;
+      const runtime = runtimeDir();
+      const staged = await stageStartInProgress(port, runtime, 999_999);
+      if (staged === null) {
+        t.skip('cannot establish process identity on this host');
+        return;
+      }
+
+      const r = runClient(['--list', '--port', String(port)], runtime);
+
+      assert.notEqual(r.status, 0, 'a real leftover must still stop the start');
+      assert.match(r.stderr, /left over from a shutdown that did not finish/);
+      assert.match(r.stderr, new RegExp(`\\b${staged.launcher.pid}\\b`));
+    });
+
+  // Pid liveness is exact only within one boot session, and the claim is judged by
+  // liveness. A claim file older than this boot names a pid the OS has since reissued,
+  // so it must not be able to hold the leftover guard open across a reboot.
+  test('a claim written before this boot is abandoned however alive its pid looks',
+    { timeout: 60_000 }, async (t) => {
+      const port = PORT.preBootClaim;
+      const runtime = runtimeDir();
+      const staged = await stageStartInProgress(port, runtime, null);
+      if (staged === null) {
+        t.skip('cannot establish process identity on this host');
+        return;
+      }
+      utimesSync(join(staged.dir, 'starting'), 0, 0);        // epoch: before any boot
+
+      const r = runClient(['--list', '--port', String(port)], runtime);
+
+      assert.notEqual(r.status, 0);
+      assert.match(r.stderr, /left over from a shutdown that did not finish/,
+        'a pre-boot claim is a stale file, not an active generation');
     });
 });
 

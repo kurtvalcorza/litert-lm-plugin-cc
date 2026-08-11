@@ -72,6 +72,22 @@ stale, so reclamation cannot delete a live winner.
 targets are processes. A stranger that holds or takes the port keeps answering, and treating
 that as failure reports an error for correctly leaving it alone.
 
+**A port is not a socket: ownership is scoped to the local address too.** Two servers may hold
+the same port on different local addresses at once — ours on `127.0.0.1:9379`, another
+`litert-lm serve` on `192.168.1.5:9379` — and every OS query (`Get-NetTCPConnection`, `lsof`,
+`ss`) reports both. Matching on the number alone therefore let the command-line test prove a
+second, unrelated litert-lm "ours" and signal it: identity passed, location was never asked.
+Discovery now reads the local address alongside the pid and keeps only listeners that would
+answer the host this client talks to. Wildcards count, because they genuinely do answer it
+(`0.0.0.0` serves v4 callers, `::` is dual-stack); a literal host is compared literally, since a
+socket on `::1` is unreachable from a client configured with `127.0.0.1`. The watchdog is passed
+`--host` for the same reason — supervising the socket we talk to means asking about that socket.
+
+An address the platform query did not yield is treated as a match. That is the absence of
+evidence, not evidence of a foreign bind, and dropping such a listener would silently disarm
+`--stop` on any host whose output failed to parse. The command line still has to prove ownership
+before anything is signalled, so the address only ever narrows a set that is already gated.
+
 **`stopped-at` is a tombstone, and the only state file that is never cleared.** A watchdog is
 spawned detached and cannot publish its pid until it has established its own identity — a
 process lookup, seconds on Windows. A `--stop` arriving inside that window cannot see it: it is
@@ -121,6 +137,17 @@ newer start had just published. Not signalling a process whose only identity you
 is not restraint. Every release compares the claim first, and `server.pid` is cleared only
 while it still names one of the cancelling invocation's own targets.
 
+**Recording a spawned pid is gated on the claim at both ends, and the opening gate matters as
+much as the closing one.** `server.pid` is a single shared slot. Recording used to clear it on
+the way in — before any identity work — so an older generation erased a record it did not own,
+leaving a live server unrecorded by the act of recording something else. Publishing was
+ungated too: everything between the spawn and the write costs real time (a process lookup is
+seconds on Windows), which is exactly the window in which the claim changes hands, so an older
+start could overwrite a newer one's identity on the way out. Ownership is now checked before
+the clear, re-checked immediately before the write, and checked once more afterwards — and if
+the claim moved in that last gap, the record is withdrawn only while the bytes on disk are
+still the ones this invocation wrote.
+
 Cancellation also requires **quiescence rather than one empty sample**. The launcher exits
 before the detached descendant it spawned has bound the socket, so a single pass can see no live
 process and no listener while the grandchild is still on its way up. Consecutive empty
@@ -141,6 +168,21 @@ plugin's processes is still holding memory does not depend on which invocation h
 witness the handshake. The check is free when nothing is recorded — an empty target list
 performs no identity lookup.
 
+**A start in progress is not a shutdown that failed, and `starting` is what tells them
+apart.** A start is not atomic: `server.pid` names a live, provable process for seconds before
+the socket answers. That is byte-for-byte the state the check above exists to catch, so a second
+client arriving mid-start read a perfectly valid generation as wreckage and told the user to run
+`--stop` — the one action that would have broken it. A live claim is therefore consulted *before*
+the state is read as debris: the arriving client waits for that start instead, up to the same
+startup timeout the start itself gets, and adopts the server when it comes up.
+
+The claim is judged by liveness, not identity — it decides whether to *wait*, never whether to
+signal, and the worst case of getting it wrong is a bounded wait ending in the same refusal it
+would have reached at once. A claim whose author has exited, or whose file predates this boot, is
+an abandoned file and the leftover refusal stands. If the wait times out with the claim still
+live, that is reported as a start that has not come up rather than as leftover debris, because
+advising `--stop` would again be advice to break a valid start.
+
 **A stop succeeds only when the watchdog is confirmed gone too.** The watchdog is signalled
 last and only once the server is proven down, but its own outcome then has to reach the
 verdict. Discarding its `unknown` bucket and sending one un-followed-up `SIGTERM` meant the
@@ -148,6 +190,16 @@ command cleared `watchdog.pid`, wrote the success tombstone, and reported both p
 on the strength of the server's result alone — leaving a supervisor that ignored the signal
 running with its identity deleted. It is chased and re-checked on the same terms as the server,
 and a survivor keeps its record and lands in `survivors` like any other.
+
+**"I could not identify this" is a verdict about a moment, and is never cached.** Identity
+lookups fail transiently — PowerShell can fail to start, `ps` can be killed — and the pids whose
+first lookup failed used to be remembered and folded unconditionally back into the final
+`unknown` set. A lookup that failed once and then succeeded, with the process identified,
+signalled and confirmed gone, was still reported as unjudgeable: a completed stop came out as a
+failure, kept state it should have cleared, and named a pid that no longer existed. Every pass
+re-asks the OS and returns a fresh verdict, so the last answer is the only one that counts. The
+watchdog is not skipped for having failed an earlier lookup either — it gets the same fresh
+check, which is what makes the failure recoverable rather than permanent.
 
 **Existence is `kill(pid, 0)`, and `EPERM` means alive.** That call has two distinct failures.
 `ESRCH` is "no such process"; `EPERM` is "it exists and you may not touch it". Flattening them
