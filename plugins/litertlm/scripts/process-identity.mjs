@@ -85,9 +85,16 @@ const flatten = (s) => (s ?? '').replace(/\s+/g, ' ').trim();
  */
 function run(cmd, args) {
   try {
-    return spawnSync(cmd, args, { encoding: 'utf8', windowsHide: true }).stdout ?? '';
+    const r = spawnSync(cmd, args, { encoding: 'utf8', windowsHide: true });
+    // `error` is ENOENT, EACCES, or a failure to spawn at all — the query never ran.
+    // That is NOT the same answer as "it ran and found nothing", and returning '' for
+    // both is how a failed lookup comes back looking like an empty port. A non-zero
+    // EXIT is deliberately not a failure here: `lsof` exits 1 when it matches nothing,
+    // which is a real answer.
+    if (r.error) return { ok: false, out: '' };
+    return { ok: true, out: r.stdout ?? '' };
   } catch {
-    return '';
+    return { ok: false, out: '' };
   }
 }
 
@@ -312,19 +319,29 @@ export function addressServes(listenAddress, host) {
  */
 function listenersOnPort(port) {
   if (process.platform === 'win32') {
-    return parseGetNetTcpConnection(run('powershell.exe', ['-NoProfile', '-Command',
+    const r = run('powershell.exe', ['-NoProfile', '-Command',
       `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue `
-      + '| ForEach-Object { ($_.LocalAddress, $_.OwningProcess) -join [char]9 }']));
+      + '| ForEach-Object { ($_.LocalAddress, $_.OwningProcess) -join [char]9 }']);
+    return { ok: r.ok, listeners: parseGetNetTcpConnection(r.out) };
   }
 
   // `-F pn` is lsof's machine-readable mode: `p<pid>` opens a process set and each
   // `n<addr>:<port>` under it is one of its sockets. The previous `-ti` form printed
   // pids alone, which is why there was no address to check.
-  const viaLsof = parseLsofFields(
-    run('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-F', 'pn']));
-  if (viaLsof.length) return viaLsof;
+  const lsof = run('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-F', 'pn']);
+  if (lsof.ok) {
+    const found = parseLsofFields(lsof.out);
+    if (found.length) return { ok: true, listeners: found };
+  }
 
-  return parseSs(run('ss', ['-ltnp', 'sport', `= :${port}`]));
+  // Minimal container and CI images routinely ship iproute2 without lsof, so `ss` is
+  // not a fallback for a failed lsof so much as the other half of the same question.
+  const ss = run('ss', ['-ltnp', 'sport', `= :${port}`]);
+  if (ss.ok) return { ok: true, listeners: parseSs(ss.out) };
+
+  // `ss` could not run either. If lsof at least RAN, its empty answer is an answer;
+  // if neither ran, we have no idea who holds this port and must say so.
+  return { ok: lsof.ok, listeners: [] };
 }
 
 /** `<LocalAddress>\t<OwningProcess>`, one line per listening socket. */
@@ -390,12 +407,17 @@ function stripPort(endpoint) {
  * see `addressServes`. Pass `host` of null only when the question really is "who
  * holds this port at all", which is what the test suite asks.
  */
-export function pidsOnPort(port, host = null) {
+function scanPort(port, host) {
+  const { ok, listeners } = listenersOnPort(port);
   const pids = new Set();
-  for (const { pid, address } of listenersOnPort(port)) {
+  for (const { pid, address } of listeners) {
     if (addressServes(address, host)) pids.add(pid);
   }
-  return [...pids];
+  return { ok, pids: [...pids] };
+}
+
+export function pidsOnPort(port, host = null) {
+  return scanPort(port, host).pids;
 }
 
 // ---------------------------------------------------------------------------
@@ -582,8 +604,22 @@ const DESCENDANT_SAMPLE_MS = process.platform === 'win32' ? 3000 : 250;
 export function startGeneration(launcherPid, readTable = processTable) {
   const mine = new Map();
   let lastSample = 0;
+  let authoritative = false;
 
   const admitFrom = (table) => {
+    // SEEDING IS RETRIED, NOT DONE ONCE. It used to happen only in the constructor,
+    // so a first read that missed the launcher — the table query failed to run at
+    // all, or the stage exited before it was enumerated — left the set permanently
+    // empty. Every later sample then derived its roots from that empty set and found
+    // nothing to work from, so no recovered table could ever bootstrap it.
+    if (!authoritative && launcherPid) {
+      const row = table.get(launcherPid);
+      if (row) {
+        mine.set(launcherPid, { pid: launcherPid, token: row.start });
+        authoritative = true;
+      }
+    }
+
     // Members whose recorded token still matches this snapshot. Anything else is a
     // number we used to know, and a number vouches for nothing.
     const roots = [];
@@ -601,17 +637,38 @@ export function startGeneration(launcherPid, readTable = processTable) {
     }
   };
 
-  const seed = readTable();
-  const seedRow = launcherPid ? seed.get(launcherPid) : undefined;
-  if (seedRow) {
-    mine.set(launcherPid, { pid: launcherPid, token: seedRow.start });
-    admitFrom(seed);
-  }
+  admitFrom(readTable());
 
   return {
     members: () => [...mine.values()],
     has: (pid) => mine.has(pid),
-    adopt(owner) { if (!mine.has(owner.pid)) mine.set(owner.pid, owner); },
+
+    /**
+     * Did we ever establish a trusted member — or have we simply never managed to look?
+     *
+     * "I OBSERVED NOTHING" AND "THERE IS NOTHING" ARE THE SAME SENTENCE ONLY WHEN YOU
+     * WERE ABLE TO LOOK, and cancellation is where the difference bites. It reads an
+     * empty member set as quiescence, so a generation that never seeded reported
+     * "nothing is left running" without ever having been able to see anything —
+     * clearing the child's record while the detached descendant went on to bind. That
+     * is the pre-bind false success this tracker exists to remove, re-entered through
+     * its own initialisation.
+     *
+     * So emptiness is only evidence for a caller that this returns true to. It is the
+     * same three-state discipline the rest of the module uses: gone, ours, or
+     * unjudgeable — and unjudgeable must never be spent as proof.
+     */
+    authoritative: () => authoritative,
+
+    adopt(owner) {
+      if (mine.has(owner.pid)) return;
+      // An adopted listener was proven ours by command line and carries a token, so
+      // it is as good a root as the launcher and equally good evidence that we were
+      // able to look at all.
+      mine.set(owner.pid, owner);
+      authoritative = true;
+    },
+
     sample(force = false) {
       if (!force && Date.now() - lastSample < DESCENDANT_SAMPLE_MS) return;
       lastSample = Date.now();
@@ -865,20 +922,30 @@ export function signallablePid(record, writtenAtMs) {
  * line test and is emphatically not ours; without the address it was signalled.
  */
 export function identifyPortOwners(port, isOurs, host = null) {
-  const before = pidsOnPort(port, host);
-  identities(before);
-  const after = new Set(pidsOnPort(port, host));
+  const first = scanPort(port, host);
+  identities(first.pids);
+  const second = scanPort(port, host);
+  const after = new Set(second.pids);
 
   const ours = [];
   const strangers = [];
   const unidentified = [];
-  for (const pid of before) {
+  for (const pid of first.pids) {
     if (!after.has(pid)) continue;                  // no longer holds this port
     if (identity(pid) === null) unidentified.push(pid);
     else if (isOurs(pid)) ours.push({ pid, token: startToken(pid) });
     else strangers.push(pid);
   }
-  return { ours, strangers, unidentified };
+
+  // "I could not ask who holds this port" is a THIRD answer, and it used to be
+  // indistinguishable from "nobody does": every query failure returned an empty
+  // string, which became an empty pid list, which became an empty owner set. A host
+  // where neither lsof nor ss will run then reads as a free port, so a recorded
+  // launcher that has exited while its unrecorded listener carries on looks exactly
+  // like a server that is already gone. Reported rather than folded into
+  // `unidentified`, because the two need different handling: an unidentified listener
+  // is a process we know is there, while this is the absence of the question.
+  return { ours, strangers, unidentified, discoveryFailed: !first.ok || !second.ok };
 }
 
 export function resolveTargets(targets) {

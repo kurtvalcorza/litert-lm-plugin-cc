@@ -269,8 +269,15 @@ async function recordSpawnedPid(port, name, child, exe, spawnedAt) {
   // that nothing of ours is running. Publishing now would contradict it and leave a
   // record of a server the user was told had been stopped. Same tombstone the
   // watchdog uses, same reason: whoever stopped could not see us yet.
+  //
+  // `>=`, not `>`. Both stamps are `Date.now()`, so a stop landing in the same
+  // millisecond as this spawn is genuinely ambiguous — and strict ordering resolved
+  // that ambiguity by ignoring the stop, which is the one direction that cannot be
+  // recovered from. Treating it as an overtaking stop costs a start that has to be
+  // retried and says so; the other reading leaves a server running that the user was
+  // told had been stopped.
   const stoppedAt = Number.parseInt(readState(port, 'stopped-at', ''), 10);
-  if (Number.isFinite(stoppedAt) && stoppedAt > spawnedAt) return false;
+  if (Number.isFinite(stoppedAt) && stoppedAt >= spawnedAt) return false;
 
   // Warm — `identity(child.pid)` above already paid for it — so the gap between this
   // check and the write is a couple of syscalls rather than a PowerShell start-up.
@@ -632,7 +639,19 @@ async function cancelStartedServer(opts, generation, child, spawnedAt) {
       // process AND no listener while the grandchild is still on its way up. Require
       // the picture to stay empty across consecutive passes before believing it.
       quiet += 1;
-      if (quiet >= 3 || !generationIsOurs) { conclusive = true; break; }
+
+      // And an empty picture is only evidence at all if we were ever able to look.
+      //
+      // The generation seeds itself from the process table; if that read never
+      // yielded the launcher — the query could not run, or the stage was gone before
+      // it was enumerated — then there are no members, and "no members" arrives here
+      // looking exactly like "everything has exited". Spending that as proof reported
+      // a clean teardown while the detached descendant was still on its way up, which
+      // is the pre-bind false success this tracker exists to remove, re-entered
+      // through its own initialisation. Unjudgeable is not a verdict.
+      const provable = generation.authoritative();
+      if (!generationIsOurs) { conclusive = provable; break; }
+      if (provable && quiet >= 3) { conclusive = true; break; }
       await sleep(400);
       continue;
     }
@@ -855,7 +874,7 @@ async function ensureServer(opts) {
     // never suppressed the record at all. A start that has been overtaken has to
     // undo itself, not just stay quiet about it.
     const stoppedAt = Number.parseInt(readState(opts.port, 'stopped-at', ''), 10);
-    if (Number.isFinite(stoppedAt) && stoppedAt > spawnedAt) {
+    if (Number.isFinite(stoppedAt) && stoppedAt >= spawnedAt) {
       const clean = await cancelStartedServer(opts, generation, child, spawnedAt);
       throw new Error(clean
         ? 'the server start was cancelled by a --stop that ran at the same time.\n'
@@ -935,13 +954,13 @@ const stillAlive = (targets) => resolveTargets(targets);
  * State is cleared either way. "We could not identify anything to stop" and "there
  * is stale state here" are different facts, and the second is safe to act on alone.
  */
-async function stopProcesses(opts) {
+async function stopProcesses(opts, endpointAnswered = false) {
   const port = opts.port;
 
   const PID_FILES = ['watchdog.pid', 'server.pid'];
   const recordedByName = ownedPids(port, PID_FILES);
   const recorded = [...recordedByName.values()];
-  const { ours, strangers, unidentified } = classifyPortOwners(opts);
+  const { ours, strangers, unidentified, discoveryFailed } = classifyPortOwners(opts);
 
   // Survivors of a PREVIOUS failed stop, which the two pid slots could not hold.
   //
@@ -984,10 +1003,19 @@ async function stopProcesses(opts) {
   // a refusal is recoverable by retrying, an unsupervised server is not recoverable
   // by anything except noticing. So when the picture is incomplete, nothing is
   // signalled and nothing is cleared.
-  if (unidentified.length) {
+  //
+  // A discovery that could not RUN counts here too, but only while something is
+  // actually answering on the port. The two facts have to be taken together: on a
+  // host with neither lsof nor ss the query always fails, and treating that alone as
+  // a blocker would make `--stop` refuse forever on exactly the minimal images the
+  // `ss` fallback was added for. With the endpoint answering it is a different claim
+  // — something is there and we cannot ask who — which is the unidentified case in
+  // all but name.
+  const blindPort = discoveryFailed && endpointAnswered;
+  if (unidentified.length || blindPort) {
     return {
       signalled: [], strangers, surviving: [], unknown: unidentified,
-      heldPort: false, down: false,
+      heldPort: false, down: false, blindPort,
     };
   }
 
@@ -1191,6 +1219,7 @@ async function stopProcesses(opts) {
     unknown,
     heldPort: ours.length > 0,
     down: remaining.length === 0 && unknown.length === 0,
+    blindPort: false,
   };
 }
 
@@ -1316,8 +1345,8 @@ async function main() {
     // The probe reports; it does not authorise. Whether anything gets signalled is
     // decided inside stopProcesses, from process identity.
     const wasUp = await probe(opts);
-    const { signalled, strangers, surviving, unknown, heldPort, down } =
-      await stopProcesses(opts);
+    const { signalled, strangers, surviving, unknown, heldPort, down, blindPort } =
+      await stopProcesses(opts, Boolean(wasUp));
 
     const noteStrangers = () => {
       if (!strangers.length) return;
@@ -1342,6 +1371,12 @@ async function main() {
       // port-based look-up the reader would otherwise try, which is exactly why the
       // state records were kept rather than cleared.
       const parts = [];
+      if (blindPort) {
+        parts.push(`something is answering on port ${opts.port}, but who owns it could not\n`
+          + '  be determined — neither lsof nor ss could be run here, so the question was\n'
+          + '  never asked rather than answered "nobody". Nothing was signalled and no\n'
+          + '  state was cleared. Install lsof or iproute2, or stop the process yourself.');
+      }
       if (surviving.length) {
         parts.push(`pid ${surviving.join(', ')} did not stop. It is this plugin's process\n`
           + '  and it is still running, so it may still hold accelerator memory even if it\n'

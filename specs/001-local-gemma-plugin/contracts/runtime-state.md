@@ -130,6 +130,21 @@ a listener, for instance. The extra identity used to exist only in the error tex
 could not find it once it had closed its socket and left port discovery blind. `survivors` has
 no such ceiling and is cleared the moment a stop actually succeeds.
 
+**A discovery that could not run is not an empty port.** Every socket query returned an empty
+string for both "the tool is not here" and "it ran and found nothing", so a host with neither
+`lsof` nor `ss` reported a free port — and a recorded launcher that had exited while its
+unrecorded listener carried on then looked exactly like a server already gone. Failure to *spawn*
+is now distinguished from a non-zero *exit* (`lsof` exits 1 when it matches nothing, which is a
+real answer) and surfaces as `discoveryFailed`.
+
+It blocks a success verdict only while the endpoint is actually answering. The two facts have to
+be taken together: on a minimal image the query always fails, and treating that alone as a blocker
+would make `--stop` refuse forever on exactly the images the `ss` fallback exists for. With
+something answering it is a different claim — something is there and we cannot ask who — and it is
+handled like an unidentified listener. The watchdog checks it before its stand-down branch, since
+that branch reads an empty target set as "nothing here is ours", which is precisely what a query
+that never ran produces.
+
 **An incomplete picture cancels the whole operation.** If any listener on the port cannot be
 identified, `--stop` signals nothing and clears nothing. Signalling only what is provable would
 take out the watchdog — a recorded target — and then fail on the server, leaving it running with
@@ -224,6 +239,17 @@ before each signal, so a reissued pid drops out like any other. The quiescence c
 backstop for the one case descent cannot cover — a grandchild spawned after the last sample *and*
 after its parent had exited — rather than as the primary evidence.
 
+**"I observed nothing" is only evidence if you were able to look.** The generation seeds itself
+from the process table, and seeding used to happen once, in the constructor. A first read that
+missed the launcher — the query could not run, or the stage was gone before it was enumerated —
+left the set permanently empty, and every later sample derived its roots from that emptiness, so
+no recovered table could bootstrap it. Cancellation then read the empty set as quiescence and
+reported a clean teardown while the detached descendant went on to bind: the pre-bind false
+success, re-entered through initialisation. Seeding is now retried on every sample, and the
+generation reports separately whether it ever established a trusted member. Emptiness is spent as
+proof only by a caller that gets `true` from that — the same three-state discipline as everywhere
+else, where unjudgeable is never a verdict.
+
 Admission takes an injectable process table, because real pid reuse cannot be forced in a test:
 the OS decides when a number comes back around. The rules above are therefore driven against a
 fabricated table, which is what makes the reuse case deterministic coverage rather than a
@@ -280,6 +306,23 @@ failure, kept state it should have cleared, and named a pid that no longer exist
 re-asks the OS and returns a fresh verdict, so the last answer is the only one that counts. The
 watchdog is not skipped for having failed an earlier lookup either — it gets the same fresh
 check, which is what makes the failure recoverable rather than permanent.
+
+**A failed idle stop keeps supervising rather than standing down.** The watchdog persisted
+survivor identities and then exited, on the reasoning that the next client would reconcile and
+start a fresh supervisor. That reasoning does not hold on the idle path: nothing guarantees a next
+client. A server that refused the signal, or that hit a transient identity failure, would sit
+resident with its accelerator memory held and no watchdog at all — the outcome this process exists
+to prevent. It now releases the handshake, so clients are not blocked by a shutdown that did not
+complete, and retries on the next poll; one poll plus a full escalation is roughly twenty seconds
+between attempts. Relinquishing the slot is only safe when someone is known to be coming.
+
+**Stop ordering compares `>=`, not `>`.** Both `stopped-at` and a start's `spawnedAt` are
+`Date.now()`, so a stop landing in the same millisecond as a spawn is genuinely ambiguous — and
+strict ordering resolved that by ignoring the stop, which is the one direction that cannot be
+recovered from. An explicit `--stop` could be overtaken by a start it should have cancelled, and a
+watchdog could go on supervising a server that command had torn down. Reading the tie as an
+overtaking stop costs a start that has to be retried and says so, or a watchdog the next client
+replaces.
 
 **Existence is `kill(pid, 0)`, and `EPERM` means alive.** That call has two distinct failures.
 `ESRCH` is "no such process"; `EPERM` is "it exists and you may not touch it". Flattening them

@@ -114,8 +114,13 @@ function stateWrittenAt(name) {
  */
 /** Has a `--stop` landed since we were spawned? */
 function invalidatedByStop() {
+  // `>=`, not `>`. Both stamps are `Date.now()`, so a stop landing in the same
+  // millisecond as our spawn is ambiguous — and strict ordering resolved it by
+  // ignoring the stop, leaving this process supervising a server that command had
+  // already torn down. Standing down in the ambiguous case costs a watchdog the next
+  // client will replace; the other reading costs the supervision itself.
   const stoppedAt = Number.parseInt(readState('stopped-at', ''), 10);
-  return Number.isFinite(stoppedAt) && stoppedAt > opts.spawnedAt;
+  return Number.isFinite(stoppedAt) && stoppedAt >= opts.spawnedAt;
 }
 
 function publish(record) {
@@ -236,13 +241,13 @@ function ourTargets() {
   // Scoped to `opts.host` too — the same address this watchdog probes for liveness.
   // A litert-lm bound to another interface on this port is a different server, and
   // supervising the socket we talk to means asking about that socket, not the number.
-  const { ours: targets, unidentified } =
+  const { ours: targets, unidentified, discoveryFailed } =
     identifyPortOwners(opts.port, looksLikeLitertLmServe, opts.host);
   const recorded = ownedPid('server.pid');
   if (recorded !== null && !targets.some((t) => t.pid === recorded)) {
     targets.push({ pid: recorded, token: startToken(recorded) });
   }
-  return { targets, unidentified };
+  return { targets, unidentified, discoveryFailed };
 }
 
 /**
@@ -387,7 +392,16 @@ async function main() {
     // bookkeeping: clearing state and writing `stopped-idle` would record that we
     // released accelerator memory we never held, and the next client would be told a
     // server had been idle-stopped when it is still running and still unsupervised.
-    const { targets, unidentified } = ourTargets();
+    const { targets, unidentified, discoveryFailed } = ourTargets();
+
+    // The socket query could not RUN. Ordered ahead of the stand-down below because
+    // that branch reads an empty target set as "nothing here is ours" — and a query
+    // that never ran produces exactly that set. This point is only reached once the
+    // server has answered a probe, so something IS on the port; standing down on a
+    // failed lookup would abandon a live server on the strength of a question we
+    // never managed to ask. Wait and ask again.
+    if (discoveryFailed) continue;
+
     // Nothing provable AND nothing unprovable: genuinely not ours, stand down clean.
     if (!targets.length && !unidentified.length) cleanupAndExit(0);
 
@@ -459,9 +473,20 @@ async function main() {
         writeState('survivors', outstanding.map((t) => `${t.pid} ${t.token}`).join('\n'));
       }
 
-      // Standing down without a report leaves the next client free to reconcile and
-      // start a fresh supervisor, which will try again once the server goes idle.
-      cleanupAndExit(1);
+      // KEEP SUPERVISING. This used to stand down, on the reasoning that the next
+      // client would reconcile and start a fresh supervisor — but this is the IDLE
+      // path, and nothing guarantees a next client. A server that refused the signal,
+      // or that hit a transient identity failure, would then sit resident with its
+      // accelerator memory held and no watchdog at all, which is the exact outcome
+      // this process exists to prevent. Relinquishing the slot is only safe when
+      // someone is known to be coming.
+      //
+      // The handshake is released so clients are not blocked by a shutdown that did
+      // not complete, and the loop retries: one poll interval plus a full escalation
+      // is roughly twenty seconds between attempts, which is a retry rather than a
+      // spin.
+      clearState('stopping');
+      continue;
     }
 
     clearState('server.pid');

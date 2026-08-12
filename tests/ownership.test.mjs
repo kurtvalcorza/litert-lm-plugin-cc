@@ -33,8 +33,8 @@ import { setTimeout as sleep } from 'node:timers/promises';
 
 import {
   _parsers, addressServes, commandLaunches, descendantsOf, formatPidRecord, identity,
-  isLitertLmServeCommand, parsePidRecord, pidsOnPort, processTable, recordIsStale,
-  signallablePid, startGeneration, startToken,
+  identifyPortOwners, isLitertLmServeCommand, parsePidRecord, pidsOnPort, processTable,
+  recordIsStale, signallablePid, startGeneration, startToken,
 } from '../plugins/litertlm/scripts/process-identity.mjs';
 
 const SCRIPTS = join(dirname(fileURLToPath(import.meta.url)), '..', 'plugins', 'litertlm', 'scripts');
@@ -55,15 +55,36 @@ const WATCHDOG = join(SCRIPTS, 'idle-watchdog.mjs');
  * So each port is bound here, checked, and released. Anything already listening is
  * skipped rather than trusted.
  */
+const taken = new Set();
+
+/**
+ * Two hazards, and the probe alone addresses neither completely.
+ *
+ * WITHIN one run the ranges overlap — the bases are ten apart and each scan walks
+ * four hundred — and nothing holds a port between reserving it and using it, so two
+ * reservations could return the SAME number and two fixtures would then signal each
+ * other. `taken` closes that half exactly.
+ *
+ * ACROSS concurrent runs it is a genuine time-of-check/time-of-use gap: the probe
+ * closes its socket before returning, so two processes scanning from the same base
+ * pick the same port and each destroys the other's fixtures. It cannot be closed from
+ * here without holding the socket, which is the one thing the caller needs. Starting
+ * each run at a pid-derived offset makes convergence unlikely rather than impossible,
+ * and that limit is worth stating rather than implying.
+ */
 function reservePort(from) {
-  for (let candidate = from; candidate < from + 400; candidate += 1) {
+  const SPAN = 400;
+  const offset = (process.pid * 7) % SPAN;
+  for (let i = 0; i < SPAN; i += 1) {
+    const candidate = from + ((offset + i) % SPAN);
+    if (taken.has(candidate)) continue;
     const probe = spawnSync(process.execPath, ['-e', `
       const { createServer } = require('node:http');
       const s = createServer(() => {});
       s.on('error', () => process.exit(1));
       s.listen(${candidate}, '127.0.0.1', () => s.close(() => process.exit(0)));
     `], { encoding: 'utf8', windowsHide: true });
-    if (probe.status === 0) return candidate;
+    if (probe.status === 0) { taken.add(candidate); return candidate; }
   }
   throw new Error(`no free port found from ${from}`);
 }
@@ -91,6 +112,7 @@ const PORT = {
   preBootClaim: reservePort(19461),
   watchdogTombstone: reservePort(19471),
   preBindCancel: reservePort(19481),
+  discoveryBlind: reservePort(19491),
 };
 
 const spawned = [];
@@ -707,18 +729,33 @@ describe('the idle watchdog', () => {
         [WATCHDOG, '--port', String(port), '--idle-timeout', '1'],
         { stdio: 'ignore', env: { ...process.env, LITERT_LM_PLUGIN_RUNTIME: runtime } }));
 
-      // One poll to decide, then 30 escalation attempts at 500ms.
-      assert.ok(await waitFor(() => watchdog.exitCode !== null, { timeout: 60_000 }),
-        'the watchdog should finish its attempt');
+      // One poll to decide, then 30 escalation attempts at 500ms. The attempt ends
+      // when the handshake is released — not when the process exits, because it
+      // deliberately no longer exits (see below).
+      assert.ok(await waitFor(() => readIfPresent(join(dir, 'survivors')) !== null,
+        { timeout: 60_000 }), 'the watchdog should record what it could not stop');
+      assert.ok(await waitFor(() => readIfPresent(join(dir, 'stopping')) === null,
+        { timeout: 30_000 }),
+        'and release the handshake so clients are not blocked by a failed shutdown');
 
       assert.equal(readIfPresent(join(dir, 'stopped-idle')), null,
         'a stop that did not happen must not be reported as one');
       assert.equal(parsePidRecord(readIfPresent(join(dir, 'server.pid')))?.pid, 1,
         'and the identity needed to retry must survive');
-      assert.equal(readIfPresent(join(dir, 'stopping')), null,
-        'while the handshake is released so clients are not blocked');
+
+      // IT MUST NOT STAND DOWN. This used to exit, on the reasoning that the next
+      // client would start a fresh supervisor — but this is the idle path, and
+      // nothing guarantees a next client. A server that refuses the signal would then
+      // sit resident holding accelerator memory with no watchdog at all, which is the
+      // outcome this process exists to prevent. Relinquishing the slot is only safe
+      // when someone is known to be coming.
+      assert.ok(alive(watchdog.pid),
+        'a failed idle stop must leave supervision in place, not abandon it');
+      assert.equal(recordedPid(dir), watchdog.pid,
+        'and it must still hold the slot, so no second supervisor is spawned beside it');
 
       try { responder.kill('SIGKILL'); } catch { /* ignore */ }
+      try { watchdog.kill('SIGKILL'); } catch { /* ignore */ }
     });
 
   // A stop can land AFTER a watchdog has published, and the two start-up checks
@@ -1074,6 +1111,44 @@ describe('scoping socket ownership to the local address', () => {
     ]);
   });
 
+  // "I could not ask" is a third answer, and it used to be indistinguishable from
+  // "nobody is there": every query failure returned an empty string, which became an
+  // empty pid list, which became an empty owner set. A host where neither lsof nor ss
+  // will run then reads as a free port, so a recorded launcher that has exited while
+  // its unrecorded listener carries on looks exactly like a server already gone.
+  //
+  // Staged by emptying PATH in a child, which is the honest version of that host.
+  test('a host with no discovery tools reports failure, not an empty port',
+    { timeout: 30_000 }, async (t) => {
+      if (process.platform === 'win32') {
+        t.skip('powershell.exe resolves without PATH on Windows');
+        return;
+      }
+      const probe = await startStranger(PORT.discoveryBlind);
+      const src = `
+        import { identifyPortOwners } from ${JSON.stringify(join(SCRIPTS, 'process-identity.mjs'))};
+        const r = identifyPortOwners(${PORT.discoveryBlind}, () => true, '127.0.0.1');
+        process.stdout.write(JSON.stringify({
+          discoveryFailed: r.discoveryFailed, ours: r.ours.length,
+        }));
+      `;
+      const out = spawnSync(process.execPath, ['--input-type=module', '-e', src],
+        { encoding: 'utf8', env: { PATH: '', LITERT_LM_PLUGIN_RUNTIME: runtimeDir() } });
+
+      const seen = JSON.parse(out.stdout);
+      assert.equal(seen.discoveryFailed, true,
+        'neither lsof nor ss could run, so who holds the port is unknown');
+      assert.equal(seen.ours, 0, 'and nothing may be claimed on the strength of that');
+
+      // The control: with PATH intact the same call answers properly, so the flag is
+      // reporting the tools' absence and not merely defaulting to true.
+      const withTools = identifyPortOwners(PORT.discoveryBlind, () => true, '127.0.0.1');
+      assert.equal(withTools.discoveryFailed, false,
+        'a host that CAN look must not be reported as blind');
+
+      try { probe.kill('SIGKILL'); } catch { /* ignore */ }
+    });
+
   // And the same claim against the real OS, because the parsers above are only worth
   // anything if the tools are actually being asked for an address.
   test('finds only the listener bound to the address we talk to', { timeout: 60_000 },
@@ -1272,6 +1347,47 @@ describe('admitting a descendant into a start generation', () => {
   test('an unknown launcher yields an empty generation', () => {
     const gen = startGeneration(4242, () => new Map());
     assert.deepEqual(gen.members(), []);
+  });
+
+  // A generation that never managed to read the table has OBSERVED nothing, which is
+  // not the same claim as "there is nothing" — and cancellation reads an empty member
+  // set as quiescence. Seeding used to happen only in the constructor, so one failed
+  // first read left the set permanently empty and every later sample derived its
+  // roots from that emptiness. The cancelled start then reported a clean teardown
+  // while its detached descendant went on to bind.
+  test('a failed first table read does not permanently disarm the generation', () => {
+    let table = new Map();                       // the query could not run at all
+    const gen = startGeneration(100, () => table);
+
+    assert.equal(gen.authoritative(), false,
+      'nothing was established, so emptiness here is not evidence of anything');
+    assert.deepEqual(gen.members(), []);
+
+    // The table recovers. Seeding must be retried rather than written off.
+    table = new Map([[100, row(1, 'T100')], [200, row(100, 'T200')]]);
+    gen.sample(true);
+
+    assert.equal(gen.authoritative(), true, 'a later read can still seed the launcher');
+    assert.deepEqual(gen.members().map((m) => m.pid).sort((a, b) => a - b), [100, 200],
+      'and the descendants it was always responsible for are picked up');
+  });
+
+  test('a table that never recovers never becomes authoritative', () => {
+    const gen = startGeneration(100, () => new Map());
+    gen.sample(true);
+    gen.sample(true);
+    assert.equal(gen.authoritative(), false,
+      'repeated failures must not quietly promote "I could not look" to "all clear"');
+  });
+
+  // An adopted listener was proven ours by command line and carries a token, so it is
+  // as good a root as the launcher — and equally good evidence that we could look.
+  test('adopting a proven listener makes the generation authoritative', () => {
+    const gen = startGeneration(100, () => new Map());
+    assert.equal(gen.authoritative(), false);
+    gen.adopt({ pid: 500, token: 'T500' });
+    assert.equal(gen.authoritative(), true);
+    assert.ok(gen.has(500));
   });
 
   // The parent link and the token must come from the same row, or the pairing has a
