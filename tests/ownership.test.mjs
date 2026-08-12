@@ -497,6 +497,14 @@ describe('--stop', () => {
   // reported the memory released.
   test('keeps pressing a target that is alive but no longer listening',
     { timeout: 60_000 }, async (t) => {
+      // Gated for the same reason the other socket tests are: with neither lsof nor
+      // ss, a valid recorded target makes the port unaccountable, so `--stop` refuses
+      // before escalating and the exit-0 assertion below would fail a minimal host
+      // for a correct refusal.
+      if (!(await canDiscoverPortOwners())) {
+        t.skip('no socket-owner discovery on this host (needs lsof or ss)');
+        return;
+      }
       if (process.platform === 'win32') {
         t.skip('SIGTERM cannot be trapped on Windows, so escalation is unobservable');
         return;

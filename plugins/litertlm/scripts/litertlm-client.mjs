@@ -675,10 +675,14 @@ async function cancelStartedServer(opts, generation, child, spawnedAt) {
     // gone, and wiped the identity B had just published — losing a live server to
     // the cleanup rather than to the kill. Not signalling a process whose only
     // identity you then discard is not restraint.
+    // THE WHOLE IDENTITY, not the number. Once B has taken the claim, a dead member
+    // of our generation can have its pid reissued to B — and a numeric test then finds
+    // that pid in our set and clears the record B had just published, losing a live
+    // server to the cleanup rather than to the kill. That is the mistake this branch
+    // already carries a paragraph about, made again one comparison lower down.
     const rec = parsePidRecord(readState(port, 'server.pid', ''));
-    if (rec === null || generation.has(rec.pid) || rec.pid === child.pid) {
-      clearState(port, 'server.pid');
-    }
+    const mineToo = rec !== null && generation.member(rec.pid)?.token === rec.token;
+    if (rec === null || mineToo) clearState(port, 'server.pid');
     return true;
   }
 
@@ -1126,12 +1130,16 @@ async function stopProcesses(opts, endpointAnswered = false) {
   // every poll as well; that closes the same hole from the other side, and neither
   // makes the other redundant — this one keeps the VERDICT honest, that one bounds how
   // long a superseded supervisor lives.
-  if (watchdogRecord === null) {
-    const late = pidRecord(port, 'watchdog.pid');
-    if (late !== null && late.token !== null
-      && !recordIsStale(late, stateWrittenAt(port, 'watchdog.pid'))) {
-      watchdogRecord = late;
-    }
+  // Unconditional, not only when the snapshot was empty. Gating it on a null snapshot
+  // covered the watchdog that published during this stop and missed the one that
+  // REPLACED a record we already held: the old supervisor dies, a new one publishes,
+  // and the stale identity we are still carrying is the only thing consulted before
+  // the new one's record is cleared.
+  {
+    const now = pidRecord(port, 'watchdog.pid');
+    const live = now !== null && now.token !== null
+      && !recordIsStale(now, stateWrittenAt(port, 'watchdog.pid'));
+    watchdogRecord = live ? now : watchdogRecord;
   }
 
   if (serverGone && watchdogRecord !== null) {
@@ -1174,8 +1182,12 @@ async function stopProcesses(opts, endpointAnswered = false) {
     // The watchdog's record comes from `watchdogRecord`, not the opening snapshot: a
     // supervisor that published mid-stop is absent from the snapshot, and reading the
     // slot from there would clear the identity of a process that is still running.
+    // Re-read once more here, immediately before the decision to clear. Everything
+    // between the check above and this point is escalation waits — seconds — and a
+    // watchdog can publish inside them; clearing on a stale reading deletes the live
+    // supervisor's identity and then reports success.
     const rec = name === 'watchdog.pid'
-      ? (watchdogRecord ?? undefined)
+      ? (pidRecord(port, 'watchdog.pid') ?? watchdogRecord ?? undefined)
       : recordedByName.get(name);
     // The watchdog we chose not to signal keeps its record too. Clearing it would
     // orphan a live supervisor: still running, but invisible to the next client,

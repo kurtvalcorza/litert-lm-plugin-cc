@@ -686,18 +686,43 @@ export function startGeneration(launcherPid, readTable = processTable,
     }
     if (!roots.length) return;
 
-    for (const pid of descendantsOf(roots, table)) {
-      if (mine.has(pid)) continue;
-      // The token comes from the SAME row that supplied the parent link, so there is
-      // no gap for the pid to be reused between learning it is a descendant and
-      // learning who it is.
-      mine.set(pid, { pid, token: table.get(pid).start });
+    const candidates = descendantsOf(roots, table).filter((pid) => !mine.has(pid));
+    if (!candidates.length) return;
+
+    // A SECOND WALK BEFORE ADMITTING ANYTHING, because one walk is not a snapshot. On
+    // Linux the table is built by reading each /proc/<pid>/stat in turn, so a root can
+    // be read, exit, and have its number reissued before a replacement's child is read
+    // later in the same enumeration — at which point the stale root row still matches
+    // its token and the unrelated child is admitted carrying a genuine one. The rows
+    // agree; they just describe two different moments.
+    //
+    // Paid only when there is something to admit, which is rare: most samples find
+    // nothing new and return above. That matters on Windows, where a walk is a
+    // PowerShell start-up.
+    const confirm = readTable();
+
+    // Roots that survived the whole enumeration, judged against the second walk.
+    const proven = roots.filter((pid) => confirm.get(pid)?.start === mine.get(pid).token);
+    if (!proven.length) return;
+
+    const stillDescended = new Set(descendantsOf(proven, confirm));
+    for (const pid of candidates) {
+      // Present in BOTH walks, descended from a root that survived BOTH, and carrying
+      // the same identity in each. The token comes from the same row that supplied the
+      // parent link, so there is no gap for the pid to be reused between learning it
+      // is a descendant and learning who it is.
+      const first = table.get(pid);
+      const second = confirm.get(pid);
+      if (!second || !stillDescended.has(pid) || first.start !== second.start) continue;
+      mine.set(pid, { pid, token: second.start });
     }
   };
 
   return {
     members: () => [...mine.values()],
     has: (pid) => mine.has(pid),
+    /** The recorded member, so a caller can compare the TOKEN and not just the pid. */
+    member: (pid) => mine.get(pid) ?? null,
 
     /**
      * Did we ever establish a trusted member — or have we simply never managed to look?
