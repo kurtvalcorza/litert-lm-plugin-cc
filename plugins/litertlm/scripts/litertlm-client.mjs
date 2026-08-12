@@ -897,6 +897,16 @@ async function ensureServer(opts) {
     }
 
     const up = await probe(opts);
+
+    // Re-read the tombstone AFTER the probe, not only before it. The check at the top
+    // of this iteration is already stale by the time the probe resolves, and a `--stop`
+    // landing inside that await is exactly the one that cannot see us: our server
+    // binds just after its ownership scan, the probe then succeeds, and accepting
+    // readiness here would return a running server that stop had already reported as
+    // gone — without ever entering cancellation.
+    const stoppedDuringProbe = Number.parseInt(readState(opts.port, 'stopped-at', ''), 10);
+    if (Number.isFinite(stoppedDuringProbe) && stoppedDuringProbe >= spawnedAt) continue;
+
     if (up) {
       releaseStartClaim(opts.port, spawnedAt);   // ours only — a newer start may own it
       startWatchdog(opts);

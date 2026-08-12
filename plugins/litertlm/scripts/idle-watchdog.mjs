@@ -386,7 +386,16 @@ async function main() {
       // — and this branch reaches SIGKILL directly. Killing mid-generation because an
       // earlier attempt was unlucky is exactly the guarantee the marker files exist
       // to provide, so the same check the normal path makes is made here.
+      // CLAIM THE HANDSHAKE BEFORE COUNTING, and hold it through the signal.
+      // Counting first was a check with nothing behind it: the earlier failure
+      // cleared `stopping`, so a client could take a marker between the count and the
+      // kill and have its request truncated anyway — and the identity lookup sitting
+      // between them makes that window seconds wide on Windows. `stopping` is what
+      // stops a new client entering at all, which is the only thing that makes the
+      // count mean something by the time it is acted on.
+      writeState('stopping', Date.now());
       if (countInFlight() > 0) {
+        clearState('stopping');        // let the live request through
         touchIdleDeadline();
         continue;
       }
@@ -435,6 +444,9 @@ async function main() {
         try { process.kill(pid, process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL'); }
         catch { /* ignore */ }
       }
+      // Released between rounds so clients are not blocked for the whole retry
+      // schedule; the next round re-claims it before it counts again.
+      clearState('stopping');
       continue;
     }
 
