@@ -410,7 +410,20 @@ async function main() {
         const isOurs = rec !== null
           && chased.some((t) => t.pid === rec.pid && t.token === rec.token);
         if (rec !== null && !isOurs) {
-          continue;              // B's, not ours: leave it be and go on supervising it
+          // B's, not ours — and supervising it is not ours to do either.
+          //
+          // Carrying on looked like the careful option and smuggled in a policy this
+          // process has no right to apply: the idle timeout is per START, and B chose
+          // its own. `--idle-timeout 0` disables shutdown entirely, which is why B
+          // spawned no watchdog of its own — so continuing here would idle-stop a
+          // server the user explicitly said never to stop, using a superseded
+          // invocation's settings.
+          //
+          // Standing down leaves B unsupervised until the next client, which then
+          // finds no live supervisor and spawns one under B's policy. That is the
+          // self-correcting direction the rest of this file already prefers, and it
+          // is strictly better than enforcing a rule nobody asked for.
+          cleanupAndExit(0);
         }
 
         clearState('server.pid');
