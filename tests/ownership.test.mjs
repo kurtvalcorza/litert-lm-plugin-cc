@@ -865,7 +865,15 @@ describe('recording a process we spawned', () => {
   }
 
   test('a launcher stage that exits leaves nothing signallable',
-    { timeout: 90_000 }, async () => {
+    { timeout: 90_000 }, async (t) => {
+      // Gated for the same reason the socket tests are, and now load-bearing rather
+      // than tidy: with neither lsof nor ss, `--stop` can no longer report success
+      // while a recorded identity exists and the port cannot be enumerated, so the
+      // exit-0 assertion below would fail on a minimal host for a correct refusal.
+      if (!(await canDiscoverPortOwners())) {
+        t.skip('no socket-owner discovery on this host (needs lsof or ss)');
+        return;
+      }
       const port = PORT.fakeLauncher;
       const runtime = runtimeDir();
       const dir = join(runtime, String(port));
@@ -1405,6 +1413,29 @@ describe('admitting a descendant into a start generation', () => {
     assert.equal(gen.authoritative(), true, 'a later read can still seed the launcher');
     assert.deepEqual(gen.members().map((m) => m.pid).sort((a, b) => a - b), [100, 200],
       'and the descendants it was always responsible for are picked up');
+  });
+
+  // Retrying the seed reopened pid reuse one level up: if the launcher exited before
+  // it was ever enumerated and its number was reissued, the stranger's row would be
+  // taken as authoritative and its descendants admitted with valid tokens that
+  // cancellation would re-prove and signal. `launcherPid` is a number; only the
+  // ChildProcess handle knows whether that number is still the process we spawned.
+  test('a retried seed is refused once the child handle says the pid is not ours', () => {
+    const table = new Map([
+      [100, row(1, 'STRANGER')],       // 100 was reused while we were not looking
+      [200, row(100, 'T200')],         // the stranger's child
+    ]);
+    const exited = startGeneration(100, () => table, () => false);
+    exited.sample(true);
+
+    assert.equal(exited.authoritative(), false,
+      'a dead child handle must not let a reused pid seed the generation');
+    assert.deepEqual(exited.members(), [],
+      'and the replacement\'s children must never be admitted');
+
+    // The control: the same table with a handle that still vouches for the number.
+    const live = startGeneration(100, () => table, () => true);
+    assert.equal(live.authoritative(), true, 'a live handle still seeds normally');
   });
 
   test('a table that never recovers never becomes authoritative', () => {

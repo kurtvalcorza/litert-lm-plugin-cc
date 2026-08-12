@@ -334,6 +334,12 @@ async function main() {
   // to clear, so withdraw rather than stand as supervisor over nothing.
   if (invalidatedByStop()) cleanupAndExit(0);
 
+  // Targets from a shutdown that did not finish. Held across polls because they are
+  // the one case where "unreachable" must not mean "gone": we know they are alive
+  // precisely because we failed to kill them, and a survivor that closed its listener
+  // will fail every probe from here on.
+  let pendingSurvivors = [];
+
   const idleMs = opts.idleTimeout * 1000;
   const ceilingMs = Math.max(idleMs * HARD_CEILING_MULTIPLIER, HARD_CEILING_FLOOR_MS);
   let missedProbes = 0;
@@ -356,6 +362,35 @@ async function main() {
     // clearing: a watchdog spawned after the stop has a later `spawnedAt` and is
     // untouched by it.
     if (invalidatedByStop()) cleanupAndExit(0);
+
+    // AN UNFINISHED SHUTDOWN OUTRANKS THE REACHABILITY GATE BELOW.
+    //
+    // Retrying by falling through was wrong in a way that undid the fix it was part
+    // of: the survivor has closed its listener, so every probe from here fails, and
+    // after UNREACHABLE_TOLERANCE the gate below concludes the engine died, clears
+    // `server.pid`, and exits successfully — destroying the identity of a process we
+    // KNOW is alive, because we just failed to kill it, and abandoning the
+    // supervision in the same breath. "Unreachable means gone" is a reasonable
+    // default and a catastrophic one here.
+    //
+    // So the survivors are chased directly, on their identities rather than on the
+    // socket, until they are provably gone.
+    if (pendingSurvivors.length) {
+      const left = stillOurs(pendingSurvivors);
+      if (!left.outstanding.length) {
+        pendingSurvivors = [];
+        clearState('survivors');
+        clearState('server.pid');
+        clearState('loaded-model');
+        writeState('stopped-idle', Date.now());     // it did stop, just not first time
+        cleanupAndExit(0);
+      }
+      for (const pid of left.alive) {
+        try { process.kill(pid, process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL'); }
+        catch { /* ignore */ }
+      }
+      continue;
+    }
 
     // A model switch tears the engine down and re-initialises it, so the server is
     // legitimately unreachable for tens of seconds *while a request is in flight*.
@@ -486,6 +521,7 @@ async function main() {
       // is roughly twenty seconds between attempts, which is a retry rather than a
       // spin.
       clearState('stopping');
+      pendingSurvivors = targets.filter((t) => left.outstanding.includes(t.pid) && t.token);
       continue;
     }
 

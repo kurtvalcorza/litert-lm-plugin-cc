@@ -610,7 +610,8 @@ const DESCENDANT_SAMPLE_MS = process.platform === 'win32' ? 3000 : 250;
  * admission rules are exercised against a fabricated table instead — which is the
  * only way the case above gets deterministic coverage rather than a hopeful comment.
  */
-export function startGeneration(launcherPid, readTable = processTable) {
+export function startGeneration(launcherPid, readTable = processTable,
+  launcherIsStillOurs = () => true) {
   const mine = new Map();
   let lastSample = 0;
   let authoritative = false;
@@ -621,7 +622,20 @@ export function startGeneration(launcherPid, readTable = processTable) {
     // all, or the stage exited before it was enumerated — left the set permanently
     // empty. Every later sample then derived its roots from that empty set and found
     // nothing to work from, so no recovered table could ever bootstrap it.
-    if (!authoritative && launcherPid) {
+    //
+    // BUT A RETRY IS ONLY SAFE WHILE THE HANDLE STILL VOUCHES FOR THE NUMBER. The
+    // first version of this retry took whatever row carried `launcherPid`, which is
+    // the pid-reuse hole again one level up: if the launcher exited before it was
+    // ever enumerated and its number was reissued, the stranger's row would be taken
+    // as authoritative, its token stored as ours, and its descendants admitted with
+    // valid tokens that cancellation would then re-prove and signal. `launcherPid` is
+    // a number; the ChildProcess handle is the only thing that knows whether that
+    // number is still the process we spawned.
+    //
+    // So a failed first read is recoverable only for as long as our child is alive.
+    // Once it has exited unseen, the generation stays unauthoritative — which is the
+    // honest answer, and one cancellation already knows how to handle.
+    if (!authoritative && launcherPid && launcherIsStillOurs()) {
       const row = table.get(launcherPid);
       if (row) {
         mine.set(launcherPid, { pid: launcherPid, token: row.start });

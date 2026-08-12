@@ -845,7 +845,12 @@ async function ensureServer(opts) {
   // the moment its parent exits, and no later walk can recover the relationship. The
   // constructor takes its own snapshot for exactly that reason: on Linux a stage that
   // hands off and exits can be gone within milliseconds of `recordSpawnedPid`.
-  const generation = startGeneration(child.pid);
+  // The third argument is what keeps a retried seed honest: if the first table read
+  // missed this launcher, seeding may be re-attempted only while the child handle
+  // still says the number is ours. `exitCode`/`signalCode` are the only evidence that
+  // distinguishes our process from whoever inherits its pid.
+  const generation = startGeneration(child.pid, undefined,
+    () => child.exitCode === null && child.signalCode === null);
 
   // Record the identity now, while the process is still the one we just spawned —
   // and only if the OS still says so. Asked for later, the answer could already be
@@ -1011,7 +1016,24 @@ async function stopProcesses(opts, endpointAnswered = false) {
   // `ss` fallback was added for. With the endpoint answering it is a different claim
   // — something is there and we cannot ask who — which is the unidentified case in
   // all but name.
-  const blindPort = discoveryFailed && endpointAnswered;
+  //
+  // `endpointAnswered` alone was not enough, and leaned on the one inference this
+  // codebase spends most of its comments warning against. A genuine server is
+  // legitimately unreachable during startup and for tens of seconds across a model
+  // switch — that is what UNREACHABLE_TOLERANCE exists for in the watchdog — so a
+  // failed probe is not evidence the server is gone. With discovery also unavailable
+  // and the recorded launcher already exited, `targets` comes back empty, and the
+  // command cleared state, wrote the success tombstone, and reported completion while
+  // the unrecorded grandchild carried on holding the socket.
+  //
+  // So the question is not "did the endpoint answer" but "is there anything here we
+  // cannot account for". Recorded identities count even when they turn out to be
+  // gone: the process that owns the socket was never one of them, so proving our
+  // records exited says nothing about it. Only a port with nothing answering AND
+  // nothing recorded is genuinely a case of "there was never anything to stop".
+  const somethingUnaccountedFor = endpointAnswered
+    || targets.length > 0 || watchdogRecord !== null || carried.length > 0;
+  const blindPort = discoveryFailed && somethingUnaccountedFor;
   if (unidentified.length || blindPort) {
     return {
       signalled: [], strangers, surviving: [], unknown: unidentified,
