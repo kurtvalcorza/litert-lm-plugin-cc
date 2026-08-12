@@ -1168,9 +1168,18 @@ describe('scoping socket ownership to the local address', () => {
 
       // The control: with PATH intact the same call answers properly, so the flag is
       // reporting the tools' absence and not merely defaulting to true.
-      const withTools = identifyPortOwners(PORT.discoveryBlind, () => true, '127.0.0.1');
-      assert.equal(withTools.discoveryFailed, false,
-        'a host that CAN look must not be reported as blind');
+      //
+      // Gated, because this half assumes a host that CAN look — and the whole subject
+      // of this test is hosts that cannot. On a minimal image with neither lsof nor
+      // ss, restoring PATH restores nothing, `discoveryFailed` stays correctly true,
+      // and an ungated control fails on precisely the configuration the feature
+      // exists for. The assertion above still holds there; only this one needs the
+      // guard the rest of the socket tests already use.
+      if (await canDiscoverPortOwners()) {
+        const withTools = identifyPortOwners(PORT.discoveryBlind, () => true, '127.0.0.1');
+        assert.equal(withTools.discoveryFailed, false,
+          'a host that CAN look must not be reported as blind');
+      }
 
       try { probe.kill('SIGKILL'); } catch { /* ignore */ }
     });
