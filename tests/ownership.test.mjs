@@ -32,9 +32,9 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import {
-  _parsers, addressServes, commandLaunches, formatPidRecord, identity,
-  isLitertLmServeCommand, parsePidRecord, pidsOnPort, recordIsStale, signallablePid,
-  startToken,
+  _parsers, addressServes, commandLaunches, descendantsOf, formatPidRecord, identity,
+  isLitertLmServeCommand, parsePidRecord, pidsOnPort, processTable, recordIsStale,
+  signallablePid, startGeneration, startToken,
 } from '../plugins/litertlm/scripts/process-identity.mjs';
 
 const SCRIPTS = join(dirname(fileURLToPath(import.meta.url)), '..', 'plugins', 'litertlm', 'scripts');
@@ -1198,6 +1198,104 @@ describe('a start that is still in progress', () => {
       assert.notEqual(r.status, 0);
       assert.match(r.stderr, /left over from a shutdown that did not finish/,
         'a pre-boot claim is a stale file, not an active generation');
+    });
+});
+
+describe('admitting a descendant into a start generation', () => {
+  /**
+   * Real pid reuse cannot be forced in a test — the OS decides when a number comes
+   * back around, and staging it would mean waiting out a pid space. So the admission
+   * rules are driven against a fabricated process table instead, which is the only
+   * way this gets deterministic coverage rather than a hopeful comment. The seam is
+   * the whole reason `startGeneration` takes a table reader.
+   */
+  const row = (ppid, start) => ({ ppid, start });
+
+  test('admits a genuine descendant, and its descendants', () => {
+    const table = new Map([
+      [100, row(1, 'T100')],
+      [200, row(100, 'T200')],
+      [300, row(200, 'T300')],
+      [900, row(1, 'T900')],          // unrelated
+    ]);
+    const gen = startGeneration(100, () => table);
+    const pids = gen.members().map((m) => m.pid).sort((a, b) => a - b);
+    assert.deepEqual(pids, [100, 200, 300], 'the whole chain, transitively');
+    assert.ok(!gen.has(900), 'and nothing that is not descended from the launcher');
+  });
+
+  // THE DEFECT. The first version admitted descendants of anything in the set that
+  // answered `pidAlive`, ignoring the token stored beside each member. So a launcher
+  // that exited and had its number reissued turned the unrelated replacement into a
+  // live root: its children were admitted with their own genuine tokens, every later
+  // identity check confirmed them, and cancellation would have signalled a stranger's
+  // processes with proof in hand.
+  test('a reused launcher pid does not vouch for the replacement\'s children', () => {
+    let table = new Map([[100, row(1, 'T100')], [200, row(100, 'T200')]]);
+    const gen = startGeneration(100, () => table);
+    assert.ok(gen.has(200), 'the real descendant is admitted while the launcher lives');
+
+    // pid 100 exits; the number is reissued to an unrelated process with its own
+    // child. Same pid, different process — which is exactly what a token detects.
+    table = new Map([
+      [100, row(1, 'STRANGER')],
+      [200, row(1, 'T200')],          // reparented to init, still genuinely ours
+      [777, row(100, 'T777')],        // the stranger's child
+    ]);
+    gen.sample(true);
+
+    assert.ok(!gen.has(777),
+      'a pid whose token no longer matches must not vouch for anything');
+    assert.ok(gen.has(200), 'while a member that is still itself is unaffected');
+  });
+
+  test('a member that is still itself keeps admitting its own descendants', () => {
+    let table = new Map([[100, row(1, 'T100')], [200, row(100, 'T200')]]);
+    const gen = startGeneration(100, () => table);
+
+    // The launcher exits entirely. 200 is still ours and still proven, so the engine
+    // process it goes on to spawn is still admissible.
+    table = new Map([[200, row(1, 'T200')], [300, row(200, 'T300')]]);
+    gen.sample(true);
+
+    assert.ok(gen.has(300), 'descent continues through a member that still proves out');
+  });
+
+  test('a launcher absent from the table admits nothing', () => {
+    let table = new Map([[100, row(1, 'T100')]]);
+    const gen = startGeneration(100, () => table);
+    table = new Map([[555, row(100, 'T555')]]);   // 100 gone; 555 claims it as parent
+    gen.sample(true);
+    assert.ok(!gen.has(555), 'a dead root is not a root');
+  });
+
+  test('an unknown launcher yields an empty generation', () => {
+    const gen = startGeneration(4242, () => new Map());
+    assert.deepEqual(gen.members(), []);
+  });
+
+  // The parent link and the token must come from the same row, or the pairing has a
+  // reuse window in it. This is the structural version of that claim: the table the
+  // walk reads is the table the token is taken from.
+  test('the real process table pairs a parent link with a start token',
+    { timeout: 30_000 }, async () => {
+      const child = await startBystander();
+
+      const table = processTable();
+      const self = table.get(process.pid);
+      assert.ok(self, 'this process should be in its own process table');
+      assert.equal(self.start, startToken(process.pid),
+        'and the token in the table must equal the one identity reports');
+
+      // The claim that matters: the walk and the token come from the same snapshot,
+      // so a pid found by descent already carries a token comparable with the ones in
+      // pid files. Checked against the real OS, not the fabricated table above.
+      assert.ok(descendantsOf([process.pid], table).includes(child.pid),
+        'a child we just spawned should be discoverable by descent');
+      assert.equal(table.get(child.pid).start, startToken(child.pid),
+        'and the row that supplied its parent link must supply a matching token');
+
+      try { child.kill('SIGKILL'); } catch { /* ignore */ }
     });
 });
 

@@ -195,18 +195,39 @@ Cancellation is the opposite situation — we spawned the launcher moments ago, 
 from the process I just started" is a stronger claim than any command line, one no bystander can
 forge and no heuristic has to guess at.
 
-Two properties make it sound. **It must sample early and keep sampling**, because a detached
-grandchild is reparented to init the moment its parent exits and no later walk can recover the
-relationship — verified directly: a three-level tree yields two descendants while the middle
-stage lives and *zero* once it exits. And **a root must be alive to vouch for anything**, since
-the ppid of an exited process names whoever the OS has since handed that number to; only live
-roots are used, which is what makes the link trustworthy.
+Two properties make it sound, and the second was got wrong once in exactly the way this document
+keeps warning about.
 
-Descent gets a process into the set; it never authorises a signal. Every member carries the
-token captured when it was first seen and is re-proved before each signal, so a reissued pid
-drops out like any other. The quiescence counter stays as a backstop for the one case descent
-cannot cover — a grandchild spawned after the last sample *and* after its parent had exited —
-rather than as the primary evidence.
+**It must sample early and keep sampling**, because a detached grandchild is reparented to init
+the moment its parent exits and no later walk can recover the relationship — verified directly:
+a three-level tree yields two descendants while the middle stage lives and *zero* once it exits.
+
+**A root must be PROVEN, not merely alive.** The first version admitted descendants of any member
+that answered `pidAlive`, ignoring the token already stored beside it — the weak test authorising
+what only the strong one may. When a launcher exited and its number was reissued, the unrelated
+replacement became a live root, its children were admitted carrying their own genuine tokens, and
+every later identity check confirmed them: real processes, real tokens, not ours. Cancellation
+would have signalled a stranger's children with proof in hand. Liveness says a number is in use;
+identity says by whom, and only the second may authorise anything.
+
+**The parent link and the token come from one snapshot.** Reading the tree first and establishing
+identity second reopens the same window one step along: a candidate exits in between, its number
+is reissued, and the token captured describes the replacement — which then passes every check
+downstream. Socket discovery had this shape and fixed it by re-asking the port; here it is
+designed out, because one read answers both questions on every platform. Linux takes fields 4 and
+22 from a single read of a single `/proc/<pid>/stat`; `ps` and `Win32_Process` each carry ppid and
+creation time on the same row. The tokens are byte-identical to what `identity` produces, so a
+token from the table and a token from a pid file are directly comparable.
+
+Descent gets a process into the set; it never authorises a signal. Every member is re-proved
+before each signal, so a reissued pid drops out like any other. The quiescence counter stays as a
+backstop for the one case descent cannot cover — a grandchild spawned after the last sample *and*
+after its parent had exited — rather than as the primary evidence.
+
+Admission takes an injectable process table, because real pid reuse cannot be forced in a test:
+the OS decides when a number comes back around. The rules above are therefore driven against a
+fabricated table, which is what makes the reuse case deterministic coverage rather than a
+hopeful comment.
 
 Sampling is throttled by what a walk costs: Linux reads `/proc` and starts nothing, Windows means
 a PowerShell start-up (~930ms, blocking the loop the readiness probe shares) and so samples every

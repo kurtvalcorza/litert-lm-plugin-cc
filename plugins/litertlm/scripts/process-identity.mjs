@@ -415,61 +415,94 @@ export function pidsOnPort(port, host = null) {
 // bound a socket yet, which is the gap a listener-based search cannot close.
 // ---------------------------------------------------------------------------
 
-/** pid -> ppid, for every process the platform will describe. */
-function parentsWindows() {
+/**
+ * One snapshot of the process table: pid -> { ppid, start }.
+ *
+ * THE PARENT LINK AND THE START TOKEN COME FROM THE SAME OBSERVATION, and that is the
+ * entire reason this exists rather than a `pid -> ppid` map with token lookups bolted
+ * on afterwards. Reading the tree first and establishing identity second reopens the
+ * exact window this module was written to close: a candidate exits between the two
+ * steps, its number is reissued, and the token captured describes the replacement —
+ * which then passes every later identity check, because it is a real token for a real
+ * process that simply is not ours. Socket discovery had this bug and fixed it by
+ * re-asking the port; here it is designed out instead, because one read can answer
+ * both questions at once on every platform that matters.
+ *
+ * The `start` values are byte-identical to what `identity` produces, so a token from
+ * here and a token from a pid file are directly comparable. That is load-bearing —
+ * `resolveTargets` re-proves generation members against `identity`, not against this.
+ */
+function tableWindows() {
   const out = run('powershell.exe', ['-NoProfile', '-Command',
     'Get-CimInstance Win32_Process -ErrorAction SilentlyContinue '
-    + '| ForEach-Object { ($_.ProcessId, $_.ParentProcessId) -join [char]9 }']);
-  const parents = new Map();
+    + '| ForEach-Object { ($_.ProcessId, $_.ParentProcessId, '
+    + '$_.CreationDate.ToFileTimeUtc()) -join [char]9 }']);
+  const table = new Map();
   for (const line of out.split(/\r?\n/)) {
-    const [pidStr, ppidStr] = line.split('\t');
+    const [pidStr, ppidStr, start] = line.split('\t');
     const pid = Number.parseInt(pidStr, 10);
     const ppid = Number.parseInt(ppidStr, 10);
-    if (Number.isInteger(pid) && Number.isInteger(ppid)) parents.set(pid, ppid);
+    if (!Number.isInteger(pid) || !Number.isInteger(ppid) || !start) continue;
+    table.set(pid, { ppid, start: start.trim() });
   }
-  return parents;
+  return table;
 }
 
 /**
- * Linux: field 4 of /proc/<pid>/stat. No subprocess, so this is cheap enough to do
- * on every poll — which matters, because the whole point is to catch a short-lived
+ * Linux: fields 4 and 22 of /proc/<pid>/stat, from ONE read of ONE file — which makes
+ * the pairing atomic rather than merely quick. No subprocess either, so this is cheap
+ * enough to run on every poll, and the whole point is to catch a short-lived
  * intermediate before it exits.
  *
- * `comm` (field 2) is parenthesised and may contain spaces and parentheses, so the
- * fields are counted from the LAST ')', exactly as `inspectLinux` does.
+ * `comm` (field 2) is parenthesised and may itself contain spaces and parentheses, so
+ * fields are counted from the LAST ')', exactly as `inspectLinux` does. Zombies are
+ * omitted for the same reason they are elsewhere: they hold nothing, serve nothing,
+ * and `pidAlive` already calls them dead.
  */
-function parentsLinux() {
-  const parents = new Map();
+function tableLinux() {
+  const table = new Map();
   let entries;
-  try { entries = readdirSync('/proc'); } catch { return parents; }
+  try { entries = readdirSync('/proc'); } catch { return table; }
   for (const name of entries) {
     const pid = Number.parseInt(name, 10);
     if (!Number.isInteger(pid) || String(pid) !== name) continue;
     try {
       const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
       const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+      if (fields[0] === 'Z') continue;                      // exited, not yet reaped
       const ppid = Number.parseInt(fields[1], 10);          // field 4, 1-indexed
-      if (Number.isInteger(ppid)) parents.set(pid, ppid);
+      const start = fields[19];                             // field 22, 1-indexed
+      if (Number.isInteger(ppid) && start) table.set(pid, { ppid, start });
     } catch { /* it exited between the readdir and the read */ }
   }
-  return parents;
+  return table;
 }
 
-/** macOS and other POSIX: one `ps` for the whole table. */
-function parentsPosixPs() {
-  const parents = new Map();
-  for (const line of run('ps', ['-Ao', 'pid=,ppid=']).split('\n')) {
-    const m = line.trim().match(/^(\d+)\s+(\d+)$/);
+/**
+ * macOS and other POSIX: one `ps` for the whole table, carrying `args` because the
+ * token on this platform includes a command-line digest — `lstart` has no subsecond
+ * field, so time alone cannot separate two processes created in the same second.
+ * Built exactly as `inspectPosixPs` builds it, or the two would not compare equal.
+ */
+function tablePosixPs() {
+  const table = new Map();
+  for (const line of run('ps', ['-Ao', 'pid=,ppid=,lstart=,args=']).split('\n')) {
+    const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.*)$/);
     if (m === null) continue;
-    parents.set(Number.parseInt(m[1], 10), Number.parseInt(m[2], 10));
+    const cmdline = flatten(m[4]);
+    const digest = createHash('sha256').update(cmdline).digest('hex').slice(0, 16);
+    table.set(Number.parseInt(m[1], 10), {
+      ppid: Number.parseInt(m[2], 10),
+      start: `${flatten(m[3])}#${digest}`,
+    });
   }
-  return parents;
+  return table;
 }
 
-export function processParents() {
-  if (process.platform === 'win32') return parentsWindows();
-  if (process.platform === 'linux') return parentsLinux();
-  return parentsPosixPs();
+export function processTable() {
+  if (process.platform === 'win32') return tableWindows();
+  if (process.platform === 'linux') return tableLinux();
+  return tablePosixPs();
 }
 
 /**
@@ -489,8 +522,7 @@ export function processParents() {
  *    roots it has just confirmed alive, which is what makes the link trustworthy —
  *    a live pid cannot be simultaneously held by anything else.
  */
-export function descendantsOf(roots) {
-  const parents = processParents();
+export function descendantsOf(roots, table = processTable()) {
   const known = new Set(roots);
   const found = new Set();
 
@@ -498,12 +530,94 @@ export function descendantsOf(roots) {
   // grandchild can be visited before the child that links it to us.
   for (let grew = true; grew;) {
     grew = false;
-    for (const [pid, ppid] of parents) {
+    for (const [pid, { ppid }] of table) {
       if (known.has(pid) || found.has(pid)) continue;
       if (known.has(ppid) || found.has(ppid)) { found.add(pid); grew = true; }
     }
   }
   return [...found];
+}
+
+/**
+ * How often to walk the process table, set by what a walk costs here.
+ *
+ * Linux reads /proc and starts nothing, so it can sample at the poll rate. Windows
+ * means a PowerShell start-up, measured at ~930ms and blocking the event loop, so
+ * sampling every 750ms poll would starve the readiness probe it shares the loop with.
+ * `ps` on macOS sits between the two and is treated as the cheap case.
+ */
+const DESCENDANT_SAMPLE_MS = process.platform === 'win32' ? 3000 : 250;
+
+/**
+ * The set of processes one start is responsible for.
+ *
+ * Seeded with the launcher we spawned and grown by sampling the process table while
+ * that launcher — or something already admitted from it — is still provably itself.
+ *
+ * ACCUMULATION IS THE POINT. A detached grandchild is reparented to init the instant
+ * its parent exits, so a single walk at cancellation time finds nothing: by then the
+ * only evidence of the relationship is gone. Sampling during the startup poll catches
+ * the link while it still exists, and what is captured stays captured.
+ *
+ * A ROOT MUST BE PROVEN, NOT MERELY ALIVE — and getting this wrong is how the first
+ * version of this recreated the accident the whole module exists to prevent. It
+ * admitted descendants of anything in the set that answered `pidAlive`, ignoring the
+ * token already stored beside each member. So when a launcher exited and its number
+ * was reissued, the unrelated replacement became a "live" root, its children were
+ * admitted with their own genuine tokens, and every later identity check faithfully
+ * confirmed them — because they were real processes with real tokens that simply were
+ * not ours. Cancellation would then have signalled a stranger's children, with proof.
+ *
+ * Liveness says a number is in use. Identity says by whom. Only the second can
+ * authorise anything here, which is the rule the rest of this file already follows.
+ *
+ * Descent gets a process INTO the set; it never authorises a signal on its own. Every
+ * member carries the token captured when it was first seen, and `resolveTargets`
+ * re-proves each one before anything is signalled.
+ *
+ * `readTable` is a seam. Real pid reuse cannot be forced reliably in a test, so the
+ * admission rules are exercised against a fabricated table instead — which is the
+ * only way the case above gets deterministic coverage rather than a hopeful comment.
+ */
+export function startGeneration(launcherPid, readTable = processTable) {
+  const mine = new Map();
+  let lastSample = 0;
+
+  const admitFrom = (table) => {
+    // Members whose recorded token still matches this snapshot. Anything else is a
+    // number we used to know, and a number vouches for nothing.
+    const roots = [];
+    for (const { pid, token } of mine.values()) {
+      if (table.get(pid)?.start === token) roots.push(pid);
+    }
+    if (!roots.length) return;
+
+    for (const pid of descendantsOf(roots, table)) {
+      if (mine.has(pid)) continue;
+      // The token comes from the SAME row that supplied the parent link, so there is
+      // no gap for the pid to be reused between learning it is a descendant and
+      // learning who it is.
+      mine.set(pid, { pid, token: table.get(pid).start });
+    }
+  };
+
+  const seed = readTable();
+  const seedRow = launcherPid ? seed.get(launcherPid) : undefined;
+  if (seedRow) {
+    mine.set(launcherPid, { pid: launcherPid, token: seedRow.start });
+    admitFrom(seed);
+  }
+
+  return {
+    members: () => [...mine.values()],
+    has: (pid) => mine.has(pid),
+    adopt(owner) { if (!mine.has(owner.pid)) mine.set(owner.pid, owner); },
+    sample(force = false) {
+      if (!force && Date.now() - lastSample < DESCENDANT_SAMPLE_MS) return;
+      lastSample = Date.now();
+      admitFrom(readTable());
+    },
+  };
 }
 
 /** The token to store alongside a pid so it can be re-identified later. */
