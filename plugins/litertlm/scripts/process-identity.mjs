@@ -455,10 +455,14 @@ export function pidsOnPort(port, host = null) {
  * `resolveTargets` re-proves generation members against `identity`, not against this.
  */
 function tableWindows() {
-  const out = run('powershell.exe', ['-NoProfile', '-Command',
+  return parseTableWindows(run('powershell.exe', ['-NoProfile', '-Command',
     'Get-CimInstance Win32_Process -ErrorAction SilentlyContinue '
     + '| ForEach-Object { ($_.ProcessId, $_.ParentProcessId, '
-    + '$_.CreationDate.ToFileTimeUtc()) -join [char]9 }']);
+    + '$_.CreationDate.ToFileTimeUtc()) -join [char]9 }']).out);
+}
+
+/** `<ProcessId>\t<ParentProcessId>\t<CreationDate as FILETIME>` per row. */
+function parseTableWindows(out) {
   const table = new Map();
   for (const line of out.split(/\r?\n/)) {
     const [pidStr, ppidStr, start] = line.split('\t');
@@ -507,8 +511,13 @@ function tableLinux() {
  * Built exactly as `inspectPosixPs` builds it, or the two would not compare equal.
  */
 function tablePosixPs() {
+  return parseTablePosix(run('ps', ['-Ao', 'pid=,ppid=,lstart=,args=']).out);
+}
+
+/** `<pid> <ppid> <Www Mmm dd HH:MM:SS YYYY> <args...>` per row. */
+function parseTablePosix(out) {
   const table = new Map();
-  for (const line of run('ps', ['-Ao', 'pid=,ppid=,lstart=,args=']).split('\n')) {
+  for (const line of out.split('\n')) {
     const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.*)$/);
     if (m === null) continue;
     const cmdline = flatten(m[4]);
@@ -976,6 +985,8 @@ export const _parsers = {
   getNetTcpConnection: parseGetNetTcpConnection,
   lsof: parseLsofFields,
   ss: parseSs,
+  tableWindows: parseTableWindows,
+  tablePosix: parseTablePosix,
 };
 
 /** Test seam: forget everything looked up so far. */

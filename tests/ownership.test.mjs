@@ -1099,6 +1099,32 @@ describe('scoping socket ownership to the local address', () => {
         { pid: 72608, address: '*' }]);
   });
 
+  // These two exist because their absence cost a red CI on two platforms at once.
+  //
+  // `run()` was changed to distinguish "the tool could not start" from "it found
+  // nothing", which altered its return shape — and two table builders went on
+  // treating it as a string. Linux never noticed: it reads /proc directly and calls
+  // `run()` not at all, so a full local suite was green while macOS and Windows both
+  // died with `run.split is not a function`. Parsing is split from running for the
+  // same reason the socket parsers are, so every platform's shape is exercised
+  // everywhere rather than only where its tool happens to exist.
+  test('parses real Win32_Process output', () => {
+    assert.deepEqual(
+      [..._parsers.tableWindows('4\t0\t133700000000000000\r\n68056\t4\t133700000000000001\r\n')],
+      [[4, { ppid: 0, start: '133700000000000000' }],
+        [68056, { ppid: 4, start: '133700000000000001' }]]);
+  });
+
+  test('parses real ps -Ao pid=,ppid=,lstart=,args= output', () => {
+    const table = _parsers.tablePosix(
+      '    1     0 Mon Aug 11 09:00:00 2026 /sbin/launchd\n'
+      + '  512     1 Mon Aug 11 09:01:02 2026 node server.js --port 9379\n');
+    assert.equal(table.get(512).ppid, 1);
+    assert.match(table.get(512).start, /^Mon Aug 11 09:01:02 2026#[0-9a-f]{16}$/,
+      'the token must carry the lstart time and a command-line digest, as identity does');
+    assert.equal(table.size, 2);
+  });
+
   test('parses real ss -ltnp output, header and shared sockets included', () => {
     const out = 'State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process\n'
       + 'LISTEN 0      128    127.0.0.1:9379      0.0.0.0:*  users:(("python",pid=68056,fd=7))\n'
