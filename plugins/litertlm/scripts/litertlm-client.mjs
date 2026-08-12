@@ -107,16 +107,44 @@ function clearState(port, name) {
  */
 const IN_FLIGHT_DIR = 'in-flight.d';
 
-function acquireInFlight(port) {
+async function acquireInFlight(port, opts = null) {
   const dir = join(stateDir(port), IN_FLIGHT_DIR);
-  const marker = join(dir, `${process.pid}-${Date.now()}`);
-  try {
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(marker, '', 'utf8');
-    return marker;
-  } catch {
-    return null;   // tracking is best-effort; never fail a request over it
+
+  const publish = () => {
+    const marker = join(dir, `${process.pid}-${Date.now()}`);
+    try {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(marker, '', 'utf8');
+      return marker;
+    } catch {
+      return null;   // tracking is best-effort; never fail a request over it
+    }
+  };
+
+  // PUBLISH, THEN RE-CHECK THE HANDSHAKE. Checking `stopping` before creating the
+  // marker — which is what `awaitNotStopping` does, earlier and further away — is a
+  // read whose answer expires immediately: a supervisor can claim the handshake, count
+  // zero markers, and still be inside its identity lookup when this marker appears,
+  // after which it signals a server with a live request against it. Writing the
+  // handshake first on the watchdog side does not fix that on its own, because
+  // nothing here looked again.
+  //
+  // Two one-way tests in opposite orders is the whole protocol: the watchdog claims
+  // then counts, this claims then re-reads. A marker that appears before the
+  // handshake is counted; one that appears after is withdrawn by its own author. Both
+  // cannot miss each other.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const marker = publish();
+    if (marker === null) return null;
+    if (readState(port, 'stopping') === null) return marker;
+
+    // A shutdown owns the server right now. Stand aside rather than pin it open, wait
+    // for the handshake to clear, and try once more.
+    releaseInFlight(marker);
+    if (opts === null || attempt === 1) return null;
+    await awaitNotStopping(opts);
   }
+  return null;
 }
 
 function releaseInFlight(marker) {
@@ -1532,7 +1560,7 @@ async function main() {
   // Activity accounting (T057). in-flight MUST fall on every exit path, or a crashed
   // client pins the server alive forever.
   touchActivity(opts.port);
-  const marker = acquireInFlight(opts.port);
+  const marker = await acquireInFlight(opts.port, opts);
 
   let released = false;
   const release = () => {
