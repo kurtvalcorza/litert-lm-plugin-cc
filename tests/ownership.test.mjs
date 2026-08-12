@@ -1479,7 +1479,8 @@ describe('admitting a descendant into a start generation', () => {
     { timeout: 30_000 }, async () => {
       const child = await startBystander();
 
-      const table = processTable();
+      const { ok, table } = processTable();
+      assert.equal(ok, true, 'the walk should have run');
       const self = table.get(process.pid);
       assert.ok(self, 'this process should be in its own process table');
       assert.equal(self.start, startToken(process.pid),

@@ -490,10 +490,11 @@ export function pidsOnPort(port, host = null) {
  * `resolveTargets` re-proves generation members against `identity`, not against this.
  */
 function tableWindows() {
-  return parseTableWindows(run('powershell.exe', ['-NoProfile', '-Command',
+  const r = run('powershell.exe', ['-NoProfile', '-Command',
     'Get-CimInstance Win32_Process -ErrorAction SilentlyContinue '
     + '| ForEach-Object { ($_.ProcessId, $_.ParentProcessId, '
-    + '$_.CreationDate.ToFileTimeUtc()) -join [char]9 }']).out);
+    + '$_.CreationDate.ToFileTimeUtc()) -join [char]9 }']);
+  return { ok: r.ok, table: parseTableWindows(r.out) };
 }
 
 /** `<ProcessId>\t<ParentProcessId>\t<CreationDate as FILETIME>` per row. */
@@ -523,7 +524,7 @@ function parseTableWindows(out) {
 function tableLinux() {
   const table = new Map();
   let entries;
-  try { entries = readdirSync('/proc'); } catch { return table; }
+  try { entries = readdirSync('/proc'); } catch { return { ok: false, table }; }
   for (const name of entries) {
     const pid = Number.parseInt(name, 10);
     if (!Number.isInteger(pid) || String(pid) !== name) continue;
@@ -536,7 +537,7 @@ function tableLinux() {
       if (Number.isInteger(ppid) && start) table.set(pid, { ppid, start });
     } catch { /* it exited between the readdir and the read */ }
   }
-  return table;
+  return { ok: true, table };
 }
 
 /**
@@ -546,7 +547,8 @@ function tableLinux() {
  * Built exactly as `inspectPosixPs` builds it, or the two would not compare equal.
  */
 function tablePosixPs() {
-  return parseTablePosix(run('ps', ['-ww', '-Ao', 'pid=,ppid=,lstart=,args=']).out);
+  const r = run('ps', ['-ww', '-Ao', 'pid=,ppid=,lstart=,args=']);
+  return { ok: r.ok, table: parseTablePosix(r.out) };
 }
 
 /** `<pid> <ppid> <Www Mmm dd HH:MM:SS YYYY> <args...>` per row. */
@@ -565,6 +567,15 @@ function parseTablePosix(out) {
   return table;
 }
 
+/**
+ * `{ ok, table }` — because a walk that FAILED is not a walk that saw nothing.
+ *
+ * Every builder returns an empty Map when its query cannot run, and an empty Map is
+ * indistinguishable from a machine with no processes on it. A caller that treats that
+ * as an observation concludes quiescence from a question it never managed to ask,
+ * which is how a generation stayed "authoritative" across failed lookups and reported
+ * a clean teardown while its descendant was still starting.
+ */
 export function processTable() {
   if (process.platform === 'win32') return tableWindows();
   if (process.platform === 'linux') return tableLinux();
@@ -588,7 +599,7 @@ export function processTable() {
  *    roots it has just confirmed alive, which is what makes the link trustworthy —
  *    a live pid cannot be simultaneously held by anything else.
  */
-export function descendantsOf(roots, table = processTable()) {
+export function descendantsOf(roots, table = processTable().table) {
   const known = new Set(roots);
   const found = new Set();
 
@@ -649,7 +660,16 @@ export function startGeneration(launcherPid, readTable = processTable,
   launcherIsStillOurs = () => true) {
   const mine = new Map();
   let lastSample = 0;
-  let authoritative = false;
+  let seeded = false;
+  let lastWalkSaw = false;
+
+  // The seam hands back a bare Map; production hands back `{ ok, table }`. Normalised
+  // here so a test can stay as simple as `() => table` while the real caller keeps the
+  // distinction between a walk that saw nothing and one that never ran.
+  const walk = () => {
+    const r = readTable();
+    return r instanceof Map ? { ok: true, table: r } : r;
+  };
 
   const admitFrom = (table) => {
     // SEEDING IS RETRIED, NOT DONE ONCE. It used to happen only in the constructor,
@@ -670,11 +690,11 @@ export function startGeneration(launcherPid, readTable = processTable,
     // So a failed first read is recoverable only for as long as our child is alive.
     // Once it has exited unseen, the generation stays unauthoritative — which is the
     // honest answer, and one cancellation already knows how to handle.
-    if (!authoritative && launcherPid && launcherIsStillOurs()) {
+    if (!seeded && launcherPid && launcherIsStillOurs()) {
       const row = table.get(launcherPid);
       if (row) {
         mine.set(launcherPid, { pid: launcherPid, token: row.start });
-        authoritative = true;
+        seeded = true;
       }
     }
 
@@ -699,21 +719,26 @@ export function startGeneration(launcherPid, readTable = processTable,
     // Paid only when there is something to admit, which is rare: most samples find
     // nothing new and return above. That matters on Windows, where a walk is a
     // PowerShell start-up.
-    const confirm = readTable();
+    const confirmed = walk();
+    if (!confirmed.ok) { lastWalkSaw = false; return; }
+    const confirm = confirmed.table;
 
     // Roots that survived the whole enumeration, judged against the second walk.
     const proven = roots.filter((pid) => confirm.get(pid)?.start === mine.get(pid).token);
     if (!proven.length) return;
 
-    const stillDescended = new Set(descendantsOf(proven, confirm));
     for (const pid of candidates) {
-      // Present in BOTH walks, descended from a root that survived BOTH, and carrying
-      // the same identity in each. The token comes from the same row that supplied the
-      // parent link, so there is no gap for the pid to be reused between learning it
-      // is a descendant and learning who it is.
+      // Present in BOTH walks with the SAME identity, and descended in the first from
+      // a root that survived both. That is sufficient, and re-checking the parent
+      // chain in the second walk is not merely redundant but harmful: a genuine
+      // descendant whose short-lived parent exits between the two walks is reparented
+      // to init and would be rejected — losing exactly the process this whole
+      // mechanism exists to catch, and doing it most often on Windows where the second
+      // query takes about a second. The root surviving both walks is what closes the
+      // reuse hole; the chain surviving the second closes nothing.
       const first = table.get(pid);
       const second = confirm.get(pid);
-      if (!second || !stillDescended.has(pid) || first.start !== second.start) continue;
+      if (!second || first.start !== second.start) continue;
       mine.set(pid, { pid, token: second.start });
     }
   };
@@ -739,7 +764,12 @@ export function startGeneration(launcherPid, readTable = processTable,
      * same three-state discipline the rest of the module uses: gone, ours, or
      * unjudgeable — and unjudgeable must never be spent as proof.
      */
-    authoritative: () => authoritative,
+    // BOTH HALVES. Seeding proves we once identified the launcher; the last walk
+    // succeeding proves the emptiness a caller is about to read is an observation
+    // rather than a failed question. A seeded generation whose queries have started
+    // failing reported "nothing remains" from walks that returned an empty Map because
+    // `ps` could not run — quiescence concluded from a question never asked.
+    authoritative: () => seeded && lastWalkSaw,
 
     adopt(owner) {
       // A MATCHING NUMBER IS NOT A MATCHING MEMBER. If an exited launcher's pid was
@@ -754,7 +784,10 @@ export function startGeneration(launcherPid, readTable = processTable,
       // it is as good a root as the launcher and equally good evidence that we were
       // able to look at all.
       mine.set(owner.pid, owner);
-      authoritative = true;
+      seeded = true;
+      // An adoption is itself a successful observation: it comes from socket discovery
+      // having answered, so the generation is not blind even if the last table walk was.
+      lastWalkSaw = true;
     },
 
     /**
@@ -768,9 +801,10 @@ export function startGeneration(launcherPid, readTable = processTable,
     async sample(force = false) {
       if (!force && Date.now() - lastSample < DESCENDANT_SAMPLE_MS) return;
       lastSample = Date.now();
-      const table = readTable();
+      const seen = walk();
       await new Promise((r) => { setImmediate(r); });
-      admitFrom(table);
+      lastWalkSaw = seen.ok;
+      if (seen.ok) admitFrom(seen.table);
     },
   };
 }
