@@ -394,11 +394,25 @@ async function main() {
       // stops a new client entering at all, which is the only thing that makes the
       // count mean something by the time it is acted on.
       writeState('stopping', Date.now());
-      if (countInFlight() > 0) {
+      const busy = countInFlight();
+      if (busy > 0) {
         clearState('stopping');        // let the live request through
         touchIdleDeadline();
         continue;
       }
+
+      // AND THE CONFIGURED DELAY APPLIES TO RETRIES TOO. Yielding to a request set
+      // `last-activity` and then came straight back here on the next poll, without
+      // consulting it — so a survivor that had just served a request was killed about
+      // five seconds later even where the user asked for 900. A failed first attempt
+      // does not convert the idle timeout into the poll interval.
+      const since = Number.parseInt(readState('last-activity', String(Date.now())), 10)
+        || Date.now();
+      if (Date.now() - since < idleMs) {
+        clearState('stopping');
+        continue;
+      }
+
       const left = stillOurs(pendingSurvivors);
       if (!left.outstanding.length) {
         const chased = pendingSurvivors;

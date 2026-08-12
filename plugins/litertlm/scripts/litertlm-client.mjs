@@ -133,18 +133,27 @@ async function acquireInFlight(port, opts = null) {
   // then counts, this claims then re-reads. A marker that appears before the
   // handshake is counted; one that appears after is withdrawn by its own author. Both
   // cannot miss each other.
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
     const marker = publish();
     if (marker === null) return null;
     if (readState(port, 'stopping') === null) return marker;
 
     // A shutdown owns the server right now. Stand aside rather than pin it open, wait
-    // for the handshake to clear, and try once more.
+    // for the handshake to clear, and try again.
     releaseInFlight(marker);
-    if (opts === null || attempt === 1) return null;
+    if (opts === null) return null;
     await awaitNotStopping(opts);
   }
-  return null;
+
+  // NEVER FALL THROUGH UNTRACKED. Returning null here and letting the request proceed
+  // would be worse than not having this protocol at all: the watchdog counts markers
+  // to decide whether anything is in flight, so a request running without one is
+  // exactly the request it is free to kill mid-generation. Giving up loudly is
+  // recoverable — the user retries — and running unprotected is not.
+  throw new Error(
+    'the server is shutting down and the shutdown has not finished.\n'
+    + '  This request was not started, rather than started without protection from\n'
+    + '  the idle watchdog. Retry in a moment.');
 }
 
 function releaseInFlight(marker) {
