@@ -340,6 +340,10 @@ async function main() {
   // will fail every probe from here on.
   let pendingSurvivors = [];
 
+  // A retry that stands aside for live work must not then treat the server as having
+  // been idle all along: the request it just yielded to IS activity.
+  const touchIdleDeadline = () => writeState('last-activity', Date.now());
+
   const idleMs = opts.idleTimeout * 1000;
   const ceilingMs = Math.max(idleMs * HARD_CEILING_MULTIPLIER, HARD_CEILING_FLOOR_MS);
   let missedProbes = 0;
@@ -376,6 +380,16 @@ async function main() {
     // So the survivors are chased directly, on their identities rather than on the
     // socket, until they are provably gone.
     if (pendingSurvivors.length) {
+      // A RETRY IS STILL AN IDLE SHUTDOWN, and FR-024 does not lapse because the
+      // first attempt failed. `stopping` was released when it did, so a client may
+      // legitimately have connected to the surviving server and taken a marker since
+      // — and this branch reaches SIGKILL directly. Killing mid-generation because an
+      // earlier attempt was unlucky is exactly the guarantee the marker files exist
+      // to provide, so the same check the normal path makes is made here.
+      if (countInFlight() > 0) {
+        touchIdleDeadline();
+        continue;
+      }
       const left = stillOurs(pendingSurvivors);
       if (!left.outstanding.length) {
         const chased = pendingSurvivors;
@@ -388,8 +402,14 @@ async function main() {
         // while declining to spawn a supervisor, because this watchdog still holds the
         // slot. Clearing unconditionally here deleted B's identity and then exited,
         // leaving B running with neither a record nor a watchdog.
+        // THE WHOLE IDENTITY, not the number. If the survivor's pid was reused by
+        // replacement server B, a numeric comparison finds it in `chased` and clears
+        // B's record anyway — the same pid-reuse mistake this file is built around,
+        // arriving through the guard meant to prevent a neighbouring one.
         const rec = parsePidRecord(readState('server.pid', ''));
-        if (rec !== null && !chased.some((t) => t.pid === rec.pid)) {
+        const isOurs = rec !== null
+          && chased.some((t) => t.pid === rec.pid && t.token === rec.token);
+        if (rec !== null && !isOurs) {
           continue;              // B's, not ours: leave it be and go on supervising it
         }
 

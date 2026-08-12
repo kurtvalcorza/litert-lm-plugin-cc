@@ -95,10 +95,10 @@ function run(cmd, args) {
     // when the process started fine and was then killed, so a terminated PowerShell
     // or lsof would hand back its partial (usually empty) stdout as an authoritative
     // answer — turning a query someone interrupted straight into an empty port.
-    if (r.error || r.signal) return { ok: false, out: '' };
-    return { ok: true, out: r.stdout ?? '' };
+    if (r.error || r.signal) return { ok: false, out: '', status: null };
+    return { ok: true, out: r.stdout ?? '', status: r.status };
   } catch {
-    return { ok: false, out: '' };
+    return { ok: false, out: '', status: null };
   }
 }
 
@@ -178,7 +178,7 @@ function inspectLinux(pid) {
 function inspectPosixPs(pids) {
   let out = '';
   try {
-    out = spawnSync('ps', ['-p', pids.join(','), '-o', 'pid=,lstart=,args='],
+    out = spawnSync('ps', ['-ww', '-p', pids.join(','), '-o', 'pid=,lstart=,args='],
       { encoding: 'utf8' }).stdout ?? '';
   } catch { return; }
 
@@ -352,14 +352,27 @@ function listenersOnPort(port) {
     const found = parseLsofFields(lsof.out);
     if (found.length) return { ok: true, listeners: found };
   }
+  // lsof's EXIT STATUS IS NOT A USABLE ERROR SIGNAL, and it is worth saying why
+  // rather than leaving it to be rediscovered. It returns 1 both for "nothing
+  // matched" and for an operational failure, and "nothing matched" is overwhelmingly
+  // the common case — an idle port. Treating nonzero as failure was tried and made
+  // `--stop` refuse on every empty port, because that is what an empty port looks
+  // like. Its stderr cannot arbitrate either: real installations emit `WARNING:
+  // can't stat()` for unreadable mounts on perfectly successful runs.
+  //
+  // So the ambiguity is accepted and mitigated rather than resolved: `ss` is
+  // consulted below and, where it runs, supplies an independent answer. Where neither
+  // tool runs at all, that IS detected — `ok` is false and the caller refuses.
 
   // Minimal container and CI images routinely ship iproute2 without lsof, so `ss` is
   // not a fallback for a failed lsof so much as the other half of the same question.
   const ss = run('ss', ['-ltnp', 'sport', `= :${port}`]);
   if (ss.ok) return { ok: true, listeners: parseSs(ss.out) };
 
-  // `ss` could not run either. If lsof at least RAN, its empty answer is an answer;
-  // if neither ran, we have no idea who holds this port and must say so.
+  // Neither tool gave a usable answer. lsof's empty output counts as a real answer
+  // only if it also exited cleanly — a nonzero exit with nothing printed could as
+  // easily be a broken query as an empty port, and with `ss` unavailable there is no
+  // second opinion to settle it.
   return { ok: lsof.ok, listeners: [] };
 }
 
@@ -533,7 +546,7 @@ function tableLinux() {
  * Built exactly as `inspectPosixPs` builds it, or the two would not compare equal.
  */
 function tablePosixPs() {
-  return parseTablePosix(run('ps', ['-Ao', 'pid=,ppid=,lstart=,args=']).out);
+  return parseTablePosix(run('ps', ['-ww', '-Ao', 'pid=,ppid=,lstart=,args=']).out);
 }
 
 /** `<pid> <ppid> <Www Mmm dd HH:MM:SS YYYY> <args...>` per row. */
