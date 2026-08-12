@@ -1329,7 +1329,7 @@ describe('admitting a descendant into a start generation', () => {
    */
   const row = (ppid, start) => ({ ppid, start });
 
-  test('admits a genuine descendant, and its descendants', () => {
+  test('admits a genuine descendant, and its descendants', async () => {
     const table = new Map([
       [100, row(1, 'T100')],
       [200, row(100, 'T200')],
@@ -1337,6 +1337,7 @@ describe('admitting a descendant into a start generation', () => {
       [900, row(1, 'T900')],          // unrelated
     ]);
     const gen = startGeneration(100, () => table);
+    await gen.sample(true);
     const pids = gen.members().map((m) => m.pid).sort((a, b) => a - b);
     assert.deepEqual(pids, [100, 200, 300], 'the whole chain, transitively');
     assert.ok(!gen.has(900), 'and nothing that is not descended from the launcher');
@@ -1348,9 +1349,10 @@ describe('admitting a descendant into a start generation', () => {
   // live root: its children were admitted with their own genuine tokens, every later
   // identity check confirmed them, and cancellation would have signalled a stranger's
   // processes with proof in hand.
-  test('a reused launcher pid does not vouch for the replacement\'s children', () => {
+  test('a reused launcher pid does not vouch for the replacement\'s children', async () => {
     let table = new Map([[100, row(1, 'T100')], [200, row(100, 'T200')]]);
     const gen = startGeneration(100, () => table);
+    await gen.sample(true);
     assert.ok(gen.has(200), 'the real descendant is admitted while the launcher lives');
 
     // pid 100 exits; the number is reissued to an unrelated process with its own
@@ -1360,35 +1362,38 @@ describe('admitting a descendant into a start generation', () => {
       [200, row(1, 'T200')],          // reparented to init, still genuinely ours
       [777, row(100, 'T777')],        // the stranger's child
     ]);
-    gen.sample(true);
+    await gen.sample(true);
 
     assert.ok(!gen.has(777),
       'a pid whose token no longer matches must not vouch for anything');
     assert.ok(gen.has(200), 'while a member that is still itself is unaffected');
   });
 
-  test('a member that is still itself keeps admitting its own descendants', () => {
+  test('a member that is still itself keeps admitting its own descendants', async () => {
     let table = new Map([[100, row(1, 'T100')], [200, row(100, 'T200')]]);
     const gen = startGeneration(100, () => table);
+    await gen.sample(true);
 
     // The launcher exits entirely. 200 is still ours and still proven, so the engine
     // process it goes on to spawn is still admissible.
     table = new Map([[200, row(1, 'T200')], [300, row(200, 'T300')]]);
-    gen.sample(true);
+    await gen.sample(true);
 
     assert.ok(gen.has(300), 'descent continues through a member that still proves out');
   });
 
-  test('a launcher absent from the table admits nothing', () => {
+  test('a launcher absent from the table admits nothing', async () => {
     let table = new Map([[100, row(1, 'T100')]]);
     const gen = startGeneration(100, () => table);
+    await gen.sample(true);
     table = new Map([[555, row(100, 'T555')]]);   // 100 gone; 555 claims it as parent
-    gen.sample(true);
+    await gen.sample(true);
     assert.ok(!gen.has(555), 'a dead root is not a root');
   });
 
-  test('an unknown launcher yields an empty generation', () => {
+  test('an unknown launcher yields an empty generation', async () => {
     const gen = startGeneration(4242, () => new Map());
+    await gen.sample(true);
     assert.deepEqual(gen.members(), []);
   });
 
@@ -1398,9 +1403,10 @@ describe('admitting a descendant into a start generation', () => {
   // first read left the set permanently empty and every later sample derived its
   // roots from that emptiness. The cancelled start then reported a clean teardown
   // while its detached descendant went on to bind.
-  test('a failed first table read does not permanently disarm the generation', () => {
+  test('a failed first table read does not permanently disarm the generation', async () => {
     let table = new Map();                       // the query could not run at all
     const gen = startGeneration(100, () => table);
+    await gen.sample(true);
 
     assert.equal(gen.authoritative(), false,
       'nothing was established, so emptiness here is not evidence of anything');
@@ -1408,7 +1414,7 @@ describe('admitting a descendant into a start generation', () => {
 
     // The table recovers. Seeding must be retried rather than written off.
     table = new Map([[100, row(1, 'T100')], [200, row(100, 'T200')]]);
-    gen.sample(true);
+    await gen.sample(true);
 
     assert.equal(gen.authoritative(), true, 'a later read can still seed the launcher');
     assert.deepEqual(gen.members().map((m) => m.pid).sort((a, b) => a - b), [100, 200],
@@ -1420,13 +1426,13 @@ describe('admitting a descendant into a start generation', () => {
   // taken as authoritative and its descendants admitted with valid tokens that
   // cancellation would re-prove and signal. `launcherPid` is a number; only the
   // ChildProcess handle knows whether that number is still the process we spawned.
-  test('a retried seed is refused once the child handle says the pid is not ours', () => {
+  test('a retried seed is refused once the child handle says the pid is not ours', async () => {
     const table = new Map([
       [100, row(1, 'STRANGER')],       // 100 was reused while we were not looking
       [200, row(100, 'T200')],         // the stranger's child
     ]);
     const exited = startGeneration(100, () => table, () => false);
-    exited.sample(true);
+    await exited.sample(true);
 
     assert.equal(exited.authoritative(), false,
       'a dead child handle must not let a reused pid seed the generation');
@@ -1435,21 +1441,23 @@ describe('admitting a descendant into a start generation', () => {
 
     // The control: the same table with a handle that still vouches for the number.
     const live = startGeneration(100, () => table, () => true);
+    await live.sample(true);
     assert.equal(live.authoritative(), true, 'a live handle still seeds normally');
   });
 
-  test('a table that never recovers never becomes authoritative', () => {
+  test('a table that never recovers never becomes authoritative', async () => {
     const gen = startGeneration(100, () => new Map());
-    gen.sample(true);
-    gen.sample(true);
+    await gen.sample(true);
+    await gen.sample(true);
     assert.equal(gen.authoritative(), false,
       'repeated failures must not quietly promote "I could not look" to "all clear"');
   });
 
   // An adopted listener was proven ours by command line and carries a token, so it is
   // as good a root as the launcher — and equally good evidence that we could look.
-  test('adopting a proven listener makes the generation authoritative', () => {
+  test('adopting a proven listener makes the generation authoritative', async () => {
     const gen = startGeneration(100, () => new Map());
+    await gen.sample(true);
     assert.equal(gen.authoritative(), false);
     gen.adopt({ pid: 500, token: 'T500' });
     assert.equal(gen.authoritative(), true);

@@ -91,7 +91,11 @@ function run(cmd, args) {
     // both is how a failed lookup comes back looking like an empty port. A non-zero
     // EXIT is deliberately not a failure here: `lsof` exits 1 when it matches nothing,
     // which is a real answer.
-    if (r.error) return { ok: false, out: '' };
+    // A SIGNAL is a failure too, and a quieter one: `spawnSync` leaves `error` unset
+    // when the process started fine and was then killed, so a terminated PowerShell
+    // or lsof would hand back its partial (usually empty) stdout as an authoritative
+    // answer — turning a query someone interrupted straight into an empty port.
+    if (r.error || r.signal) return { ok: false, out: '' };
     return { ok: true, out: r.stdout ?? '' };
   } catch {
     return { ok: false, out: '' };
@@ -288,22 +292,37 @@ function normaliseAddress(addr) {
  * only ever narrows a set that is already gated; it is not the thing standing
  * between us and a stranger.
  */
-export function addressServes(listenAddress, host) {
-  if (host === null || host === undefined) return true;
+export function addressVerdict(listenAddress, host) {
+  if (host === null || host === undefined) return 'serves';
   const a = normaliseAddress(listenAddress);
-  if (a === '' || a === '*') return true;
+  if (a === '' || a === '*') return 'serves';
   const h = normaliseAddress(host);
-  if (a === h) return true;
+  if (a === h) return 'serves';
 
   const isWildcard = a === '0.0.0.0' || a === '::' || a === '0:0:0:0:0:0:0:0';
   if (!isWildcard) {
     // A literal address is compared literally: a listener on ::1 is unreachable from
     // a client configured with 127.0.0.1, so it is not ours however loopback it looks.
-    return h === 'localhost' && (a === '127.0.0.1' || a === '::1');
+    return (h === 'localhost' && (a === '127.0.0.1' || a === '::1')) ? 'serves' : 'foreign';
   }
-  if (h === 'localhost') return true;                  // either family may be the one
-  return h.includes(':') ? a !== '0.0.0.0' : a === '0.0.0.0';
+  if (h === 'localhost') return 'serves';              // either family may be the one
+  if (h.includes(':') ? a !== '0.0.0.0' : a === '0.0.0.0') return 'serves';
+
+  // A CROSS-FAMILY WILDCARD IS UNPROVABLE, NOT ABSENT — and the difference is the
+  // whole verdict. `::` serves v4 callers when IPV6_V6ONLY is off and does not when
+  // it is on, and no platform query here reports which. Excluding it outright was the
+  // first correction and it overshot: a filtered pid appears in none of `ours`,
+  // `strangers` or `unidentified`, so a genuinely dual-stack server that IS answering
+  // us vanished from discovery entirely and `--stop` reported "not running", cleared
+  // state, and left it holding accelerator memory. Unjudgeable keeps it out of the
+  // kill set and out of the success verdict at the same time, which is the only
+  // reading that is honest in both directions.
+  return 'unprovable';
 }
+
+/** Convenience for callers that only care whether it definitely serves `host`. */
+export const addressServes = (listenAddress, host) =>
+  addressVerdict(listenAddress, host) === 'serves';
 
 /**
  * Every listening socket on `port`, as `{ pid, address }`.
@@ -410,10 +429,13 @@ function stripPort(endpoint) {
 function scanPort(port, host) {
   const { ok, listeners } = listenersOnPort(port);
   const pids = new Set();
+  const unprovable = new Set();
   for (const { pid, address } of listeners) {
-    if (addressServes(address, host)) pids.add(pid);
+    const verdict = addressVerdict(address, host);
+    if (verdict === 'serves') pids.add(pid);
+    else if (verdict === 'unprovable') unprovable.add(pid);
   }
-  return { ok, pids: [...pids] };
+  return { ok, pids: [...pids], unprovable: [...unprovable] };
 }
 
 export function pidsOnPort(port, host = null) {
@@ -660,8 +682,6 @@ export function startGeneration(launcherPid, readTable = processTable,
     }
   };
 
-  admitFrom(readTable());
-
   return {
     members: () => [...mine.values()],
     has: (pid) => mine.has(pid),
@@ -692,10 +712,20 @@ export function startGeneration(launcherPid, readTable = processTable,
       authoritative = true;
     },
 
-    sample(force = false) {
+    /**
+     * Async because the seed retry needs an EVENT-LOOP YIELD before it may trust the
+     * child handle, and for exactly the reason `recordSpawnedPid` documents: the table
+     * read is `spawnSync` and blocks the loop, so a child that exited during it has
+     * not had its exit event delivered yet and `exitCode` still reads null. Checking
+     * the handle straight after a blocking read is how a guard looks correct while
+     * doing nothing — and here it would let a reused pid seed the generation.
+     */
+    async sample(force = false) {
       if (!force && Date.now() - lastSample < DESCENDANT_SAMPLE_MS) return;
       lastSample = Date.now();
-      admitFrom(readTable());
+      const table = readTable();
+      await new Promise((r) => { setImmediate(r); });
+      admitFrom(table);
     },
   };
 }
@@ -968,6 +998,14 @@ export function identifyPortOwners(port, isOurs, host = null) {
   // like a server that is already gone. Reported rather than folded into
   // `unidentified`, because the two need different handling: an unidentified listener
   // is a process we know is there, while this is the absence of the question.
+  // A listener we cannot prove either way about is unidentified — never signalled,
+  // never counted as gone. See `addressVerdict`: a cross-family wildcard may or may
+  // not be the socket answering us, and dropping it was how a live server became
+  // invisible.
+  for (const pid of first.unprovable) {
+    if (second.unprovable.includes(pid) && !unidentified.includes(pid)) unidentified.push(pid);
+  }
+
   return { ours, strangers, unidentified, discoveryFailed: !first.ok || !second.ok };
 }
 

@@ -378,8 +378,21 @@ async function main() {
     if (pendingSurvivors.length) {
       const left = stillOurs(pendingSurvivors);
       if (!left.outstanding.length) {
+        const chased = pendingSurvivors;
         pendingSurvivors = [];
         clearState('survivors');
+
+        // A REPLACEMENT START MAY OWN THIS PORT BY NOW, and its state is not ours to
+        // tidy. `stopping` was released when the shutdown failed, so a client could
+        // prove the old records stale, start server B, and publish B's `server.pid` —
+        // while declining to spawn a supervisor, because this watchdog still holds the
+        // slot. Clearing unconditionally here deleted B's identity and then exited,
+        // leaving B running with neither a record nor a watchdog.
+        const rec = parsePidRecord(readState('server.pid', ''));
+        if (rec !== null && !chased.some((t) => t.pid === rec.pid)) {
+          continue;              // B's, not ours: leave it be and go on supervising it
+        }
+
         clearState('server.pid');
         clearState('loaded-model');
         writeState('stopped-idle', Date.now());     // it did stop, just not first time

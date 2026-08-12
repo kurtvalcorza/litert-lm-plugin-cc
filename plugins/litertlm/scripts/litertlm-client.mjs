@@ -624,7 +624,7 @@ async function cancelStartedServer(opts, generation, child, spawnedAt) {
     // reach a newer start's, so the generation boundary has nothing to protect here.
     // Listener adoption is gated, because the port is shared and a newer start's
     // socket would otherwise be adopted by a cancellation that has already lost it.
-    generation.sample(true);
+    await generation.sample(true);
     if (generationIsOurs) {
       for (const owner of classifyPortOwners(opts).ours) generation.adopt(owner);
     }
@@ -851,12 +851,15 @@ async function ensureServer(opts) {
   // distinguishes our process from whoever inherits its pid.
   const generation = startGeneration(child.pid, undefined,
     () => child.exitCode === null && child.signalCode === null);
+  // Seeding happens here rather than in the constructor: it has to yield to the event
+  // loop before the handle above means anything, and a constructor cannot await.
+  await generation.sample(true);
 
   // Record the identity now, while the process is still the one we just spawned —
   // and only if the OS still says so. Asked for later, the answer could already be
   // about whoever inherited the pid.
   await recordSpawnedPid(opts.port, 'server.pid', child, exe, spawnedAt);
-  generation.sample(true);      // again, now that the identity lookup has cost us time
+  await generation.sample(true);   // again, now the identity lookup has cost us time
   // Prune, not wipe: another client may have acquired a marker against this same
   // new server between our spawn and this line.
   pruneInFlight(opts.port);
@@ -869,7 +872,7 @@ async function ensureServer(opts) {
     // Keep watching the tree while the server comes up. Throttled by
     // DESCENDANT_SAMPLE_MS rather than run every pass, because on Windows a walk is a
     // PowerShell start-up that blocks the loop this probe shares.
-    generation.sample();
+    await generation.sample();
 
     // A concurrent `--stop` cancels this start, and cancelling has to mean stopping.
     //
