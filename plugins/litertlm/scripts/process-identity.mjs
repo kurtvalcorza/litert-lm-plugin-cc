@@ -742,7 +742,14 @@ export function startGeneration(launcherPid, readTable = processTable,
     authoritative: () => authoritative,
 
     adopt(owner) {
-      if (mine.has(owner.pid)) return;
+      // A MATCHING NUMBER IS NOT A MATCHING MEMBER. If an exited launcher's pid was
+      // reissued to this start's eventual listener, the set already holds that number
+      // under the OLD token — so discarding the adoption keeps a member that
+      // `resolveTargets` will reject, cancellation counts as gone, and a clean
+      // teardown is reported while the listener runs. A freshly proven identity for
+      // the same number replaces the stale one rather than losing to it.
+      const held = mine.get(owner.pid);
+      if (held !== undefined && held.token === owner.token) return;
       // An adopted listener was proven ours by command line and carries a token, so
       // it is as good a root as the launcher and equally good evidence that we were
       // able to look at all.

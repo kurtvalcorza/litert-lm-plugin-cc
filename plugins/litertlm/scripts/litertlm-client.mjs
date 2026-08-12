@@ -626,7 +626,17 @@ async function cancelStartedServer(opts, generation, child, spawnedAt) {
     // socket would otherwise be adopted by a cancellation that has already lost it.
     await generation.sample(true);
     if (generationIsOurs) {
-      for (const owner of classifyPortOwners(opts).ours) generation.adopt(owner);
+      // Both the sample above and the owner lookup below are slow — on Windows each
+      // launches PowerShell — so the claim read at the top of this pass is already
+      // history by the time its result is used. If B took the claim inside that gap
+      // and bound the port, adopting here pulls B's listener into A's generation with
+      // a valid identity, and the loop below signals it: a cancelled start killing the
+      // valid newer one, which is the exact failure the generation boundary exists to
+      // prevent, re-entered through the staleness of its own check.
+      const owners = classifyPortOwners(opts).ours;
+      if (ownsStartClaim(port, spawnedAt)) {
+        for (const owner of owners) generation.adopt(owner);
+      }
     }
 
     const { alive, unknown } = resolveTargets(generation.members());
