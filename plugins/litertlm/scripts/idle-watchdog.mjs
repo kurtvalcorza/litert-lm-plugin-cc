@@ -340,10 +340,6 @@ async function main() {
   // will fail every probe from here on.
   let pendingSurvivors = [];
 
-  // A retry that stands aside for live work must not then treat the server as having
-  // been idle all along: the request it just yielded to IS activity.
-  const touchIdleDeadline = () => writeState('last-activity', Date.now());
-
   const idleMs = opts.idleTimeout * 1000;
   const ceilingMs = Math.max(idleMs * HARD_CEILING_MULTIPLIER, HARD_CEILING_FLOOR_MS);
   let missedProbes = 0;
@@ -394,22 +390,28 @@ async function main() {
       // stops a new client entering at all, which is the only thing that makes the
       // count mean something by the time it is acted on.
       writeState('stopping', Date.now());
+      // THE SAME RULE AS THE NORMAL IDLE PATH, not a second one written alongside it.
+      //
+      // Two attempts at this branch each got half of it. Yielding to live work
+      // without re-applying the configured delay turned a 900-second timeout into the
+      // poll interval; then re-applying the delay while REFRESHING `last-activity` on
+      // every poll broke the other half — `idleFor` could never grow, so the hard
+      // ceiling never fired, and a leaked marker whose owner pid had been reused
+      // pinned the survivor and its accelerator memory indefinitely. That ceiling
+      // exists for exactly that case (T056), and this branch had quietly opted out of
+      // it.
+      //
+      // The activity stamp belongs to the client, which writes it around each
+      // request; a supervisor refreshing it is a supervisor manufacturing the evidence
+      // it then reads. So the timestamp is left alone and the normal path's own test
+      // is applied verbatim.
       const busy = countInFlight();
-      if (busy > 0) {
-        clearState('stopping');        // let the live request through
-        touchIdleDeadline();
-        continue;
-      }
-
-      // AND THE CONFIGURED DELAY APPLIES TO RETRIES TOO. Yielding to a request set
-      // `last-activity` and then came straight back here on the next poll, without
-      // consulting it — so a survivor that had just served a request was killed about
-      // five seconds later even where the user asked for 900. A failed first attempt
-      // does not convert the idle timeout into the poll interval.
       const since = Number.parseInt(readState('last-activity', String(Date.now())), 10)
         || Date.now();
-      if (Date.now() - since < idleMs) {
-        clearState('stopping');
+      const idleFor = Date.now() - since;
+
+      if ((busy > 0 && idleFor < ceilingMs) || idleFor < idleMs) {
+        clearState('stopping');        // let live work through, or wait out the delay
         continue;
       }
 
