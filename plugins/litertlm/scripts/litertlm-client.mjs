@@ -742,6 +742,20 @@ async function cancelStartedServer(opts, generation, child, spawnedAt) {
   return false;
 }
 
+/** Cancel this start immediately when a concurrent `--stop` has overtaken it. */
+async function cancelIfStopped(opts, generation, child, spawnedAt) {
+  const stoppedAt = Number.parseInt(readState(opts.port, 'stopped-at', ''), 10);
+  if (!Number.isFinite(stoppedAt) || stoppedAt < spawnedAt) return;
+
+  const clean = await cancelStartedServer(opts, generation, child, spawnedAt);
+  throw new Error(clean
+    ? 'the server start was cancelled by a --stop that ran at the same time.\n'
+      + '  Nothing is left running. Retry if you did want it started.'
+    : 'the server start was cancelled by a --stop that ran at the same time,\n'
+      + '  but it could not be confirmed torn down. Its identity has been recorded;\n'
+      + '  run --stop again to finish the job.');
+}
+
 /**
  * Wait out another invocation's start rather than mistaking it for debris.
  *
@@ -935,16 +949,7 @@ async function ensureServer(opts) {
     // anyway — running, unrecorded, and therefore harder to find than if we had
     // never suppressed the record at all. A start that has been overtaken has to
     // undo itself, not just stay quiet about it.
-    const stoppedAt = Number.parseInt(readState(opts.port, 'stopped-at', ''), 10);
-    if (Number.isFinite(stoppedAt) && stoppedAt >= spawnedAt) {
-      const clean = await cancelStartedServer(opts, generation, child, spawnedAt);
-      throw new Error(clean
-        ? 'the server start was cancelled by a --stop that ran at the same time.\n'
-          + '  Nothing is left running. Retry if you did want it started.'
-        : 'the server start was cancelled by a --stop that ran at the same time,\n'
-          + '  but it could not be confirmed torn down. Its identity has been recorded;\n'
-          + '  run --stop again to finish the job.');
-    }
+    await cancelIfStopped(opts, generation, child, spawnedAt);
 
     const up = await probe(opts);
 
@@ -954,8 +959,7 @@ async function ensureServer(opts) {
     // binds just after its ownership scan, the probe then succeeds, and accepting
     // readiness here would return a running server that stop had already reported as
     // gone — without ever entering cancellation.
-    const stoppedDuringProbe = Number.parseInt(readState(opts.port, 'stopped-at', ''), 10);
-    if (Number.isFinite(stoppedDuringProbe) && stoppedDuringProbe >= spawnedAt) continue;
+    await cancelIfStopped(opts, generation, child, spawnedAt);
 
     if (up) {
       releaseStartClaim(opts.port, spawnedAt);   // ours only — a newer start may own it

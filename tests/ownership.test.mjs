@@ -114,6 +114,7 @@ const PORT = {
   watchdogTombstone: reservePort(19471),
   preBindCancel: reservePort(19481),
   discoveryBlind: reservePort(19491),
+  postProbeCancel: reservePort(19501),
 };
 
 const spawned = [];
@@ -1644,10 +1645,11 @@ describe('cancelling a start whose descendant has not bound yet', () => {
    * descendant then bound anyway, unrecorded, which is the exact outcome cancelling
    * exists to prevent.
    *
-   * Timings here are chosen so the ONLY way to pass is to have tracked the descendant
-   * while its parent was alive: the stage exits at 1.5s, the stop lands at 3s, so by
-   * the time cancellation runs the parent link is gone and a fresh walk finds nothing.
-   * Accumulation during the startup poll is the whole answer.
+   * A state-file handshake makes the ordering exact instead of betting on how long a
+   * Windows process-table query takes: the stage exits only after `last-activity`
+   * proves the client's second descendant sample completed, and the stop lands only
+   * after the stage is confirmed gone. By cancellation time a fresh walk still finds
+   * no parent link. Accumulation during startup is the whole answer.
    */
   function installHandoffLitertLm(binDir, workDir, port) {
     mkdirSync(binDir, { recursive: true });
@@ -1668,23 +1670,70 @@ describe('cancelling a start whose descendant has not bound yet', () => {
           res.writeHead(200, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ object: 'list', data: [{ id: 'fake' }] }));
         }).listen(${port}, '127.0.0.1');
-      }, 10000);
+      }, 60000);
       setInterval(() => {}, 1000);
     `, 'utf8');
 
-    // Alive briefly, then gone — the three real stages were observed coexisting, and
-    // this reproduces that before collapsing to the orphaned-descendant state.
+    // Stay alive until the test observes that the client has completed its second
+    // process-tree sample. Fixed 1.5-second survival raced cold PowerShell startup on
+    // Windows, letting the fixture exit before the sample it was meant to exercise.
     writeFileSync(join(workDir, 'serve'), `
       const { spawn } = require('node:child_process');
+      const { existsSync, writeFileSync } = require('node:fs');
       const { join } = require('node:path');
+      writeFileSync(join(__dirname, 'launcher.pid'), String(process.pid), 'utf8');
       spawn(process.execPath, [join(__dirname, 'grandchild.js')],
         { detached: true, stdio: 'ignore' }).unref();
-      setTimeout(() => process.exit(0), 1500);
+      setInterval(() => {
+        if (existsSync(join(__dirname, 'release-launcher'))) process.exit(0);
+      }, 50);
+    `, 'utf8');
+  }
+
+  /**
+   * Make the first successful readiness probe publish the same tombstone a concurrent
+   * `--stop` would have written. The preload advances only the client's clock after
+   * that response, putting the probe in the final startup-loop iteration without
+   * making this regression take the production 90-second timeout.
+   */
+  function installProbeTombstoneLitertLm(binDir, workDir, port) {
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(workDir, { recursive: true });
+
+    const exe = join(binDir, process.platform === 'win32' ? 'litert-lm.exe' : 'litert-lm');
+    try { linkSync(process.execPath, exe); } catch { copyFileSync(process.execPath, exe); }
+    if (process.platform !== 'win32') chmodSync(exe, 0o755);
+
+    writeFileSync(join(workDir, 'clock.cjs'), `
+      const { existsSync } = require('node:fs');
+      const realNow = Date.now.bind(Date);
+      if ((process.argv[1] || '').endsWith('litertlm-client.mjs')) {
+        Date.now = () => realNow()
+          + (existsSync(process.env.LITERT_TEST_CLOCK_MARKER) ? 90000 : 0);
+      }
+    `, 'utf8');
+
+    writeFileSync(join(workDir, 'serve'), `
+      const { createServer } = require('node:http');
+      const { mkdirSync, readFileSync, writeFileSync } = require('node:fs');
+      const { join } = require('node:path');
+      const dir = join(process.env.LITERT_LM_PLUGIN_RUNTIME, String(${port}));
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(__dirname, 'server.pid'), String(process.pid), 'utf8');
+      createServer((req, res) => {
+        const spawnedAt = Number.parseInt(
+          readFileSync(join(dir, 'starting'), 'utf8').split(/\\s+/)[0], 10);
+        writeFileSync(join(dir, 'stopped-at'), String(spawnedAt + 1), 'utf8');
+        writeFileSync(process.env.LITERT_TEST_CLOCK_MARKER, 'seen', 'utf8');
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', data: [{ id: 'fake' }] }));
+      }).listen(${port}, '127.0.0.1');
+      setInterval(() => {}, 1000);
     `, 'utf8');
   }
 
   test('kills a descendant that is alive but has not yet bound', { timeout: 120_000 },
-    async () => {
+    async (t) => {
       const port = PORT.preBindCancel;
       const runtime = runtimeDir();
       const workDir = join(runtime, 'work');
@@ -1714,10 +1763,21 @@ describe('cancelling a start whose descendant has not bound yet', () => {
         'the descendant should have been spawned');
       const grandchild = Number.parseInt(readIfPresent(pidFile), 10);
       assert.ok(alive(grandchild), 'and should be running but not yet listening');
+      t.after(async () => {
+        if (alive(grandchild)) {
+          try { process.kill(grandchild, 'SIGKILL'); } catch { /* already gone */ }
+          await waitFor(() => !alive(grandchild));
+        }
+      });
 
-      // Long enough that the launcher stage has exited: from here the only way to
-      // know the descendant exists is to have seen it while its parent was alive.
-      await sleep(3000);
+      const dir = join(runtime, String(port));
+      assert.ok(await waitFor(() => readIfPresent(join(dir, 'last-activity')) !== null,
+        { timeout: 30_000 }), 'the client should finish sampling the live launcher tree');
+      writeFileSync(join(workDir, 'release-launcher'), 'release', 'utf8');
+      const launcher = Number.parseInt(readIfPresent(join(workDir, 'launcher.pid')), 10);
+      assert.ok(Number.isInteger(launcher), 'the fixture should report its launcher pid');
+      assert.ok(await waitFor(() => !alive(launcher)),
+        'the launcher must be gone before cancellation starts');
 
       const stop = runClient(['--stop', '--port', String(port)], runtime);
       assert.equal(stop.status, 0, `--stop should succeed: ${stop.stderr}`);
@@ -1734,6 +1794,53 @@ describe('cancelling a start whose descendant has not bound yet', () => {
 
       assert.doesNotMatch(stderr, /could not be confirmed torn down/,
         'and having tracked it, cancellation should be able to confirm the teardown');
+    });
+
+  test('cancels when stop lands during the final readiness probe',
+    { timeout: 60_000 }, async (t) => {
+      const port = PORT.postProbeCancel;
+      const runtime = runtimeDir();
+      const workDir = join(runtime, 'work');
+      const binDir = join(runtime, 'bin');
+      const clockMarker = join(workDir, 'probe-complete');
+      installProbeTombstoneLitertLm(binDir, workDir, port);
+
+      let serverPid = null;
+      t.after(async () => {
+        serverPid = Number.parseInt(readIfPresent(join(workDir, 'server.pid')) ?? '', 10);
+        if (alive(serverPid)) {
+          try { process.kill(serverPid, 'SIGKILL'); } catch { /* already gone */ }
+          await waitFor(() => !alive(serverPid));
+        }
+      });
+
+      const sep = process.platform === 'win32' ? ';' : ':';
+      const client = reap(spawn(process.execPath,
+        [CLIENT, '--list', '--port', String(port), '--idle-timeout', '0'], {
+          cwd: workDir,
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: {
+            ...process.env,
+            LITERT_LM_PLUGIN_RUNTIME: runtime,
+            LITERT_TEST_CLOCK_MARKER: clockMarker,
+            NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=./clock.cjs`.trim(),
+            PATH: `${binDir}${sep}${process.env.PATH ?? ''}`,
+            Path: `${binDir}${sep}${process.env.Path ?? ''}`,
+          },
+        }));
+      let stderr = '';
+      client.stderr.setEncoding('utf8');
+      client.stderr.on('data', (d) => { stderr += d; });
+      const status = await new Promise((resolve) => client.on('close', resolve));
+
+      serverPid = Number.parseInt(readIfPresent(join(workDir, 'server.pid')) ?? '', 10);
+      assert.ok(Number.isInteger(serverPid), 'the readiness-probe server should have started');
+      assert.notEqual(status, 0, 'a stop that overtakes start must cancel the request');
+      assert.match(stderr, /cancelled by a --stop/,
+        'the post-probe tombstone must take cancellation, not startup timeout');
+      assert.ok(await waitFor(() => !alive(serverPid)),
+        'the server made ready during the stop must not be left running unsupervised');
     });
 });
 
