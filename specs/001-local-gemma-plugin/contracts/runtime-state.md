@@ -14,6 +14,7 @@ different ports never share state.
 |---|---|---|---|
 | `server.pid` | `<pid> <start-token>` | client, after successful start | watchdog |
 | `watchdog.pid` | `<pid> <start-token>` | **watchdog only** — see below | client, watchdog |
+| `watchdog-request` | JSON `{server, host, idleTimeout, requestedAt}` | client | retiring watchdog |
 | `last-activity` | epoch ms | client, before and after each request | watchdog |
 | `in-flight.d/<pid>-<ts>` | **directory of marker files** | client, one per request | watchdog |
 | `stopping` | empty; presence is the signal | watchdog, before terminating | client |
@@ -40,9 +41,12 @@ guesswork required.
 **Why a pid file holds a token as well as a pid** *(revised after issue #10)*: a pid is a slot
 the OS reuses, not a handle on a process. A recorded pid whose owner has exited can name
 something else entirely, and both parties here send signals to recorded pids. The token is the
-process's OS-reported creation time, captured at spawn; pid and token together are unique for as
-long as that process lives, so a reused pid fails the comparison. A file carrying a bare pid —
-every file written by a version before this one — is readable but **never signallable**.
+process's OS-reported creation identity, captured at spawn; pid and token together are unique for
+as long as that process lives, so a reused pid fails the comparison. macOS exposes creation time
+only to the second through `ps`, so plugin-launched processes add a random inherited environment
+nonce to the command digest. A file carrying a bare pid — every file written by a version before
+this one — is readable but **never signallable**. While that bare pid remains live it also blocks
+a successful shutdown verdict and its record is retained; unprovable is not the same as gone.
 
 Two questions are asked of these files and they are not the same question:
 
@@ -67,6 +71,16 @@ too, leaving the server unsupervised. A watchdog never writes after deciding to 
 single-writer removes the class rather than arbitrating it. The claim itself is an exclusive
 create (`wx`), and a stale record is reclaimed only after re-reading the exact bytes judged
 stale, so reclamation cannot delete a live winner.
+
+**A retiring watchdog hands replacement supervision forward.** A client records its desired
+policy and the complete current `server.pid` identity in `watchdog-request` before it decides
+whether a supervisor already exists. This matters when the incumbent is still retrying an older
+failed shutdown: the replacement client's one start attempt sees that live incumbent and backs
+off, then the incumbent observes the replacement on its next poll and exits. Without a durable
+request both events are locally correct and the replacement is nevertheless left unsupervised.
+The incumbent accepts a request only when its complete server identity matches the replacement
+record, releases its slot, and starts the successor under the replacement's policy. A request
+with `idleTimeout: 0` deliberately releases the slot without starting a successor.
 
 **Shutdown is judged by the processes signalled, never by the port.** The socket is an endpoint;
 targets are processes. A stranger that holds or takes the port keeps answering, and treating
@@ -139,8 +153,11 @@ unrecorded listener carried on then looked exactly like a server already gone. F
 is now distinguished from a non-zero *exit* (`lsof` exits 1 when it matches nothing, which is a
 real answer) and surfaces as `discoveryFailed`.
 
-It blocks a success verdict when the endpoint answers **or recorded state says a process may still
-need accounting**: a recorded server target, watchdog, or carried survivor. The latter matters
+It blocks a success verdict when either walk observed a listener, the endpoint answers, **or
+recorded state says a process may still need accounting**: a recorded server target, watchdog,
+legacy tokenless record, or carried survivor. Evidence from the second walk is retained even if
+the first walk failed, because a listener seen only after a failed query is inconclusive rather
+than absent. Recorded state matters
 during startup and model switches, when a genuine server can be unreachable and its recorded
 launcher can already have exited while an unrecorded descendant owns the socket. Discovery failure
 with neither an answer nor any recorded state remains non-blocking; otherwise a minimal image with

@@ -34,7 +34,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import {
   _parsers, _queries, addressServes, commandLaunches, descendantsOf, formatPidRecord, identity,
   identifyPortOwners, isLitertLmServeCommand, parsePidRecord, pidsOnPort, processTable,
-  recordIsStale, signallablePid, startGeneration, startToken,
+  portOwnerDiscoveryHelp, recordIsStale, signallablePid, startGeneration, startToken,
 } from '../plugins/litertlm/scripts/process-identity.mjs';
 
 const SCRIPTS = join(dirname(fileURLToPath(import.meta.url)), '..', 'plugins', 'litertlm', 'scripts');
@@ -115,6 +115,7 @@ const PORT = {
   preBindCancel: reservePort(19481),
   discoveryBlind: reservePort(19491),
   postProbeCancel: reservePort(19501),
+  watchdogHandoff: reservePort(19511),
 };
 
 const spawned = [];
@@ -497,8 +498,11 @@ describe('--stop', () => {
 
     const r = runClient(['--stop', '--port', String(port)], runtime);
 
-    assert.equal(r.status, 0);
+    assert.notEqual(r.status, 0, 'a live tokenless record must keep shutdown inconclusive');
     assert.ok(alive(bystander.pid), 'a reused pid in server.pid must never be signalled');
+    assert.equal(recordedServerPid(stateDir(runtime, port)), bystander.pid,
+      'and its only evidence must be retained for manual reconciliation');
+    assert.match(r.stderr, /legacy PID record without an identity/);
   });
 
   test('does not signal a reused pid in watchdog.pid either', async () => {
@@ -510,8 +514,10 @@ describe('--stop', () => {
 
     const r = runClient(['--stop', '--port', String(port)], runtime);
 
-    assert.equal(r.status, 0);
+    assert.notEqual(r.status, 0, 'a live tokenless watchdog must block a false success');
     assert.ok(alive(bystander.pid), 'a reused pid in watchdog.pid must never be signalled');
+    assert.equal(recordedPid(stateDir(runtime, port)), bystander.pid,
+      'and its only evidence must not be cleared');
   });
 
   // A recorded target that is alive but NOT listening must still be chased. This is
@@ -820,6 +826,88 @@ describe('the idle watchdog', () => {
         'a superseded supervisor must stand down, not supervise a torn-down server');
       assert.equal(readIfPresent(join(dir, 'watchdog.pid')), null,
         'and release the slot, so the next client is free to start a fresh one');
+    });
+
+  test('hands supervision to a replacement server before exiting',
+    { timeout: 180_000 }, async (t) => {
+      if (!(await canDiscoverPortOwners())) {
+        t.skip('no socket-owner discovery on this host (needs lsof or ss)');
+        return;
+      }
+
+      const port = PORT.watchdogHandoff;
+      const runtime = runtimeDir();
+      const dir = stateDir(runtime, port);
+      const workDir = join(runtime, 'handoff');
+      mkdirSync(workDir, { recursive: true });
+
+      const responder = await startStranger(port);
+      const oldTarget = await startBystander();
+      let replacement = null;
+      let successor = null;
+      t.after(async () => {
+        for (const pid of [successor, replacement?.pid]) {
+          if (alive(pid)) try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+        }
+        try { responder.kill('SIGKILL'); } catch { /* already gone */ }
+      });
+      const allowSignals = join(workDir, 'allow-signals');
+      const preload = join(workDir, 'block-signals.cjs');
+      writeFileSync(preload, `
+        const { existsSync } = require('node:fs');
+        const realKill = process.kill.bind(process);
+        process.kill = (pid, signal) => {
+          if (pid === Number(process.env.LITERT_TEST_BLOCK_PID)
+              && signal && !existsSync(process.env.LITERT_TEST_ALLOW_SIGNALS)) {
+            const error = new Error('staged refusal');
+            error.code = 'EPERM';
+            throw error;
+          }
+          return realKill(pid, signal);
+        };
+      `, 'utf8');
+
+      writeFileSync(join(dir, 'server.pid'), formatPidRecord(oldTarget.pid), 'utf8');
+      writeFileSync(join(dir, 'last-activity'), String(Date.now() - 600_000), 'utf8');
+      const oldWatchdog = reap(spawn(process.execPath,
+        [WATCHDOG, '--port', String(port), '--idle-timeout', '1'], {
+          stdio: 'ignore', windowsHide: true,
+          env: {
+            ...process.env,
+            LITERT_LM_PLUGIN_RUNTIME: runtime,
+            LITERT_TEST_BLOCK_PID: String(oldTarget.pid),
+            LITERT_TEST_ALLOW_SIGNALS: allowSignals,
+            NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${JSON.stringify(preload)}`.trim(),
+          },
+        }));
+
+      assert.ok(await waitFor(() => recordedPid(dir) === oldWatchdog.pid),
+        'the incumbent should own the watchdog slot');
+      assert.ok(await waitFor(() => readIfPresent(join(dir, 'survivors')) !== null,
+        { timeout: 120_000 }), 'the staged refusal should put it in survivor-retry mode');
+
+      replacement = await startBystander();
+      const replacementRecord = formatPidRecord(replacement.pid);
+      writeFileSync(join(dir, 'server.pid'), replacementRecord, 'utf8');
+      writeFileSync(join(dir, 'watchdog-request'), JSON.stringify({
+        server: replacementRecord,
+        host: '127.0.0.1',
+        idleTimeout: 900,
+        requestedAt: Date.now(),
+      }), 'utf8');
+      writeFileSync(allowSignals, 'yes', 'utf8');
+
+      assert.ok(await waitFor(() => !alive(oldTarget.pid), { timeout: 60_000 }),
+        'the old survivor should become stoppable');
+      assert.ok(await waitFor(() => {
+        const pid = recordedPid(dir);
+        return pid !== null && pid !== oldWatchdog.pid && alive(pid);
+      }, { timeout: 60_000 }),
+      'a successor under the replacement policy must claim the slot before the gap persists');
+      assert.ok(await waitFor(() => oldWatchdog.exitCode !== null, { timeout: 20_000 }),
+        'the incumbent should exit after completing the handoff');
+
+      successor = recordedPid(dir);
     });
 
   // The other half of an exclusive claim: it must not become a lock. A record left
@@ -1165,6 +1253,17 @@ describe('scoping socket ownership to the local address', () => {
     assert.equal(table.size, 2);
   });
 
+  test('the launch nonce distinguishes same-second POSIX identities', () => {
+    const prefix = '512 1 Mon Aug 11 09:01:02 2026 node server.js --port 9379 ';
+    const first = _parsers.tablePosix(
+      `${prefix}LITERT_LM_PLUGIN_INSTANCE=8b9741c1 HOME=/tmp\n`);
+    const second = _parsers.tablePosix(
+      `${prefix}LITERT_LM_PLUGIN_INSTANCE=cc560eb4 HOME=/tmp\n`);
+
+    assert.notEqual(first.get(512).start, second.get(512).start,
+      'same pid, second, and argv must still differ across plugin instances');
+  });
+
   test('parses real ss -ltnp output, header and shared sockets included', () => {
     const out = 'State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process\n'
       + 'LISTEN 0      128    127.0.0.1:9379      0.0.0.0:*  users:(("python",pid=68056,fd=7))\n'
@@ -1175,6 +1274,26 @@ describe('scoping socket ownership to the local address', () => {
       { pid: 901, address: '[::1]' },
       { pid: 902, address: '[::1]' },
     ]);
+  });
+
+  test('keeps a listener observed after a failed walk in the discovery verdict', () => {
+    const scans = [
+      { ok: false, pids: [], unprovable: [] },
+      { ok: true, pids: [process.pid], unprovable: [] },
+    ];
+    const result = identifyPortOwners(9379, () => true, '127.0.0.1', () => scans.shift());
+
+    assert.equal(result.discoveryFailed, true, 'one failed walk keeps the query inconclusive');
+    assert.equal(result.observed, true,
+      'and the second-only listener must not collapse into an empty port');
+    assert.equal(result.ours.length, 0,
+      'a pid absent from the first walk was never confirmed and is not a target');
+  });
+
+  test('owner-discovery recovery guidance matches the platform path', () => {
+    assert.match(portOwnerDiscoveryHelp('win32'), /PowerShell.*Get-NetTCPConnection/);
+    assert.doesNotMatch(portOwnerDiscoveryHelp('win32'), /lsof|iproute2/);
+    assert.match(portOwnerDiscoveryHelp('darwin'), /lsof|iproute2/);
   });
 
   // "I could not ask" is a third answer, and it used to be indistinguishable from

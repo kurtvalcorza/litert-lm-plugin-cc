@@ -218,31 +218,25 @@ function inspectLinux(pid) {
  * pid-churn case the identity check exists to catch: a target exits, its pid is
  * reissued within the same second, and `{pid, start}` matches the replacement.
  *
- * The token therefore carries a digest of the command line as well. A collision now
- * needs the recycled pid to be running the same argv too, which narrows "unrelated
- * process" to "another instance of the same server" — still a collision in
- * principle, but no longer one that can reach an unrelated program.
- *
- * Not fully closed, and worth being plain about that: Linux (/proc field 22, clock
- * ticks) and Windows (creation time, 100ns) are precise enough not to need this.
- * A subsecond source on macOS would be better than a digest; there is no portable
- * one via `ps`.
+ * The token therefore carries a digest of the command line and launch environment.
+ * For processes this plugin launches, that environment contains a random instance
+ * nonce. macOS `ps -E` exposes both in the SAME process row, preserving the required
+ * atomic pairing with pid and start time. The nonce closes the same-pid + same-second
+ * + same-argv collision for our server and watchdog; an adopted hand-started server
+ * still gets the full command/environment digest fallback.
  */
 function inspectPosixPs(pids) {
-  let out = '';
-  try {
-    out = spawnSync('ps', ['-ww', '-p', pids.join(','), '-o', 'pid=,lstart=,args='],
-      { encoding: 'utf8' }).stdout ?? '';
-  } catch { return; }
+  const result = run('ps', ['-wwE', '-p', pids.join(','), '-o', 'pid=,lstart=,args=']);
+  if (!result.ok) return;
 
-  for (const line of out.split('\n')) {
+  for (const line of result.out.split('\n')) {
     // pid, then a fixed 5-field `lstart` (Www Mmm DD HH:MM:SS YYYY), then argv.
     const m = line.trim().match(/^(\d+)\s+(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.*)$/);
     if (!m) continue;
     const cmdline = flatten(m[3]);
     const digest = createHash('sha256').update(cmdline).digest('hex').slice(0, 16);
-    cache.set(Number.parseInt(m[1], 10),
-      { start: `${flatten(m[2])}#${digest}`, cmdline });
+    const pid = Number.parseInt(m[1], 10);
+    cache.set(pid, { start: `${flatten(m[2])}#${digest}`, cmdline });
   }
 }
 
@@ -622,7 +616,7 @@ function tableLinux() {
  * Built exactly as `inspectPosixPs` builds it, or the two would not compare equal.
  */
 function tablePosixPs() {
-  const r = run('ps', ['-ww', '-Ao', 'pid=,ppid=,lstart=,args=']);
+  const r = run('ps', ['-wwE', '-Ao', 'pid=,ppid=,lstart=,args=']);
   return { ok: r.ok, table: parseTablePosix(r.out) };
 }
 
@@ -634,7 +628,8 @@ function parseTablePosix(out) {
     if (m === null) continue;
     const cmdline = flatten(m[4]);
     const digest = createHash('sha256').update(cmdline).digest('hex').slice(0, 16);
-    table.set(Number.parseInt(m[1], 10), {
+    const pid = Number.parseInt(m[1], 10);
+    table.set(pid, {
       ppid: Number.parseInt(m[2], 10),
       start: `${flatten(m[3])}#${digest}`,
     });
@@ -675,7 +670,7 @@ export async function processTableAsync() {
     return { ok: r.ok, table: parseTableWindows(r.out) };
   }
   if (process.platform === 'linux') return tableLinux();
-  const r = await runAsync('ps', ['-ww', '-Ao', 'pid=,ppid=,lstart=,args=']);
+  const r = await runAsync('ps', ['-wwE', '-Ao', 'pid=,ppid=,lstart=,args=']);
   return { ok: r.ok, table: parseTablePosix(r.out) };
 }
 
@@ -1258,10 +1253,10 @@ export function signallablePid(record, writtenAtMs) {
  * litert-lm server bound to another interface on the same port passes the command
  * line test and is emphatically not ours; without the address it was signalled.
  */
-export function identifyPortOwners(port, isOurs, host = null) {
-  const first = scanPort(port, host);
+export function identifyPortOwners(port, isOurs, host = null, scan = scanPort) {
+  const first = scan(port, host);
   identities(first.pids);
-  const second = scanPort(port, host);
+  const second = scan(port, host);
   const after = new Set(second.pids);
 
   const ours = [];
@@ -1303,7 +1298,24 @@ export function identifyPortOwners(port, isOurs, host = null) {
     judged.add(pid);
   }
 
-  return { ours, strangers, unidentified, discoveryFailed: !first.ok || !second.ok };
+  // Preserve evidence from EITHER walk. A failed first query followed by a
+  // successful second query that sees a listener is not an empty port: it is an
+  // inconclusive observation of a real socket. Callers use this bit to refuse a
+  // false-successful shutdown even when no pid survived both walks long enough to
+  // be classified.
+  const observed = first.pids.length > 0 || first.unprovable.length > 0
+    || second.pids.length > 0 || second.unprovable.length > 0;
+  return {
+    ours, strangers, unidentified, observed,
+    discoveryFailed: !first.ok || !second.ok,
+  };
+}
+
+/** Platform-specific recovery guidance for a failed socket-owner query. */
+export function portOwnerDiscoveryHelp(platform = process.platform) {
+  return platform === 'win32'
+    ? 'Check that PowerShell and Get-NetTCPConnection are available, or stop the process yourself.'
+    : 'Install lsof or iproute2, or stop the process yourself.';
 }
 
 export function resolveTargets(targets) {

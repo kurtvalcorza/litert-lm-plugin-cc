@@ -33,6 +33,10 @@ jobs:
 
       - name: Run Claude Code Review
         id: claude-review
+        # Review availability is advisory. OAuth quota/rate-limit failures happen
+        # before the action produces review output and must not turn a green,
+        # independently tested PR into a red code check.
+        continue-on-error: true
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -42,3 +46,10 @@ jobs:
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
 
+      - name: Report unavailable Claude review
+        if: steps.claude-review.outcome == 'failure'
+        shell: bash
+        run: |
+          echo '### Claude review unavailable' >> "$GITHUB_STEP_SUMMARY"
+          echo 'The review action failed before producing review output (for example, quota or rate limiting).' >> "$GITHUB_STEP_SUMMARY"
+          echo 'This is advisory and is not reported as a code/test failure; the required OS test matrix remains authoritative.' >> "$GITHUB_STEP_SUMMARY"

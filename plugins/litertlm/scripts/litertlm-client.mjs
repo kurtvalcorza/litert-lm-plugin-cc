@@ -16,6 +16,7 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -31,7 +32,7 @@ import { BOOT_TIME_MS, pidAlive, reapMarkers } from './marker-state.mjs';
 // choosing one.
 import {
   commandLaunches, formatPidRecord, identifyPortOwners, identities, identity,
-  looksLikeLitertLmServe, parsePidRecord, recordIsStale, resolveTargets,
+  looksLikeLitertLmServe, parsePidRecord, portOwnerDiscoveryHelp, recordIsStale, resolveTargets,
   signallablePid, startGeneration, startToken,
 } from './process-identity.mjs';
 
@@ -528,6 +529,20 @@ async function awaitNotStopping(opts) {
 
 /** Start the watchdog only when we started a server, and only if none supervises (T060). */
 function startWatchdog(opts) {
+  // Publish the desired policy even when an older watchdog still owns the slot.
+  // That incumbent may be finishing a failed shutdown while this invocation starts
+  // replacement server B. B's only watchdog-start attempt used to stop here, then
+  // the incumbent noticed B and exited on its next poll, leaving B unsupervised.
+  // The durable request lets the incumbent hand the slot to a successor under B's
+  // policy. A disabled request is meaningful too: it tells the old watchdog to
+  // relinquish without replacing itself.
+  const request = {
+    server: readState(opts.port, 'server.pid', '') || null,
+    host: opts.host,
+    idleTimeout: opts.idleTimeout,
+    requestedAt: Date.now(),
+  };
+  writeState(opts.port, 'watchdog-request', JSON.stringify(request));
   if (opts.idleTimeout === 0) return;
   // Liveness, not file existence: a stale pid must never suppress the watchdog.
   //
@@ -556,8 +571,9 @@ function startWatchdog(opts) {
         // So a `--stop` landing before this child has published its pid can still
         // invalidate it. Without this the child is invisible to that stop and would
         // publish a supervisor record over the state it had just cleared.
-        '--spawned-at', String(Date.now())],
-      { detached: true, stdio: 'ignore' },
+        '--spawned-at', String(request.requestedAt)],
+      { detached: true, stdio: 'ignore',
+        env: { ...process.env, LITERT_LM_PLUGIN_INSTANCE: randomUUID() } },
     );
     child.unref();
     // Deliberately does NOT record the watchdog. The watchdog publishes its own pid,
@@ -894,7 +910,8 @@ async function ensureServer(opts) {
   writeState(opts.port, 'starting', `${spawnedAt} ${process.pid}`);
   try {
     child = spawn(exe, ['serve', '--host', opts.host, '--port', String(opts.port)],
-      { detached: true, stdio: 'ignore', windowsHide: true });
+      { detached: true, stdio: 'ignore', windowsHide: true,
+        env: { ...process.env, LITERT_LM_PLUGIN_INSTANCE: randomUUID() } });
     child.unref();
   } catch (err) {
     throw new Error(
@@ -1034,9 +1051,20 @@ async function stopProcesses(opts, endpointAnswered = false) {
   const port = opts.port;
 
   const PID_FILES = ['watchdog.pid', 'server.pid'];
+  // A live record from pre-token releases is evidence, but never authority. The old
+  // filter dropped it before the shutdown model was built, so an off-port launcher
+  // or watchdog could remain alive while its only record was cleared and success was
+  // reported. Keep it visible and fail closed; a socket owner independently proven
+  // by command line does not need the legacy record's authority.
+  const legacyRecords = PID_FILES
+    .map((name) => ({ name, record: pidRecord(port, name) }))
+    .filter(({ name, record }) => record !== null && record.token === null
+      && !recordIsStale(record, stateWrittenAt(port, name)));
   const recordedByName = ownedPids(port, PID_FILES);
   const recorded = [...recordedByName.values()];
-  const { ours, strangers, unidentified, discoveryFailed } = classifyPortOwners(opts);
+  const { ours, strangers, unidentified, observed, discoveryFailed } = classifyPortOwners(opts);
+  const legacy = legacyRecords.map(({ record }) => record.pid)
+    .filter((pid) => !ours.some((owner) => owner.pid === pid));
 
   // Survivors of a PREVIOUS failed stop, which the two pid slots could not hold.
   //
@@ -1080,13 +1108,11 @@ async function stopProcesses(opts, endpointAnswered = false) {
   // by anything except noticing. So when the picture is incomplete, nothing is
   // signalled and nothing is cleared.
   //
-  // A discovery that could not RUN counts here too, but only while something is
-  // actually answering on the port. The two facts have to be taken together: on a
-  // host with neither lsof nor ss the query always fails, and treating that alone as
-  // a blocker would make `--stop` refuse forever on exactly the minimal images the
-  // `ss` fallback was added for. With the endpoint answering it is a different claim
-  // — something is there and we cannot ask who — which is the unidentified case in
-  // all but name.
+  // A discovery that could not RUN counts here too, but only when another observation
+  // says there is something to account for: either walk saw a listener, the endpoint
+  // answered, or live state remains. On a host with neither lsof nor ss the query
+  // always fails, and treating failure alone as a blocker would make `--stop` refuse
+  // forever even when no server or state exists.
   //
   // `endpointAnswered` alone was not enough, and leaned on the one inference this
   // codebase spends most of its comments warning against. A genuine server is
@@ -1103,12 +1129,13 @@ async function stopProcesses(opts, endpointAnswered = false) {
   // records exited says nothing about it. Only a port with nothing answering AND
   // nothing recorded is genuinely a case of "there was never anything to stop".
   const somethingUnaccountedFor = endpointAnswered
-    || targets.length > 0 || watchdogRecord !== null || carried.length > 0;
+    || observed || targets.length > 0 || watchdogRecord !== null
+    || carried.length > 0 || legacy.length > 0;
   const blindPort = discoveryFailed && somethingUnaccountedFor;
-  if (unidentified.length || blindPort) {
+  if (unidentified.length || blindPort || legacy.length) {
     return {
       signalled: [], strangers, surviving: [], unknown: unidentified,
-      heldPort: false, down: false, blindPort,
+      legacy, heldPort: false, down: false, blindPort,
     };
   }
 
@@ -1320,7 +1347,7 @@ async function stopProcesses(opts, endpointAnswered = false) {
     unknown,
     heldPort: ours.length > 0,
     down: remaining.length === 0 && unknown.length === 0,
-    blindPort: false,
+    blindPort: false, legacy: [],
   };
 }
 
@@ -1446,7 +1473,7 @@ async function main() {
     // The probe reports; it does not authorise. Whether anything gets signalled is
     // decided inside stopProcesses, from process identity.
     const wasUp = await probe(opts);
-    const { signalled, strangers, surviving, unknown, heldPort, down, blindPort } =
+    const { signalled, strangers, surviving, unknown, legacy, heldPort, down, blindPort } =
       await stopProcesses(opts, Boolean(wasUp));
 
     const noteStrangers = () => {
@@ -1473,10 +1500,16 @@ async function main() {
       // state records were kept rather than cleared.
       const parts = [];
       if (blindPort) {
-        parts.push(`something is answering on port ${opts.port}, but who owns it could not\n`
-          + '  be determined — neither lsof nor ss could be run here, so the question was\n'
-          + '  never asked rather than answered "nobody". Nothing was signalled and no\n'
-          + '  state was cleared. Install lsof or iproute2, or stop the process yourself.');
+        parts.push(`process ownership on port ${opts.port} could not be determined — the\n`
+          + '  platform owner-discovery query could not be run, so\n'
+          + '  the question was never asked rather than answered "nobody". Nothing was\n'
+          + '  signalled and no\n'
+          + `  state was cleared. ${portOwnerDiscoveryHelp()}`);
+      }
+      if (legacy.length) {
+        parts.push(`pid ${legacy.join(', ')} has a live legacy PID record without an identity\n`
+          + '  token. It cannot be safely signalled or counted as gone. Nothing was\n'
+          + '  signalled and its record was kept; stop it manually, then retry.');
       }
       if (surviving.length) {
         parts.push(`pid ${surviving.join(', ')} did not stop. It is this plugin's process\n`

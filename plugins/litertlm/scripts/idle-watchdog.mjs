@@ -13,6 +13,8 @@
  * Started detached by litertlm-client.mjs; never invoked by a user directly.
  */
 
+import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -300,6 +302,44 @@ function cleanupAndExit(code = 0) {
   process.exit(code);
 }
 
+/**
+ * Relinquish supervision of an old survivor and start the successor requested by
+ * the client that owns replacement server `record`.
+ *
+ * The request is matched by the complete server identity. A stale request must not
+ * make this watchdog apply another invocation's timeout to an unrelated process,
+ * and a bare pid is not enough under reuse. The slot is released before spawning so
+ * the successor can claim it; if spawn fails the durable request remains for the
+ * next client to repair rather than pretending a handoff occurred.
+ */
+function handoffReplacement(record) {
+  let request = null;
+  try { request = JSON.parse(readState('watchdog-request', 'null')); } catch { return false; }
+  const identity = record?.token ? `${record.pid} ${record.token}` : null;
+  if (identity === null || request?.server !== identity
+      || !Number.isFinite(request.idleTimeout) || request.idleTimeout < 0
+      || typeof request.host !== 'string' || !request.host) return false;
+
+  const mine = parsePidRecord(readState('watchdog.pid', ''));
+  if (mine?.pid === process.pid) clearState('watchdog.pid');
+  clearState('stopping');
+
+  if (request.idleTimeout > 0) {
+    try {
+      const child = spawn(process.execPath,
+        [process.argv[1], '--port', String(opts.port),
+          '--idle-timeout', String(request.idleTimeout), '--host', request.host,
+          '--spawned-at', String(request.requestedAt ?? Date.now())],
+        { detached: true, stdio: 'ignore', windowsHide: true,
+          env: { ...process.env, LITERT_LM_PLUGIN_INSTANCE: randomUUID() } });
+      child.unref();
+    } catch {
+      return false;
+    }
+  }
+  process.exit(0);
+}
+
 async function main() {
   if (!Number.isFinite(opts.idleTimeout) || opts.idleTimeout <= 0) {
     process.exit(0);                                  // disabled; nothing to supervise
@@ -444,11 +484,12 @@ async function main() {
           // server the user explicitly said never to stop, using a superseded
           // invocation's settings.
           //
-          // Standing down leaves B unsupervised until the next client, which then
-          // finds no live supervisor and spawns one under B's policy. That is the
-          // self-correcting direction the rest of this file already prefers, and it
-          // is strictly better than enforcing a rule nobody asked for.
-          cleanupAndExit(0);
+          // B's client has already made its only watchdog-start attempt. It left a
+          // durable request before declining to compete with this live supervisor,
+          // so hand the slot to a successor under B's policy instead of assuming a
+          // future request will repair the gap. If the request is absent, stale, or
+          // does not name B's complete identity, stand down without guessing.
+          if (!handoffReplacement(rec)) cleanupAndExit(0);
         }
 
         clearState('server.pid');
