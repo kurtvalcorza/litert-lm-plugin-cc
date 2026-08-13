@@ -1542,6 +1542,38 @@ describe('admitting a descendant into a start generation', () => {
       'a later stable walk cannot recover a handoff that was never accounted for');
   });
 
+  test('a candidate whose identity changes during confirmation is unjudgeable', async () => {
+    const seeded = new Map([
+      [100, row(1, 'T100')],
+      [200, row(100, 'T200')],
+    ]);
+    const first = new Map([
+      [100, row(1, 'T100')],
+      [200, row(1, 'T200')],
+      [300, row(200, 'T300')],
+    ]);
+    const second = new Map([
+      [100, row(1, 'T100')],
+      [200, row(1, 'T200')],
+      [300, row(200, 'STRANGER')],   // same pid, but not the observed candidate
+    ]);
+    const stable = new Map([
+      [100, row(1, 'T100')],
+      [200, row(1, 'T200')],
+    ]);
+    const gen = startGeneration(100, walks(seeded, seeded, first, second, stable));
+    await gen.sample(true);            // admit 200 while it descends from 100
+    await gen.sample(true);            // observe 300, then see its pid reused
+
+    assert.ok(!gen.has(300), 'a contradicted candidate must not be admitted');
+    assert.equal(gen.authoritative(), false,
+      'pid reuse cannot turn failed identity confirmation into proven quiescence');
+
+    await gen.sample(true);
+    assert.equal(gen.authoritative(), false,
+      'a later stable walk cannot recover the identity that disappeared');
+  });
+
   test('losing every root during confirmation makes the sample unjudgeable', async () => {
     const first = new Map([
       [100, row(1, 'T100')],
