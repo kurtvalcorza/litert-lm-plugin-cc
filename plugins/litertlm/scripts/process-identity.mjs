@@ -316,9 +316,9 @@ function normaliseAddress(addr) {
  * the common default. That admits an IPv6-only `litert-lm serve` on `:::9379` as the
  * owner of a socket a client on 127.0.0.1 cannot reach, and `--stop` would then
  * terminate it: precisely the cross-interface kill this function exists to prevent,
- * reintroduced by the case meant to be generous. Unprovable is excluded, as
- * everywhere else in this module — the cost is a hand-started server on `::` being
- * reported as a stranger and left running, which is visible and recoverable.
+ * reintroduced by the case meant to be generous. A cross-family wildcard is kept
+ * unprovable rather than discarded: it cannot authorise a signal, but its pid enters
+ * the unidentified bucket so an incomplete picture cannot authorise success either.
  *
  * `localhost` is the exception, and not a grudging one: it is a NAME that resolves to
  * either family depending on the resolver, so neither wildcard can be ruled out and
@@ -833,7 +833,13 @@ export function startGeneration(launcherPid, readTable = processTableAsync,
     }
     if (!roots.length) return;
 
-    const candidates = descendantsOf(roots, table).filter((pid) => !mine.has(pid));
+    // Numeric membership is not identity. A later genuine descendant can receive a
+    // pid held by an exited member; suppressing it here preserves the stale token and
+    // prevents the two-walk proof below from replacing it with the current process.
+    // Matching identities need no work, while a different token is a fresh candidate
+    // that still has to pass every confirmation and ancestry check below.
+    const candidates = descendantsOf(roots, table)
+      .filter((pid) => mine.get(pid)?.token !== table.get(pid)?.start);
     if (!candidates.length) return;
 
     // A SECOND WALK BEFORE ADMITTING ANYTHING, because one walk is not a snapshot. On

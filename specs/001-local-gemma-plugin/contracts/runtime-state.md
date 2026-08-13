@@ -88,10 +88,12 @@ generalisation — was wrong: dual-stack depends on `IPV6_V6ONLY`, which none of
 platform queries reports. An IPv6-only `litert-lm serve` on `:::9379` would then be admitted as
 the owner of a socket a `127.0.0.1` client cannot reach, and `--stop` would terminate it —
 exactly the cross-interface kill the filter exists to prevent, reintroduced by the case meant to
-be generous. Unprovable is excluded, as everywhere else here. The cost is a hand-started server
-on `::` being reported as a stranger and left running, which is visible and recoverable.
-`localhost` is the one exception, and not a grudging one: it is a name that resolves to either
-family, so neither wildcard can be ruled out and both are accepted.
+be generous. A cross-family wildcard is therefore `unprovable`: its pid enters the unidentified
+bucket rather than being classified as a stranger, and the incomplete picture defers the whole
+shutdown — nothing is signalled or cleared. That is visible and recoverable, while treating the
+listener as absent could strand an unsupervised server. `localhost` is the one exception, and not
+a grudging one: it is a name that resolves to either family, so neither wildcard can be ruled out
+and both are accepted.
 
 An address the platform query did not yield is treated as a match. That is the absence of
 evidence, not evidence of a foreign bind, and dropping such a listener would silently disarm
@@ -137,13 +139,14 @@ unrecorded listener carried on then looked exactly like a server already gone. F
 is now distinguished from a non-zero *exit* (`lsof` exits 1 when it matches nothing, which is a
 real answer) and surfaces as `discoveryFailed`.
 
-It blocks a success verdict only while the endpoint is actually answering. The two facts have to
-be taken together: on a minimal image the query always fails, and treating that alone as a blocker
-would make `--stop` refuse forever on exactly the images the `ss` fallback exists for. With
-something answering it is a different claim — something is there and we cannot ask who — and it is
-handled like an unidentified listener. The watchdog checks it before its stand-down branch, since
-that branch reads an empty target set as "nothing here is ours", which is precisely what a query
-that never ran produces.
+It blocks a success verdict when the endpoint answers **or recorded state says a process may still
+need accounting**: a recorded server target, watchdog, or carried survivor. The latter matters
+during startup and model switches, when a genuine server can be unreachable and its recorded
+launcher can already have exited while an unrecorded descendant owns the socket. Discovery failure
+with neither an answer nor any recorded state remains non-blocking; otherwise a minimal image with
+no server would make `--stop` refuse forever. The watchdog likewise treats a failed discovery as
+unjudgeable before its stand-down branch, rather than spending an empty result as proof that no
+server remains.
 
 **An incomplete picture cancels the whole operation.** If any listener on the port cannot be
 identified, `--stop` signals nothing and clears nothing. Signalling only what is provable would
@@ -255,10 +258,12 @@ the OS decides when a number comes back around. The rules above are therefore dr
 fabricated table, which is what makes the reuse case deterministic coverage rather than a
 hopeful comment.
 
-Sampling is throttled by what a walk costs: Linux reads `/proc` and starts nothing, Windows means
-a PowerShell start-up (~930ms, blocking the loop the readiness probe shares) and so samples every
-3s. On that platform the launcher stages were observed alive together for the whole start, so the
-slower cadence still catches the intermediate long before it exits.
+Sampling is throttled by what a walk costs. Linux reads `/proc` and starts nothing. Windows starts
+PowerShell (~930ms), but the walk is asynchronous so it no longer blocks the readiness probe. For
+the first 15 seconds, while launcher handoffs occur, Windows samples on every roughly 750ms startup
+iteration; after that dense window it falls back to a 3-second cadence while the long-running engine
+initialisation is unlikely to spawn new stages. This narrows rather than eliminates the handoff
+window, so cancellation's quiescence check remains the backstop.
 
 **A teardown that lost its supervisor is unfinished, not finished.** If the watchdog dies
 mid-shutdown, `stopping` is released but `server.pid` is preserved, and the next start must

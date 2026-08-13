@@ -1424,6 +1424,28 @@ describe('admitting a descendant into a start generation', () => {
     assert.ok(gen.has(200), 'while a member that is still itself is unaffected');
   });
 
+  test('a genuine descendant refreshes a stale member that reused its pid', async () => {
+    let table = new Map([
+      [100, row(1, 'T100')],
+      [200, row(100, 'OLD-T200')],
+    ]);
+    const gen = startGeneration(100, () => table);
+    await gen.sample(true);
+    assert.equal(gen.member(200)?.token, 'OLD-T200', 'the first descendant is recorded');
+
+    // The original process exits, then a later genuine descendant of the surviving
+    // root receives the same number. Numeric membership must not suppress the new,
+    // independently confirmed identity.
+    table = new Map([
+      [100, row(1, 'T100')],
+      [200, row(100, 'NEW-T200')],
+    ]);
+    await gen.sample(true);
+
+    assert.equal(gen.member(200)?.token, 'NEW-T200',
+      'the stale member must be replaced by the current proven descendant');
+  });
+
   /**
    * The seam hands back a different table per call, so one `sample()` can be given a
    * first walk and a confirming second walk that disagree. That is the only way to
