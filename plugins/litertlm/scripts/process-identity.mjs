@@ -111,18 +111,29 @@ function run(cmd, args, { nonZeroIsAnswer = false } = {}) {
 /**
  * `run`, off the event loop.
  *
- * Same contract, same three-state answer; the only difference is that the caller keeps
- * its timers and sockets while the query runs. That is what makes a tight sampling
- * cadence affordable on Windows, where a process-table walk is a PowerShell start-up
- * measured at ~930ms — long enough that a blocking version had to be throttled to
- * every 3s, which is itself long enough for a launcher stage to spawn a descendant and
- * exit unobserved.
+ * Same contract, same three-state answer; the caller keeps its timers and sockets
+ * while the query runs, and a query that exceeds its bound becomes `{ ok: false }`.
+ * That is what makes a tight sampling cadence affordable on Windows, where a
+ * process-table walk is a PowerShell start-up measured at ~930ms — long enough that a
+ * blocking version had to be throttled to every 3s, which is itself long enough for a
+ * launcher stage to spawn a descendant and exit unobserved.
  */
-function runAsync(cmd, args, { nonZeroIsAnswer = false } = {}) {
+const PROCESS_QUERY_TIMEOUT_MS = 10_000;
+
+function runAsync(cmd, args,
+  { nonZeroIsAnswer = false, timeoutMs = PROCESS_QUERY_TIMEOUT_MS } = {}) {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(cmd, args, { windowsHide: true });
+      // A process-table query sits inside the startup deadline, but awaiting a child
+      // with no bound prevents that deadline from advancing at all. Abort the query
+      // and return the ordinary unjudgeable result; callers already know not to spend
+      // `{ ok: false }` as an empty process table.
+      child = spawn(cmd, args, {
+        windowsHide: true,
+        signal: AbortSignal.timeout(timeoutMs),
+        killSignal: 'SIGKILL',
+      });
     } catch {
       resolve({ ok: false, out: '', status: null });
       return;
@@ -788,6 +799,7 @@ export function startGeneration(launcherPid, readTable = processTableAsync,
   let lastSample = 0;
   let seeded = false;
   let lastWalkSaw = false;
+  let handoffUncertain = false;
 
   // The seam hands back a bare Map; production hands back a promise of
   // `{ ok, table }`. Normalised here so a test can stay as simple as `() => table`
@@ -858,7 +870,15 @@ export function startGeneration(launcherPid, readTable = processTableAsync,
 
     // Roots that survived the whole enumeration, judged against the second walk.
     const proven = roots.filter((pid) => confirm.get(pid)?.start === mine.get(pid).token);
-    if (!proven.length) return;
+    if (!proven.length) {
+      // Both queries ran, but validation lost the only identities that could vouch
+      // for the candidates. That is not an authoritative empty observation: the
+      // child may simply have reparented after the first walk. Cancellation must keep
+      // this sample unjudgeable instead of converting rejected admission to proof of
+      // quiescence.
+      handoffUncertain = true;
+      return;
+    }
 
     for (const pid of candidates) {
       // Present in BOTH walks with the SAME identity...
@@ -871,7 +891,14 @@ export function startGeneration(launcherPid, readTable = processTableAsync,
       // candidate descended from the one that turned out to be a reused number was
       // admitted on the strength of the other one's survival.
       const chain = chainToRoot(pid, table, proven);
-      if (chain === null) continue;
+      if (chain === null) {
+        // Some root survived, but not the one that vouched for this candidate. Once
+        // that ancestry disappears no later empty walk can recover it, so remember
+        // the uncertainty rather than letting a different root manufacture global
+        // authority for the generation.
+        handoffUncertain = true;
+        continue;
+      }
 
       // EVERY LINK ON THE PATH IS A CLAIM, not just its two ends. One walk is not a
       // snapshot: an intermediate can be read, exit, and have its number reissued
@@ -920,12 +947,15 @@ export function startGeneration(launcherPid, readTable = processTableAsync,
      * same three-state discipline the rest of the module uses: gone, ours, or
      * unjudgeable — and unjudgeable must never be spent as proof.
      */
-    // BOTH HALVES. Seeding proves we once identified the launcher; the last walk
+    // ALL THREE PARTS. Seeding proves we once identified the launcher; the last walk
     // succeeding proves the emptiness a caller is about to read is an observation
-    // rather than a failed question. A seeded generation whose queries have started
-    // failing reported "nothing remains" from walks that returned an empty Map because
-    // `ps` could not run — quiescence concluded from a question never asked.
-    authoritative: () => seeded && lastWalkSaw,
+    // rather than a failed question; and no candidate may have lost the roots that
+    // vouched for it during confirmation. A later empty walk cannot recover that
+    // vanished ancestry. Without these distinctions cancellation concludes quiescence
+    // from either a question never asked or a handoff it failed to follow.
+    // Handoff uncertainty is sticky. A later empty walk cannot prove what happened
+    // to a candidate after the last root that vouched for it disappeared.
+    authoritative: () => seeded && lastWalkSaw && !handoffUncertain,
 
     adopt(owner) {
       // A MATCHING NUMBER IS NOT A MATCHING MEMBER. If an exited launcher's pid was
@@ -938,7 +968,8 @@ export function startGeneration(launcherPid, readTable = processTableAsync,
       if (held !== undefined && held.token === owner.token) return;
       // An adopted listener was proven ours by command line and carries a token, so
       // it is as good a root as the launcher and equally good evidence that we were
-      // able to look at all.
+      // able to look at all. It does not erase an earlier uncertain handoff: another
+      // candidate may still be starting without a socket.
       mine.set(owner.pid, owner);
       seeded = true;
       // An adoption is itself a successful observation: it comes from socket discovery
@@ -1293,6 +1324,9 @@ export const _parsers = {
   tableWindows: parseTableWindows,
   tablePosix: parseTablePosix,
 };
+
+/** Test seam: query completion and timeout behavior without a platform-specific tool. */
+export const _queries = { runAsync };
 
 /** Test seam: forget everything looked up so far. */
 export function _resetIdentityCache() {

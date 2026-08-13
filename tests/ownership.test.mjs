@@ -32,7 +32,7 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import {
-  _parsers, addressServes, commandLaunches, descendantsOf, formatPidRecord, identity,
+  _parsers, _queries, addressServes, commandLaunches, descendantsOf, formatPidRecord, identity,
   identifyPortOwners, isLitertLmServeCommand, parsePidRecord, pidsOnPort, processTable,
   recordIsStale, signallablePid, startGeneration, startToken,
 } from '../plugins/litertlm/scripts/process-identity.mjs';
@@ -1507,6 +1507,29 @@ describe('admitting a descendant into a start generation', () => {
 
     assert.ok(!gen.has(300),
       'a candidate must descend from the particular root that survived confirmation');
+    assert.equal(gen.authoritative(), false,
+      'losing the candidate\'s specific root makes the generation unjudgeable');
+  });
+
+  test('losing every root during confirmation makes the sample unjudgeable', async () => {
+    const first = new Map([
+      [100, row(1, 'T100')],
+      [200, row(100, 'T200')],
+    ]);
+    const second = new Map([
+      [200, row(1, 'T200')],           // same candidate, but its root vanished
+    ]);
+    const empty = new Map();
+    const gen = startGeneration(100, walks(first, second, empty));
+    await gen.sample(true);
+
+    assert.ok(!gen.has(200), 'the candidate cannot be admitted without a proven root');
+    assert.equal(gen.authoritative(), false,
+      'a successful query is not authoritative when its validation lost every root');
+
+    await gen.sample(true);
+    assert.equal(gen.authoritative(), false,
+      'a later empty walk cannot recover ancestry that already disappeared');
   });
 
   // The other half, and the reason the check is CONTRADICTED rather than ABSENT. A
@@ -1651,6 +1674,15 @@ describe('admitting a descendant into a start generation', () => {
 
       try { child.kill('SIGKILL'); } catch { /* ignore */ }
     });
+
+  test('an asynchronous query has a bounded failure path', async () => {
+    const started = Date.now();
+    const result = await _queries.runAsync(process.execPath,
+      ['-e', 'setInterval(() => {}, 1000)'], { timeoutMs: 100 });
+
+    assert.equal(result.ok, false, 'a query that outlives its bound is not an answer');
+    assert.ok(Date.now() - started < 5000, 'the hung child must not hold startup indefinitely');
+  });
 });
 
 describe('cancelling a start whose descendant has not bound yet', () => {
@@ -1667,11 +1699,13 @@ describe('cancelling a start whose descendant has not bound yet', () => {
    * descendant then bound anyway, unrecorded, which is the exact outcome cancelling
    * exists to prevent.
    *
-   * A state-file handshake makes the ordering exact instead of betting on how long a
-   * Windows process-table query takes: the stage exits only after `last-activity`
-   * proves the client's second descendant sample completed, and the stop lands only
-   * after the stage is confirmed gone. By cancellation time a fresh walk still finds
-   * no parent link. Accumulation during startup is the whole answer.
+   * A preload counter makes the ordering exact instead of betting on how long a
+   * process-table query takes. It acknowledges the generation sampler's post-walk
+   * checkpoint only after `grandchild.pid` exists, and the test requires TWO such
+   * acknowledgements: even if the marker appeared just after the first walk, the
+   * second walk necessarily started after it. The stage exits only then, and the stop
+   * lands after the stage is confirmed gone. Accumulation during startup is the whole
+   * answer.
    */
   function installHandoffLitertLm(binDir, workDir, port) {
     mkdirSync(binDir, { recursive: true });
@@ -1709,6 +1743,25 @@ describe('cancelling a start whose descendant has not bound yet', () => {
       setInterval(() => {
         if (existsSync(join(__dirname, 'release-launcher'))) process.exit(0);
       }, 50);
+    `, 'utf8');
+
+    writeFileSync(join(workDir, 'sample-ack.cjs'), `
+      const { existsSync, readFileSync, writeFileSync } = require('node:fs');
+      const { join } = require('node:path');
+      const realSetImmediate = global.setImmediate;
+      if ((process.argv[1] || '').endsWith('litertlm-client.mjs')) {
+        global.setImmediate = (callback, ...args) => realSetImmediate(() => {
+          const child = join(process.cwd(), 'grandchild.pid');
+          const ack = join(process.cwd(), 'sample-ack');
+          if (existsSync(child)) {
+            let count = 0;
+            try { count = Number.parseInt(readFileSync(ack, 'utf8'), 10) || 0; }
+            catch { /* first acknowledgement */ }
+            writeFileSync(ack, String(count + 1), 'utf8');
+          }
+          callback(...args);
+        });
+      }
     `, 'utf8');
   }
 
@@ -1771,6 +1824,7 @@ describe('cancelling a start whose descendant has not bound yet', () => {
           env: {
             ...process.env,
             LITERT_LM_PLUGIN_RUNTIME: runtime,
+            NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=./sample-ack.cjs`.trim(),
             PATH: `${binDir}${sep}${process.env.PATH ?? ''}`,
             Path: `${binDir}${sep}${process.env.Path ?? ''}`,
           },
@@ -1792,9 +1846,9 @@ describe('cancelling a start whose descendant has not bound yet', () => {
         }
       });
 
-      const dir = join(runtime, String(port));
-      assert.ok(await waitFor(() => readIfPresent(join(dir, 'last-activity')) !== null,
-        { timeout: 30_000 }), 'the client should finish sampling the live launcher tree');
+      const sampleAck = join(workDir, 'sample-ack');
+      assert.ok(await waitFor(() => Number.parseInt(readIfPresent(sampleAck) ?? '', 10) >= 2,
+        { timeout: 30_000 }), 'two post-spawn process-table samples should be acknowledged');
       writeFileSync(join(workDir, 'release-launcher'), 'release', 'utf8');
       const launcher = Number.parseInt(readIfPresent(join(workDir, 'launcher.pid')), 10);
       assert.ok(Number.isInteger(launcher), 'the fixture should report its launcher pid');

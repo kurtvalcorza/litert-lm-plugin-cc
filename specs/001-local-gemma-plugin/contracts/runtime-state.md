@@ -262,8 +262,9 @@ Sampling is throttled by what a walk costs. Linux reads `/proc` and starts nothi
 PowerShell (~930ms), but the walk is asynchronous so it no longer blocks the readiness probe. For
 the first 15 seconds, while launcher handoffs occur, Windows samples on every roughly 750ms startup
 iteration; after that dense window it falls back to a 3-second cadence while the long-running engine
-initialisation is unlikely to spawn new stages. This narrows rather than eliminates the handoff
-window, so cancellation's quiescence check remains the backstop.
+initialisation is unlikely to spawn new stages. Each asynchronous tool query is capped at 10 seconds;
+exceeding that bound is a failed, unjudgeable walk rather than an empty process table. This narrows
+rather than eliminates the handoff window, so cancellation's quiescence check remains the backstop.
 
 **A teardown that lost its supervisor is unfinished, not finished.** If the watchdog dies
 mid-shutdown, `stopping` is released but `server.pid` is preserved, and the next start must
