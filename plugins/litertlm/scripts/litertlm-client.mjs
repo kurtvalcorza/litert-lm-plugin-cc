@@ -894,7 +894,7 @@ async function ensureServer(opts) {
   // The link between our launcher and the process that will actually serve exists
   // only while the launcher is alive — a detached grandchild is reparented to init
   // the moment its parent exits, and no later walk can recover the relationship. The
-  // constructor takes its own snapshot for exactly that reason: on Linux a stage that
+  // first sample is taken immediately for exactly that reason: on Linux a stage that
   // hands off and exits can be gone within milliseconds of `recordSpawnedPid`.
   // The third argument is what keeps a retried seed honest: if the first table read
   // missed this launcher, seeding may be re-attempted only while the child handle
@@ -920,9 +920,12 @@ async function ensureServer(opts) {
   while (Date.now() < deadline) {
     await sleep(750);
 
-    // Keep watching the tree while the server comes up. Throttled by
-    // DESCENDANT_SAMPLE_MS rather than run every pass, because on Windows a walk is a
-    // PowerShell start-up that blocks the loop this probe shares.
+    // Keep watching the tree while the server comes up. The walk no longer blocks the
+    // event loop, so this awaits a subprocess rather than freezing on one — an
+    // in-flight probe keeps making progress across it. What the cadence rations now is
+    // CPU: dense while the launcher chain is assembling and a handoff could be missed,
+    // throttled once the start is a single process loading a model. See
+    // DESCENDANT_SAMPLE_MS.
     await generation.sample();
 
     // A concurrent `--stop` cancels this start, and cancelling has to mean stopping.

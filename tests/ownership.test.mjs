@@ -107,6 +107,7 @@ const PORT = {
   watchdogSurvivor: reservePort(19411),
   leftover: reservePort(19421),
   twoInterfaces: reservePort(19431),
+  dualBinding: reservePort(19436),
   concurrentStart: reservePort(19441),
   abandonedClaim: reservePort(19451),
   preBootClaim: reservePort(19461),
@@ -244,6 +245,28 @@ async function startListener(port, address) {
     });
     s.on('error', () => process.exit(1));
     s.listen(${port}, ${JSON.stringify(address)});
+    setInterval(() => {}, 1000);
+  `;
+  const child = reap(spawn(process.execPath, ['--input-type=module', '-e', src],
+    { stdio: 'ignore', windowsHide: true }));
+  await sleep(1200);
+  return alive(child.pid) ? child : null;
+}
+
+/** One process holding an exact IPv4 socket and an unprovable IPv6 wildcard. */
+async function startDualListener(port) {
+  const src = `
+    import { createServer } from 'node:http';
+    const reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ object: 'list', data: [] }));
+    };
+    const v4 = createServer(reply);
+    const v6 = createServer(reply);
+    v4.on('error', () => process.exit(1));
+    v6.on('error', () => process.exit(1));
+    v4.listen(${port}, '127.0.0.1');
+    v6.listen({ port: ${port}, host: '::', ipv6Only: true });
     setInterval(() => {}, 1000);
   `;
   const child = reap(spawn(process.execPath, ['--input-type=module', '-e', src],
@@ -1229,6 +1252,29 @@ describe('scoping socket ownership to the local address', () => {
       assert.ok(both.includes(ours.pid) && both.includes(other.pid),
         'a null host still means "whoever holds this port"');
     });
+
+  // The same pid can appear in both buckets: its exact IPv4 socket is provably the
+  // endpoint, while its IPv6 wildcard may or may not serve an IPv4 caller. The second
+  // socket adds no uncertainty about a process already conclusively identified by the
+  // first; counting it as unidentified made shutdown defer forever.
+  test('a proven owner is not also unidentified through its wildcard socket',
+    { timeout: 60_000 }, async (t) => {
+      if (!(await canDiscoverPortOwners())) {
+        t.skip('no socket-owner discovery on this host (needs lsof or ss)');
+        return;
+      }
+      const child = await startDualListener(PORT.dualBinding);
+      if (child === null) {
+        t.skip('this host cannot bind separate IPv4 and IPv6 sockets on one port');
+        return;
+      }
+
+      const seen = identifyPortOwners(PORT.dualBinding, (pid) => pid === child.pid,
+        '127.0.0.1');
+      assert.deepEqual(seen.ours.map((owner) => owner.pid), [child.pid]);
+      assert.deepEqual(seen.unidentified, [],
+        'an unprovable second socket cannot undo a conclusive first socket');
+    });
 });
 
 describe('a start that is still in progress', () => {
@@ -1375,6 +1421,92 @@ describe('admitting a descendant into a start generation', () => {
     assert.ok(!gen.has(777),
       'a pid whose token no longer matches must not vouch for anything');
     assert.ok(gen.has(200), 'while a member that is still itself is unaffected');
+  });
+
+  /**
+   * The seam hands back a different table per call, so one `sample()` can be given a
+   * first walk and a confirming second walk that disagree. That is the only way to
+   * stage a mid-enumeration tear: the rows within one walk describe different moments,
+   * and no fixture built from a single table can express it.
+   */
+  const walks = (...tables) => {
+    let i = 0;
+    return () => tables[Math.min(i++, tables.length - 1)];
+  };
+
+  // THE DEFECT: admission checked the two ENDS of the chain and never the middle. A
+  // non-root intermediate can be read, exit, and have its number reissued before a
+  // later row in the SAME enumeration records an unrelated child under it. Both ends
+  // then survive both walks honestly — 100 is genuinely ours, 300 is a real process
+  // with a real token — while the row that joined them described two processes.
+  // Cancellation would have re-proved that bystander and signalled it.
+  test('a reused intermediate does not carry a stranger\'s child into the set', async () => {
+    const first = new Map([
+      [100, row(1, 'T100')],
+      [200, row(100, 'T200')],        // ours when this row was read...
+      [300, row(200, 'T300')],        // ...but by now 200 is somebody else
+    ]);
+    const second = new Map([
+      [100, row(1, 'T100')],          // the root survived, honestly
+      [200, row(1, 'STRANGER')],      // and the middle is provably not who it was
+      [300, row(200, 'T300')],        // the child is real, and is not ours
+    ]);
+    const gen = startGeneration(100, walks(first, second));
+    await gen.sample(true);
+
+    assert.ok(!gen.has(300),
+      'a chain is only as good as its weakest link, and this one was reissued');
+    assert.ok(!gen.has(200), 'nor the reused number itself');
+    assert.deepEqual(gen.members().map((m) => m.pid), [100], 'only the launcher remains');
+  });
+
+  // A different tear shape: two members are roots in the first walk, but only one
+  // survives confirmation. The survivor cannot vouch globally for a child whose
+  // actual ancestry ran through the root that failed confirmation.
+  test('a surviving root does not vouch for another reused root\'s child', async () => {
+    const seeded = new Map([
+      [100, row(1, 'T100')],
+      [200, row(100, 'T200')],
+    ]);
+    const first = new Map([
+      [100, row(1, 'T100')],
+      [200, row(1, 'T200')],
+      [300, row(200, 'T300')],
+    ]);
+    const second = new Map([
+      [100, row(1, 'T100')],          // one generation member survives
+      [200, row(1, 'STRANGER')],      // the other root has been reused
+      [300, row(200, 'T300')],
+    ]);
+    const gen = startGeneration(100, walks(seeded, seeded, first, second));
+    await gen.sample(true);            // admit 200 while both roots are genuine
+    await gen.sample(true);            // then reject 300 when only 100 proves out
+
+    assert.ok(!gen.has(300),
+      'a candidate must descend from the particular root that survived confirmation');
+  });
+
+  // The other half, and the reason the check is CONTRADICTED rather than ABSENT. A
+  // short-lived stage that hands off and exits between the two walks is the ordinary
+  // case on every platform — its child is reparented to init and is exactly the
+  // process this whole mechanism exists to catch. Requiring the chain to still stand
+  // in the second walk would discard it.
+  test('an intermediate that merely exited still passes its child through', async () => {
+    const first = new Map([
+      [100, row(1, 'T100')],
+      [200, row(100, 'T200')],
+      [300, row(200, 'T300')],
+    ]);
+    const second = new Map([
+      [100, row(1, 'T100')],
+      [300, row(1, 'T300')],          // reparented: 200 handed off and exited
+    ]);
+    const gen = startGeneration(100, walks(first, second));
+    await gen.sample(true);
+
+    assert.ok(gen.has(300),
+      'a descendant whose parent exited between the walks is still ours');
+    assert.ok(!gen.has(200), 'while the stage that is gone is not carried along');
   });
 
   test('a member that is still itself keeps admitting its own descendants', async () => {

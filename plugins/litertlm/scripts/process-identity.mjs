@@ -43,7 +43,7 @@
  * Node standard library only (constitution, Principle III).
  */
 
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
 
@@ -76,30 +76,72 @@ const cache = new Map();
 const flatten = (s) => (s ?? '').replace(/\s+/g, ' ').trim();
 
 /**
- * Run a query tool and return its stdout, or '' if it could not run at all.
+ * Run a query tool and preserve whether the query produced an answer at all.
  *
- * Shared by socket discovery and the process-table walk. A tool that is absent, or
- * that the OS refuses to start, is indistinguishable from one that found nothing —
- * which is why every caller here treats an empty answer as "I could not tell" and
- * never as "there is nothing there".
+ * Shared by socket discovery and the process-table walk. `ok` is the load-bearing
+ * part: an empty successful answer means "nothing matched" while a failed query means
+ * "I could not tell", and callers must never spend the second as the first.
+ *
+ * `nonZeroIsAnswer` IS FOR `lsof` ALONE, and it has to be opt-in rather than the
+ * default. `lsof` exits 1 for "nothing matched", so for that one tool a nonzero exit
+ * really is a result. Extending the same generosity to PowerShell, `ss` and `ps` meant
+ * a query that STARTED and then failed handed its empty stdout back as an
+ * authoritative scan: in `--stop` an operational failure became "no owners", state was
+ * cleared and success reported while the server carried on running. Every other tool
+ * here exits 0 on an empty result, so nonzero from them is a broken question.
  */
-function run(cmd, args) {
+function run(cmd, args, { nonZeroIsAnswer = false } = {}) {
   try {
     const r = spawnSync(cmd, args, { encoding: 'utf8', windowsHide: true });
     // `error` is ENOENT, EACCES, or a failure to spawn at all — the query never ran.
     // That is NOT the same answer as "it ran and found nothing", and returning '' for
-    // both is how a failed lookup comes back looking like an empty port. A non-zero
-    // EXIT is deliberately not a failure here: `lsof` exits 1 when it matches nothing,
-    // which is a real answer.
+    // both is how a failed lookup comes back looking like an empty port.
     // A SIGNAL is a failure too, and a quieter one: `spawnSync` leaves `error` unset
     // when the process started fine and was then killed, so a terminated PowerShell
     // or lsof would hand back its partial (usually empty) stdout as an authoritative
     // answer — turning a query someone interrupted straight into an empty port.
     if (r.error || r.signal) return { ok: false, out: '', status: null };
+    if (!nonZeroIsAnswer && r.status !== 0) return { ok: false, out: '', status: r.status };
     return { ok: true, out: r.stdout ?? '', status: r.status };
   } catch {
     return { ok: false, out: '', status: null };
   }
+}
+
+/**
+ * `run`, off the event loop.
+ *
+ * Same contract, same three-state answer; the only difference is that the caller keeps
+ * its timers and sockets while the query runs. That is what makes a tight sampling
+ * cadence affordable on Windows, where a process-table walk is a PowerShell start-up
+ * measured at ~930ms — long enough that a blocking version had to be throttled to
+ * every 3s, which is itself long enough for a launcher stage to spawn a descendant and
+ * exit unobserved.
+ */
+function runAsync(cmd, args, { nonZeroIsAnswer = false } = {}) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(cmd, args, { windowsHide: true });
+    } catch {
+      resolve({ ok: false, out: '', status: null });
+      return;
+    }
+    let out = '';
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+    child.stdout?.setEncoding('utf8');
+    child.stdout?.on('data', (d) => { out += d; });
+    child.stdout?.on('error', () => {});
+    child.stderr?.on('data', () => {});
+    child.stderr?.on('error', () => {});
+    child.on('error', () => done({ ok: false, out: '', status: null }));
+    child.on('close', (status, signal) => {
+      if (signal) { done({ ok: false, out: '', status: null }); return; }
+      if (!nonZeroIsAnswer && status !== 0) { done({ ok: false, out: '', status }); return; }
+      done({ ok: true, out, status });
+    });
+  });
 }
 
 function inspectWindows(pids) {
@@ -338,16 +380,34 @@ export const addressServes = (listenAddress, host) =>
  */
 function listenersOnPort(port) {
   if (process.platform === 'win32') {
+    // THE EXIT CODE IS MADE MEANINGFUL HERE RATHER THAN INTERPRETED.
+    //
+    // `Get-NetTCPConnection` reports "no matching connections" as a non-terminating
+    // ERROR, so `powershell.exe -Command` exits 1 for an empty port — measured, and
+    // identical to the exit it gives when the query genuinely fails. Read naively,
+    // nonzero would mean `--stop` refuses on every idle port; ignored, as it was, a
+    // broken query hands back empty stdout that becomes an authoritative "no owners",
+    // and `--stop` clears state and reports success while the server runs.
+    //
+    // Neither reading is available from the outside, so the script settles it itself:
+    // the one error id that means "nothing matched" is swallowed and exits 0, anything
+    // else exits 3. `run` then applies its ordinary rule — nonzero is a failed query —
+    // and both cases are finally distinguishable. Verified on this host: empty port 0
+    // with no rows, live port 0 with a row, malformed query 3.
     const r = run('powershell.exe', ['-NoProfile', '-Command',
-      `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue `
-      + '| ForEach-Object { ($_.LocalAddress, $_.OwningProcess) -join [char]9 }']);
+      'try { '
+      + `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction Stop `
+      + '| ForEach-Object { ($_.LocalAddress, $_.OwningProcess) -join [char]9 } '
+      + "} catch { if ($_.FullyQualifiedErrorId -notlike 'CmdletizationQuery_NotFound*')"
+      + ' { exit 3 } }; exit 0']);
     return { ok: r.ok, listeners: parseGetNetTcpConnection(r.out) };
   }
 
   // `-F pn` is lsof's machine-readable mode: `p<pid>` opens a process set and each
   // `n<addr>:<port>` under it is one of its sockets. The previous `-ti` form printed
   // pids alone, which is why there was no address to check.
-  const lsof = run('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-F', 'pn']);
+  const lsof = run('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-F', 'pn'],
+    { nonZeroIsAnswer: true });
   if (lsof.ok) {
     const found = parseLsofFields(lsof.out);
     if (found.length) return { ok: true, listeners: found };
@@ -369,10 +429,11 @@ function listenersOnPort(port) {
   const ss = run('ss', ['-ltnp', 'sport', `= :${port}`]);
   if (ss.ok) return { ok: true, listeners: parseSs(ss.out) };
 
-  // Neither tool gave a usable answer. lsof's empty output counts as a real answer
-  // only if it also exited cleanly — a nonzero exit with nothing printed could as
-  // easily be a broken query as an empty port, and with `ss` unavailable there is no
-  // second opinion to settle it.
+  // Neither tool added anything. `lsof.ok` is the whole verdict here, and because lsof
+  // is the one tool run with `nonZeroIsAnswer` it stays true for an exit-1-nothing-
+  // matched run — an empty port on a host with lsof is a real observation, not a
+  // failure. It goes false only when lsof could not run at all, which with `ss` also
+  // unavailable leaves nobody to answer the question, and the caller refuses.
   return { ok: lsof.ok, listeners: [] };
 }
 
@@ -489,11 +550,14 @@ export function pidsOnPort(port, host = null) {
  * here and a token from a pid file are directly comparable. That is load-bearing —
  * `resolveTargets` re-proves generation members against `identity`, not against this.
  */
+const WIN_TABLE_QUERY =
+  'try { Get-CimInstance Win32_Process -ErrorAction Stop '
+  + '| ForEach-Object { ($_.ProcessId, $_.ParentProcessId, '
+  + '$_.CreationDate.ToFileTimeUtc()) -join [char]9 } '
+  + '} catch { exit 3 }; exit 0';
+
 function tableWindows() {
-  const r = run('powershell.exe', ['-NoProfile', '-Command',
-    'Get-CimInstance Win32_Process -ErrorAction SilentlyContinue '
-    + '| ForEach-Object { ($_.ProcessId, $_.ParentProcessId, '
-    + '$_.CreationDate.ToFileTimeUtc()) -join [char]9 }']);
+  const r = run('powershell.exe', ['-NoProfile', '-Command', WIN_TABLE_QUERY]);
   return { ok: r.ok, table: parseTableWindows(r.out) };
 }
 
@@ -583,6 +647,28 @@ export function processTable() {
 }
 
 /**
+ * `processTable`, without blocking the event loop.
+ *
+ * Same output, same `{ ok, table }` contract. Linux needs no async form — it reads
+ * /proc and starts no subprocess — so it simply reuses the sync one.
+ *
+ * This exists so the sampling cadence can be set by what a walk COSTS rather than by
+ * what it blocks. The blocking version forced a 3s throttle on Windows to keep the
+ * readiness probe alive, and 3s is long enough for a launcher stage to spawn a
+ * detached descendant and exit between two samples — after which the descendant is
+ * reparented and nothing can link it back to us.
+ */
+export async function processTableAsync() {
+  if (process.platform === 'win32') {
+    const r = await runAsync('powershell.exe', ['-NoProfile', '-Command', WIN_TABLE_QUERY]);
+    return { ok: r.ok, table: parseTableWindows(r.out) };
+  }
+  if (process.platform === 'linux') return tableLinux();
+  const r = await runAsync('ps', ['-ww', '-Ao', 'pid=,ppid=,lstart=,args=']);
+  return { ok: r.ok, table: parseTablePosix(r.out) };
+}
+
+/**
  * Every process descended from `roots`, transitively, in the CURRENT process table.
  *
  * TWO THINGS THIS DOES NOT DO, both deliberate:
@@ -619,11 +705,50 @@ export function descendantsOf(roots, table = processTable().table) {
  * How often to walk the process table, set by what a walk costs here.
  *
  * Linux reads /proc and starts nothing, so it can sample at the poll rate. Windows
- * means a PowerShell start-up, measured at ~930ms and blocking the event loop, so
- * sampling every 750ms poll would starve the readiness probe it shares the loop with.
- * `ps` on macOS sits between the two and is treated as the cheap case.
+ * means a PowerShell start-up measured at ~930ms; that used to also block the event
+ * loop, which forced a 3s throttle to keep the readiness probe alive. `processTableAsync`
+ * removes the blocking half, so what is left to ration is CPU rather than latency.
+ *
+ * THE STEADY RATE IS STILL NOT FAST ENOUGH TO OBSERVE A HANDOFF, so it is not asked
+ * to. A stage that spawns a detached descendant and exits between two samples takes
+ * the only link to that descendant with it — reparenting to init is immediate and no
+ * later walk recovers it. Handoffs happen while the launcher chain is assembling, in
+ * the first seconds of a start, so that window is sampled at the poll rate and the
+ * long tail — a single process initialising an engine, spawning nothing — is not.
+ *
+ * This narrows the gap; it does not close it. A stage that hands off for the first
+ * time after the dense window still escapes, and the quiescence counter in
+ * `cancelStartedServer` remains the backstop for exactly that. Sampling every 750ms
+ * for the whole start would cost a PowerShell process per poll for the full startup
+ * timeout, on a machine simultaneously loading a model onto the GPU.
  */
 const DESCENDANT_SAMPLE_MS = process.platform === 'win32' ? 3000 : 250;
+
+/** How long a start is treated as still assembling, and sampled at the poll rate. */
+const DESCENDANT_DENSE_MS = 15000;
+
+/**
+ * The pids between `pid` and the first root in `roots`, per `table`, or null if the
+ * walk never reaches one.
+ *
+ * Separate from `descendantsOf` because admission needs the PATH and not merely the
+ * fact of descent: every link on it is a claim the second walk gets to contradict.
+ */
+function chainToRoot(pid, table, roots) {
+  const rootSet = new Set(roots);
+  const chain = [];
+  const seen = new Set([pid]);
+  let cur = table.get(pid)?.ppid;
+  while (Number.isInteger(cur) && !seen.has(cur)) {
+    if (rootSet.has(cur)) return chain;
+    const row = table.get(cur);
+    if (!row) return null;
+    chain.push(cur);
+    seen.add(cur);
+    cur = row.ppid;
+  }
+  return null;
+}
 
 /**
  * The set of processes one start is responsible for.
@@ -656,22 +781,24 @@ const DESCENDANT_SAMPLE_MS = process.platform === 'win32' ? 3000 : 250;
  * admission rules are exercised against a fabricated table instead — which is the
  * only way the case above gets deterministic coverage rather than a hopeful comment.
  */
-export function startGeneration(launcherPid, readTable = processTable,
+export function startGeneration(launcherPid, readTable = processTableAsync,
   launcherIsStillOurs = () => true) {
   const mine = new Map();
+  const startedAt = Date.now();
   let lastSample = 0;
   let seeded = false;
   let lastWalkSaw = false;
 
-  // The seam hands back a bare Map; production hands back `{ ok, table }`. Normalised
-  // here so a test can stay as simple as `() => table` while the real caller keeps the
-  // distinction between a walk that saw nothing and one that never ran.
-  const walk = () => {
-    const r = readTable();
+  // The seam hands back a bare Map; production hands back a promise of
+  // `{ ok, table }`. Normalised here so a test can stay as simple as `() => table`
+  // while the real caller keeps the distinction between a walk that saw nothing and
+  // one that never ran. `await` on a plain value is a no-op, so both shapes work.
+  const walk = async () => {
+    const r = await readTable();
     return r instanceof Map ? { ok: true, table: r } : r;
   };
 
-  const admitFrom = (table) => {
+  const admitFrom = async (table) => {
     // SEEDING IS RETRIED, NOT DONE ONCE. It used to happen only in the constructor,
     // so a first read that missed the launcher — the table query failed to run at
     // all, or the stage exited before it was enumerated — left the set permanently
@@ -719,7 +846,7 @@ export function startGeneration(launcherPid, readTable = processTable,
     // Paid only when there is something to admit, which is rare: most samples find
     // nothing new and return above. That matters on Windows, where a walk is a
     // PowerShell start-up.
-    const confirmed = walk();
+    const confirmed = await walk();
     if (!confirmed.ok) { lastWalkSaw = false; return; }
     const confirm = confirmed.table;
 
@@ -728,17 +855,40 @@ export function startGeneration(launcherPid, readTable = processTable,
     if (!proven.length) return;
 
     for (const pid of candidates) {
-      // Present in BOTH walks with the SAME identity, and descended in the first from
-      // a root that survived both. That is sufficient, and re-checking the parent
-      // chain in the second walk is not merely redundant but harmful: a genuine
-      // descendant whose short-lived parent exits between the two walks is reparented
-      // to init and would be rejected — losing exactly the process this whole
-      // mechanism exists to catch, and doing it most often on Windows where the second
-      // query takes about a second. The root surviving both walks is what closes the
-      // reuse hole; the chain surviving the second closes nothing.
+      // Present in BOTH walks with the SAME identity...
       const first = table.get(pid);
       const second = confirm.get(pid);
       if (!second || first.start !== second.start) continue;
+
+      // ...and descended, in the first walk, from a root that survived BOTH. Checking
+      // only that SOME proven root exists was too weak: with two roots in the set, a
+      // candidate descended from the one that turned out to be a reused number was
+      // admitted on the strength of the other one's survival.
+      const chain = chainToRoot(pid, table, proven);
+      if (chain === null) continue;
+
+      // EVERY LINK ON THE PATH IS A CLAIM, not just its two ends. One walk is not a
+      // snapshot: an intermediate can be read, exit, and have its number reissued
+      // before a later row in the SAME enumeration records an unrelated child under
+      // that number. Both ends then survive both walks honestly — the root is ours,
+      // the child is a real process with a real token — while the row that joined them
+      // described two different processes. Cancellation would re-prove that bystander
+      // and signal it, which is the accident this module exists to prevent.
+      //
+      // CONTRADICTED, NOT MERELY ABSENT, and the distinction is the whole reason this
+      // can be checked at all. An intermediate MISSING from the second walk is the
+      // ordinary case — a short-lived stage that handed off and exited, reparenting
+      // its child to init — and rejecting that would discard exactly the descendant
+      // this mechanism exists to catch. An intermediate PRESENT under a different
+      // identity is the tear: the number is in use by someone who is not who the first
+      // walk said it was.
+      const torn = chain.some((mid) => {
+        const then = table.get(mid);
+        const now = confirm.get(mid);
+        return now !== undefined && then !== undefined && now.start !== then.start;
+      });
+      if (torn) continue;
+
       mine.set(pid, { pid, token: second.start });
     }
   };
@@ -799,12 +949,17 @@ export function startGeneration(launcherPid, readTable = processTable,
      * doing nothing — and here it would let a reused pid seed the generation.
      */
     async sample(force = false) {
-      if (!force && Date.now() - lastSample < DESCENDANT_SAMPLE_MS) return;
+      // Dense while the launcher chain is still assembling, throttled afterwards.
+      // See DESCENDANT_SAMPLE_MS: a handoff is only observable if a sample lands
+      // between the descendant's creation and its parent's exit, and that window is
+      // at the start of a start.
+      const interval = Date.now() - startedAt < DESCENDANT_DENSE_MS ? 0 : DESCENDANT_SAMPLE_MS;
+      if (!force && Date.now() - lastSample < interval) return;
       lastSample = Date.now();
-      const seen = walk();
+      const seen = await walk();
       await new Promise((r) => { setImmediate(r); });
       lastWalkSaw = seen.ok;
-      if (seen.ok) admitFrom(seen.table);
+      if (seen.ok) await admitFrom(seen.table);
     },
   };
 }
@@ -1081,8 +1236,21 @@ export function identifyPortOwners(port, isOurs, host = null) {
   // never counted as gone. See `addressVerdict`: a cross-family wildcard may or may
   // not be the socket answering us, and dropping it was how a live server became
   // invisible.
+  //
+  // ONE PROCESS CAN HOLD BOTH KINDS OF SOCKET, and that is not an unproven process.
+  // A server bound to 127.0.0.1:P and :::P appears in `pids` for the first socket and
+  // in `unprovable` for the second, so the loop above rightly calls it ours while this
+  // one used to append the same pid to `unidentified` as well. Both `--stop` and the
+  // watchdog treat any unidentified listener as an incomplete picture and refuse the
+  // whole operation, so a server that had been conclusively identified deferred its
+  // own shutdown for ever. A pid already judged — either way — is judged; the
+  // unprovable socket adds nothing the proven one has not already settled.
+  const judged = new Set([...ours.map((o) => o.pid), ...strangers, ...unidentified]);
   for (const pid of first.unprovable) {
-    if (second.unprovable.includes(pid) && !unidentified.includes(pid)) unidentified.push(pid);
+    if (judged.has(pid)) continue;
+    if (!second.unprovable.includes(pid)) continue;
+    unidentified.push(pid);
+    judged.add(pid);
   }
 
   return { ours, strangers, unidentified, discoveryFailed: !first.ok || !second.ok };
