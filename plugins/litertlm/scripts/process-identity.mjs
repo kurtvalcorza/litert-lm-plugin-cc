@@ -927,7 +927,13 @@ export function startGeneration(launcherPid, readTable = processTableAsync,
         const now = confirm.get(mid);
         return now !== undefined && then !== undefined && now.start !== then.start;
       });
-      if (torn) continue;
+      if (torn) {
+        // The candidate is correctly rejected, but the contradicted link may have
+        // handed off before its pid was reused. No later walk can reconstruct that
+        // lost ancestry, so rejection cannot strengthen this generation's authority.
+        handoffUncertain = true;
+        continue;
+      }
 
       mine.set(pid, { pid, token: second.start });
     }

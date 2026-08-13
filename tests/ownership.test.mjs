@@ -1464,9 +1464,13 @@ describe('admitting a descendant into a start generation', () => {
   // with a real token — while the row that joined them described two processes.
   // Cancellation would have re-proved that bystander and signalled it.
   test('a reused intermediate does not carry a stranger\'s child into the set', async () => {
+    const seeded = new Map([
+      [100, row(1, 'T100')],
+      [200, row(100, 'T200')],
+    ]);
     const first = new Map([
       [100, row(1, 'T100')],
-      [200, row(100, 'T200')],        // ours when this row was read...
+      [200, row(100, 'T200')],        // a recorded member when this row was read...
       [300, row(200, 'T300')],        // ...but by now 200 is somebody else
     ]);
     const second = new Map([
@@ -1474,13 +1478,19 @@ describe('admitting a descendant into a start generation', () => {
       [200, row(1, 'STRANGER')],      // and the middle is provably not who it was
       [300, row(200, 'T300')],        // the child is real, and is not ours
     ]);
-    const gen = startGeneration(100, walks(first, second));
-    await gen.sample(true);
+    const stable = new Map([[100, row(1, 'T100')]]);
+    const gen = startGeneration(100, walks(seeded, seeded, first, second, stable));
+    await gen.sample(true);            // admit 200 before it becomes the torn link
+    await gen.sample(true);            // reject 300 through the isolated torn path
 
     assert.ok(!gen.has(300),
       'a chain is only as good as its weakest link, and this one was reissued');
-    assert.ok(!gen.has(200), 'nor the reused number itself');
-    assert.deepEqual(gen.members().map((m) => m.pid), [100], 'only the launcher remains');
+    assert.equal(gen.authoritative(), false,
+      'a contradicted intermediate makes the handoff unjudgeable');
+
+    await gen.sample(true);
+    assert.equal(gen.authoritative(), false,
+      'a later stable walk cannot recover ancestry that was torn apart');
   });
 
   // A different tear shape: two members are roots in the first walk, but only one
