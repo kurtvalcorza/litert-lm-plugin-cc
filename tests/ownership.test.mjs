@@ -32,9 +32,9 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import {
-  _parsers, addressServes, commandLaunches, formatPidRecord, identity,
-  isLitertLmServeCommand, parsePidRecord, pidsOnPort, recordIsStale, signallablePid,
-  startToken,
+  _parsers, _queries, addressServes, commandLaunches, descendantsOf, formatPidRecord, identity,
+  identifyPortOwners, isLitertLmServeCommand, parsePidRecord, pidsOnPort, processTable,
+  recordIsStale, signallablePid, startGeneration, startToken,
 } from '../plugins/litertlm/scripts/process-identity.mjs';
 
 const SCRIPTS = join(dirname(fileURLToPath(import.meta.url)), '..', 'plugins', 'litertlm', 'scripts');
@@ -55,15 +55,36 @@ const WATCHDOG = join(SCRIPTS, 'idle-watchdog.mjs');
  * So each port is bound here, checked, and released. Anything already listening is
  * skipped rather than trusted.
  */
+const taken = new Set();
+
+/**
+ * Two hazards, and the probe alone addresses neither completely.
+ *
+ * WITHIN one run the ranges overlap — the bases are ten apart and each scan walks
+ * four hundred — and nothing holds a port between reserving it and using it, so two
+ * reservations could return the SAME number and two fixtures would then signal each
+ * other. `taken` closes that half exactly.
+ *
+ * ACROSS concurrent runs it is a genuine time-of-check/time-of-use gap: the probe
+ * closes its socket before returning, so two processes scanning from the same base
+ * pick the same port and each destroys the other's fixtures. It cannot be closed from
+ * here without holding the socket, which is the one thing the caller needs. Starting
+ * each run at a pid-derived offset makes convergence unlikely rather than impossible,
+ * and that limit is worth stating rather than implying.
+ */
 function reservePort(from) {
-  for (let candidate = from; candidate < from + 400; candidate += 1) {
+  const SPAN = 400;
+  const offset = (process.pid * 7) % SPAN;
+  for (let i = 0; i < SPAN; i += 1) {
+    const candidate = from + ((offset + i) % SPAN);
+    if (taken.has(candidate)) continue;
     const probe = spawnSync(process.execPath, ['-e', `
       const { createServer } = require('node:http');
       const s = createServer(() => {});
       s.on('error', () => process.exit(1));
       s.listen(${candidate}, '127.0.0.1', () => s.close(() => process.exit(0)));
     `], { encoding: 'utf8', windowsHide: true });
-    if (probe.status === 0) return candidate;
+    if (probe.status === 0) { taken.add(candidate); return candidate; }
   }
   throw new Error(`no free port found from ${from}`);
 }
@@ -86,9 +107,14 @@ const PORT = {
   watchdogSurvivor: reservePort(19411),
   leftover: reservePort(19421),
   twoInterfaces: reservePort(19431),
+  dualBinding: reservePort(19436),
   concurrentStart: reservePort(19441),
   abandonedClaim: reservePort(19451),
   preBootClaim: reservePort(19461),
+  watchdogTombstone: reservePort(19471),
+  preBindCancel: reservePort(19481),
+  discoveryBlind: reservePort(19491),
+  postProbeCancel: reservePort(19501),
 };
 
 const spawned = [];
@@ -220,6 +246,28 @@ async function startListener(port, address) {
     });
     s.on('error', () => process.exit(1));
     s.listen(${port}, ${JSON.stringify(address)});
+    setInterval(() => {}, 1000);
+  `;
+  const child = reap(spawn(process.execPath, ['--input-type=module', '-e', src],
+    { stdio: 'ignore', windowsHide: true }));
+  await sleep(1200);
+  return alive(child.pid) ? child : null;
+}
+
+/** One process holding an exact IPv4 socket and an unprovable IPv6 wildcard. */
+async function startDualListener(port) {
+  const src = `
+    import { createServer } from 'node:http';
+    const reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ object: 'list', data: [] }));
+    };
+    const v4 = createServer(reply);
+    const v6 = createServer(reply);
+    v4.on('error', () => process.exit(1));
+    v6.on('error', () => process.exit(1));
+    v4.listen(${port}, '127.0.0.1');
+    v6.listen({ port: ${port}, host: '::', ipv6Only: true });
     setInterval(() => {}, 1000);
   `;
   const child = reap(spawn(process.execPath, ['--input-type=module', '-e', src],
@@ -473,6 +521,14 @@ describe('--stop', () => {
   // reported the memory released.
   test('keeps pressing a target that is alive but no longer listening',
     { timeout: 60_000 }, async (t) => {
+      // Gated for the same reason the other socket tests are: with neither lsof nor
+      // ss, a valid recorded target makes the port unaccountable, so `--stop` refuses
+      // before escalating and the exit-0 assertion below would fail a minimal host
+      // for a correct refusal.
+      if (!(await canDiscoverPortOwners())) {
+        t.skip('no socket-owner discovery on this host (needs lsof or ss)');
+        return;
+      }
       if (process.platform === 'win32') {
         t.skip('SIGTERM cannot be trapped on Windows, so escalation is unobservable');
         return;
@@ -705,18 +761,65 @@ describe('the idle watchdog', () => {
         [WATCHDOG, '--port', String(port), '--idle-timeout', '1'],
         { stdio: 'ignore', env: { ...process.env, LITERT_LM_PLUGIN_RUNTIME: runtime } }));
 
-      // One poll to decide, then 30 escalation attempts at 500ms.
-      assert.ok(await waitFor(() => watchdog.exitCode !== null, { timeout: 60_000 }),
-        'the watchdog should finish its attempt');
+      // One poll to decide, then 30 escalation attempts at 500ms. The attempt ends
+      // when the handshake is released — not when the process exits, because it
+      // deliberately no longer exits (see below).
+      assert.ok(await waitFor(() => readIfPresent(join(dir, 'survivors')) !== null,
+        { timeout: 60_000 }), 'the watchdog should record what it could not stop');
+      assert.ok(await waitFor(() => readIfPresent(join(dir, 'stopping')) === null,
+        { timeout: 30_000 }),
+        'and release the handshake so clients are not blocked by a failed shutdown');
 
       assert.equal(readIfPresent(join(dir, 'stopped-idle')), null,
         'a stop that did not happen must not be reported as one');
       assert.equal(parsePidRecord(readIfPresent(join(dir, 'server.pid')))?.pid, 1,
         'and the identity needed to retry must survive');
-      assert.equal(readIfPresent(join(dir, 'stopping')), null,
-        'while the handshake is released so clients are not blocked');
+
+      // IT MUST NOT STAND DOWN. This used to exit, on the reasoning that the next
+      // client would start a fresh supervisor — but this is the idle path, and
+      // nothing guarantees a next client. A server that refuses the signal would then
+      // sit resident holding accelerator memory with no watchdog at all, which is the
+      // outcome this process exists to prevent. Relinquishing the slot is only safe
+      // when someone is known to be coming.
+      assert.ok(alive(watchdog.pid),
+        'a failed idle stop must leave supervision in place, not abandon it');
+      assert.equal(recordedPid(dir), watchdog.pid,
+        'and it must still hold the slot, so no second supervisor is spawned beside it');
 
       try { responder.kill('SIGKILL'); } catch { /* ignore */ }
+      try { watchdog.kill('SIGKILL'); } catch { /* ignore */ }
+    });
+
+  // A stop can land AFTER a watchdog has published, and the two start-up checks
+  // cannot see it: the tombstone is written last, at the very end of `--stop`, so a
+  // watchdog that published anywhere inside that command checked a `stopped-at` that
+  // did not exist yet. It then went on supervising a server that had been torn down,
+  // and — because it stayed the registered supervisor — the next client saw a live
+  // `watchdog.pid`, declined to spawn one, and had its server adopted by this process
+  // under the previous invocation's idle-timeout.
+  test('stands down when a stop lands after it has published', { timeout: 60_000 },
+    async () => {
+      const port = PORT.watchdogTombstone;
+      const runtime = runtimeDir();
+      const dir = stateDir(runtime, port);
+      const spawnedAt = Date.now();
+
+      const watchdog = reap(spawn(process.execPath,
+        [WATCHDOG, '--port', String(port), '--idle-timeout', '900',
+          '--spawned-at', String(spawnedAt)],
+        { stdio: 'ignore', windowsHide: true,
+          env: { ...process.env, LITERT_LM_PLUGIN_RUNTIME: runtime } }));
+
+      assert.ok(await waitFor(() => recordedPid(dir) === watchdog.pid),
+        'the watchdog should hold the slot before the stop arrives');
+
+      // A `--stop` completes and writes its tombstone, as it does last of all.
+      writeFileSync(join(dir, 'stopped-at'), String(spawnedAt + 1000), 'utf8');
+
+      assert.ok(await waitFor(() => watchdog.exitCode !== null, { timeout: 40_000 }),
+        'a superseded supervisor must stand down, not supervise a torn-down server');
+      assert.equal(readIfPresent(join(dir, 'watchdog.pid')), null,
+        'and release the slot, so the next client is free to start a fresh one');
     });
 
   // The other half of an exclusive claim: it must not become a lock. A record left
@@ -794,7 +897,15 @@ describe('recording a process we spawned', () => {
   }
 
   test('a launcher stage that exits leaves nothing signallable',
-    { timeout: 90_000 }, async () => {
+    { timeout: 90_000 }, async (t) => {
+      // Gated for the same reason the socket tests are, and now load-bearing rather
+      // than tidy: with neither lsof nor ss, `--stop` can no longer report success
+      // while a recorded identity exists and the port cannot be enumerated, so the
+      // exit-0 assertion below would fail on a minimal host for a correct refusal.
+      if (!(await canDiscoverPortOwners())) {
+        t.skip('no socket-owner discovery on this host (needs lsof or ss)');
+        return;
+      }
       const port = PORT.fakeLauncher;
       const runtime = runtimeDir();
       const dir = join(runtime, String(port));
@@ -967,6 +1078,12 @@ describe('scoping socket ownership to the local address', () => {
       ['::1', '127.0.0.1'],          // a v6 loopback is not reachable over v4
       ['127.0.0.1', '::1'],
       ['0.0.0.0', '::1'],            // a v4 wildcard does not answer v6 callers
+      // And the converse, which is NOT symmetric-looking until you ask why: `::`
+      // is dual-stack only when IPV6_V6ONLY is off, and no OS query here reports
+      // that. An IPv6-only listener admitted to a v4 client is the cross-interface
+      // kill this filter exists to prevent, so an unprovable wildcard is excluded.
+      ['::', '127.0.0.1'],
+      ['0:0:0:0:0:0:0:0', '127.0.0.1'],
     ]) {
       assert.equal(addressServes(address, host), false, `${address} vs ${host}`);
     }
@@ -977,7 +1094,7 @@ describe('scoping socket ownership to the local address', () => {
       ['127.0.0.1', '127.0.0.1'],
       ['0.0.0.0', '127.0.0.1'],
       ['*', '127.0.0.1'],
-      ['::', '127.0.0.1'],              // dual-stack, so it answers v4 too
+      ['::', '::1'],                    // a wildcard does serve its own family
       ['[::1]', '::1'],                 // ss and lsof bracket v6 addresses
       ['::ffff:127.0.0.1', '127.0.0.1'],
       ['fe80::1%lo0', 'fe80::1'],       // a scope id names an interface, not an address
@@ -993,6 +1110,9 @@ describe('scoping socket ownership to the local address', () => {
     assert.equal(addressServes('127.0.0.1', 'localhost'), true);
     assert.equal(addressServes('::1', 'localhost'), true);
     assert.equal(addressServes('192.168.1.5', 'localhost'), false);
+    // A name can resolve to either family, so neither wildcard can be ruled out.
+    assert.equal(addressServes('0.0.0.0', 'localhost'), true);
+    assert.equal(addressServes('::', 'localhost'), true);
   });
 
   // Not evidence of a foreign bind — the absence of evidence. Dropping these would
@@ -1019,6 +1139,32 @@ describe('scoping socket ownership to the local address', () => {
         { pid: 72608, address: '*' }]);
   });
 
+  // These two exist because their absence cost a red CI on two platforms at once.
+  //
+  // `run()` was changed to distinguish "the tool could not start" from "it found
+  // nothing", which altered its return shape — and two table builders went on
+  // treating it as a string. Linux never noticed: it reads /proc directly and calls
+  // `run()` not at all, so a full local suite was green while macOS and Windows both
+  // died with `run.split is not a function`. Parsing is split from running for the
+  // same reason the socket parsers are, so every platform's shape is exercised
+  // everywhere rather than only where its tool happens to exist.
+  test('parses real Win32_Process output', () => {
+    assert.deepEqual(
+      [..._parsers.tableWindows('4\t0\t133700000000000000\r\n68056\t4\t133700000000000001\r\n')],
+      [[4, { ppid: 0, start: '133700000000000000' }],
+        [68056, { ppid: 4, start: '133700000000000001' }]]);
+  });
+
+  test('parses real ps -Ao pid=,ppid=,lstart=,args= output', () => {
+    const table = _parsers.tablePosix(
+      '    1     0 Mon Aug 11 09:00:00 2026 /sbin/launchd\n'
+      + '  512     1 Mon Aug 11 09:01:02 2026 node server.js --port 9379\n');
+    assert.equal(table.get(512).ppid, 1);
+    assert.match(table.get(512).start, /^Mon Aug 11 09:01:02 2026#[0-9a-f]{16}$/,
+      'the token must carry the lstart time and a command-line digest, as identity does');
+    assert.equal(table.size, 2);
+  });
+
   test('parses real ss -ltnp output, header and shared sockets included', () => {
     const out = 'State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process\n'
       + 'LISTEN 0      128    127.0.0.1:9379      0.0.0.0:*  users:(("python",pid=68056,fd=7))\n'
@@ -1030,6 +1176,53 @@ describe('scoping socket ownership to the local address', () => {
       { pid: 902, address: '[::1]' },
     ]);
   });
+
+  // "I could not ask" is a third answer, and it used to be indistinguishable from
+  // "nobody is there": every query failure returned an empty string, which became an
+  // empty pid list, which became an empty owner set. A host where neither lsof nor ss
+  // will run then reads as a free port, so a recorded launcher that has exited while
+  // its unrecorded listener carries on looks exactly like a server already gone.
+  //
+  // Staged by emptying PATH in a child, which is the honest version of that host.
+  test('a host with no discovery tools reports failure, not an empty port',
+    { timeout: 30_000 }, async (t) => {
+      if (process.platform === 'win32') {
+        t.skip('powershell.exe resolves without PATH on Windows');
+        return;
+      }
+      const probe = await startStranger(PORT.discoveryBlind);
+      const src = `
+        import { identifyPortOwners } from ${JSON.stringify(join(SCRIPTS, 'process-identity.mjs'))};
+        const r = identifyPortOwners(${PORT.discoveryBlind}, () => true, '127.0.0.1');
+        process.stdout.write(JSON.stringify({
+          discoveryFailed: r.discoveryFailed, ours: r.ours.length,
+        }));
+      `;
+      const out = spawnSync(process.execPath, ['--input-type=module', '-e', src],
+        { encoding: 'utf8', env: { PATH: '', LITERT_LM_PLUGIN_RUNTIME: runtimeDir() } });
+
+      const seen = JSON.parse(out.stdout);
+      assert.equal(seen.discoveryFailed, true,
+        'neither lsof nor ss could run, so who holds the port is unknown');
+      assert.equal(seen.ours, 0, 'and nothing may be claimed on the strength of that');
+
+      // The control: with PATH intact the same call answers properly, so the flag is
+      // reporting the tools' absence and not merely defaulting to true.
+      //
+      // Gated, because this half assumes a host that CAN look — and the whole subject
+      // of this test is hosts that cannot. On a minimal image with neither lsof nor
+      // ss, restoring PATH restores nothing, `discoveryFailed` stays correctly true,
+      // and an ungated control fails on precisely the configuration the feature
+      // exists for. The assertion above still holds there; only this one needs the
+      // guard the rest of the socket tests already use.
+      if (await canDiscoverPortOwners()) {
+        const withTools = identifyPortOwners(PORT.discoveryBlind, () => true, '127.0.0.1');
+        assert.equal(withTools.discoveryFailed, false,
+          'a host that CAN look must not be reported as blind');
+      }
+
+      try { probe.kill('SIGKILL'); } catch { /* ignore */ }
+    });
 
   // And the same claim against the real OS, because the parsers above are only worth
   // anything if the tools are actually being asked for an address.
@@ -1059,6 +1252,29 @@ describe('scoping socket ownership to the local address', () => {
       const both = pidsOnPort(port, null);
       assert.ok(both.includes(ours.pid) && both.includes(other.pid),
         'a null host still means "whoever holds this port"');
+    });
+
+  // The same pid can appear in both buckets: its exact IPv4 socket is provably the
+  // endpoint, while its IPv6 wildcard may or may not serve an IPv4 caller. The second
+  // socket adds no uncertainty about a process already conclusively identified by the
+  // first; counting it as unidentified made shutdown defer forever.
+  test('a proven owner is not also unidentified through its wildcard socket',
+    { timeout: 60_000 }, async (t) => {
+      if (!(await canDiscoverPortOwners())) {
+        t.skip('no socket-owner discovery on this host (needs lsof or ss)');
+        return;
+      }
+      const child = await startDualListener(PORT.dualBinding);
+      if (child === null) {
+        t.skip('this host cannot bind separate IPv4 and IPv6 sockets on one port');
+        return;
+      }
+
+      const seen = identifyPortOwners(PORT.dualBinding, (pid) => pid === child.pid,
+        '127.0.0.1');
+      assert.deepEqual(seen.ours.map((owner) => owner.pid), [child.pid]);
+      assert.deepEqual(seen.unidentified, [],
+        'an unprovable second socket cannot undo a conclusive first socket');
     });
 });
 
@@ -1155,6 +1371,625 @@ describe('a start that is still in progress', () => {
       assert.notEqual(r.status, 0);
       assert.match(r.stderr, /left over from a shutdown that did not finish/,
         'a pre-boot claim is a stale file, not an active generation');
+    });
+});
+
+describe('admitting a descendant into a start generation', () => {
+  /**
+   * Real pid reuse cannot be forced in a test — the OS decides when a number comes
+   * back around, and staging it would mean waiting out a pid space. So the admission
+   * rules are driven against a fabricated process table instead, which is the only
+   * way this gets deterministic coverage rather than a hopeful comment. The seam is
+   * the whole reason `startGeneration` takes a table reader.
+   */
+  const row = (ppid, start) => ({ ppid, start });
+
+  test('admits a genuine descendant, and its descendants', async () => {
+    const table = new Map([
+      [100, row(1, 'T100')],
+      [200, row(100, 'T200')],
+      [300, row(200, 'T300')],
+      [900, row(1, 'T900')],          // unrelated
+    ]);
+    const gen = startGeneration(100, () => table);
+    await gen.sample(true);
+    const pids = gen.members().map((m) => m.pid).sort((a, b) => a - b);
+    assert.deepEqual(pids, [100, 200, 300], 'the whole chain, transitively');
+    assert.ok(!gen.has(900), 'and nothing that is not descended from the launcher');
+  });
+
+  // THE DEFECT. The first version admitted descendants of anything in the set that
+  // answered `pidAlive`, ignoring the token stored beside each member. So a launcher
+  // that exited and had its number reissued turned the unrelated replacement into a
+  // live root: its children were admitted with their own genuine tokens, every later
+  // identity check confirmed them, and cancellation would have signalled a stranger's
+  // processes with proof in hand.
+  test('a reused launcher pid does not vouch for the replacement\'s children', async () => {
+    let table = new Map([[100, row(1, 'T100')], [200, row(100, 'T200')]]);
+    const gen = startGeneration(100, () => table);
+    await gen.sample(true);
+    assert.ok(gen.has(200), 'the real descendant is admitted while the launcher lives');
+
+    // pid 100 exits; the number is reissued to an unrelated process with its own
+    // child. Same pid, different process — which is exactly what a token detects.
+    table = new Map([
+      [100, row(1, 'STRANGER')],
+      [200, row(1, 'T200')],          // reparented to init, still genuinely ours
+      [777, row(100, 'T777')],        // the stranger's child
+    ]);
+    await gen.sample(true);
+
+    assert.ok(!gen.has(777),
+      'a pid whose token no longer matches must not vouch for anything');
+    assert.ok(gen.has(200), 'while a member that is still itself is unaffected');
+  });
+
+  test('a genuine descendant refreshes a stale member that reused its pid', async () => {
+    let table = new Map([
+      [100, row(1, 'T100')],
+      [200, row(100, 'OLD-T200')],
+    ]);
+    const gen = startGeneration(100, () => table);
+    await gen.sample(true);
+    assert.equal(gen.member(200)?.token, 'OLD-T200', 'the first descendant is recorded');
+
+    // The original process exits, then a later genuine descendant of the surviving
+    // root receives the same number. Numeric membership must not suppress the new,
+    // independently confirmed identity.
+    table = new Map([
+      [100, row(1, 'T100')],
+      [200, row(100, 'NEW-T200')],
+    ]);
+    await gen.sample(true);
+
+    assert.equal(gen.member(200)?.token, 'NEW-T200',
+      'the stale member must be replaced by the current proven descendant');
+  });
+
+  /**
+   * The seam hands back a different table per call, so one `sample()` can be given a
+   * first walk and a confirming second walk that disagree. That is the only way to
+   * stage a mid-enumeration tear: the rows within one walk describe different moments,
+   * and no fixture built from a single table can express it.
+   */
+  const walks = (...tables) => {
+    let i = 0;
+    return () => tables[Math.min(i++, tables.length - 1)];
+  };
+
+  // THE DEFECT: admission checked the two ENDS of the chain and never the middle. A
+  // non-root intermediate can be read, exit, and have its number reissued before a
+  // later row in the SAME enumeration records an unrelated child under it. Both ends
+  // then survive both walks honestly — 100 is genuinely ours, 300 is a real process
+  // with a real token — while the row that joined them described two processes.
+  // Cancellation would have re-proved that bystander and signalled it.
+  test('a reused intermediate does not carry a stranger\'s child into the set', async () => {
+    const seeded = new Map([
+      [100, row(1, 'T100')],
+      [200, row(100, 'T200')],
+    ]);
+    const first = new Map([
+      [100, row(1, 'T100')],
+      [200, row(100, 'T200')],        // a recorded member when this row was read...
+      [300, row(200, 'T300')],        // ...but by now 200 is somebody else
+    ]);
+    const second = new Map([
+      [100, row(1, 'T100')],          // the root survived, honestly
+      [200, row(1, 'STRANGER')],      // and the middle is provably not who it was
+      [300, row(200, 'T300')],        // the child is real, and is not ours
+    ]);
+    const stable = new Map([[100, row(1, 'T100')]]);
+    const gen = startGeneration(100, walks(seeded, seeded, first, second, stable));
+    await gen.sample(true);            // admit 200 before it becomes the torn link
+    await gen.sample(true);            // reject 300 through the isolated torn path
+
+    assert.ok(!gen.has(300),
+      'a chain is only as good as its weakest link, and this one was reissued');
+    assert.equal(gen.authoritative(), false,
+      'a contradicted intermediate makes the handoff unjudgeable');
+
+    await gen.sample(true);
+    assert.equal(gen.authoritative(), false,
+      'a later stable walk cannot recover ancestry that was torn apart');
+  });
+
+  // A different tear shape: two members are roots in the first walk, but only one
+  // survives confirmation. The survivor cannot vouch globally for a child whose
+  // actual ancestry ran through the root that failed confirmation.
+  test('a surviving root does not vouch for another reused root\'s child', async () => {
+    const seeded = new Map([
+      [100, row(1, 'T100')],
+      [200, row(100, 'T200')],
+    ]);
+    const first = new Map([
+      [100, row(1, 'T100')],
+      [200, row(1, 'T200')],
+      [300, row(200, 'T300')],
+    ]);
+    const second = new Map([
+      [100, row(1, 'T100')],          // one generation member survives
+      [200, row(1, 'STRANGER')],      // the other root has been reused
+      [300, row(200, 'T300')],
+    ]);
+    const gen = startGeneration(100, walks(seeded, seeded, first, second));
+    await gen.sample(true);            // admit 200 while both roots are genuine
+    await gen.sample(true);            // then reject 300 when only 100 proves out
+
+    assert.ok(!gen.has(300),
+      'a candidate must descend from the particular root that survived confirmation');
+    assert.equal(gen.authoritative(), false,
+      'losing the candidate\'s specific root makes the generation unjudgeable');
+  });
+
+  test('a candidate lost during confirmation makes the generation unjudgeable', async () => {
+    const seeded = new Map([
+      [100, row(1, 'T100')],
+      [200, row(100, 'T200')],
+    ]);
+    const first = new Map([
+      [100, row(1, 'T100')],
+      [200, row(1, 'T200')],
+      [300, row(200, 'T300')],       // observed after a possible handoff
+    ]);
+    const second = new Map([
+      [100, row(1, 'T100')],
+      [200, row(1, 'T200')],         // trusted roots survive, but 300 does not
+    ]);
+    const stable = new Map([
+      [100, row(1, 'T100')],
+      [200, row(1, 'T200')],
+    ]);
+    const gen = startGeneration(100, walks(seeded, seeded, first, second, stable));
+    await gen.sample(true);            // admit 200 while it descends from 100
+    await gen.sample(true);            // observe 300, then lose it before confirmation
+
+    assert.ok(!gen.has(300), 'an unconfirmed candidate must not be admitted');
+    assert.equal(gen.authoritative(), false,
+      'another surviving root cannot turn a lost handoff into proven quiescence');
+
+    await gen.sample(true);
+    assert.equal(gen.authoritative(), false,
+      'a later stable walk cannot recover a handoff that was never accounted for');
+  });
+
+  test('a candidate whose identity changes during confirmation is unjudgeable', async () => {
+    const seeded = new Map([
+      [100, row(1, 'T100')],
+      [200, row(100, 'T200')],
+    ]);
+    const first = new Map([
+      [100, row(1, 'T100')],
+      [200, row(1, 'T200')],
+      [300, row(200, 'T300')],
+    ]);
+    const second = new Map([
+      [100, row(1, 'T100')],
+      [200, row(1, 'T200')],
+      [300, row(200, 'STRANGER')],   // same pid, but not the observed candidate
+    ]);
+    const stable = new Map([
+      [100, row(1, 'T100')],
+      [200, row(1, 'T200')],
+    ]);
+    const gen = startGeneration(100, walks(seeded, seeded, first, second, stable));
+    await gen.sample(true);            // admit 200 while it descends from 100
+    await gen.sample(true);            // observe 300, then see its pid reused
+
+    assert.ok(!gen.has(300), 'a contradicted candidate must not be admitted');
+    assert.equal(gen.authoritative(), false,
+      'pid reuse cannot turn failed identity confirmation into proven quiescence');
+
+    await gen.sample(true);
+    assert.equal(gen.authoritative(), false,
+      'a later stable walk cannot recover the identity that disappeared');
+  });
+
+  test('losing every root during confirmation makes the sample unjudgeable', async () => {
+    const first = new Map([
+      [100, row(1, 'T100')],
+      [200, row(100, 'T200')],
+    ]);
+    const second = new Map([
+      [200, row(1, 'T200')],           // same candidate, but its root vanished
+    ]);
+    const empty = new Map();
+    const gen = startGeneration(100, walks(first, second, empty));
+    await gen.sample(true);
+
+    assert.ok(!gen.has(200), 'the candidate cannot be admitted without a proven root');
+    assert.equal(gen.authoritative(), false,
+      'a successful query is not authoritative when its validation lost every root');
+
+    await gen.sample(true);
+    assert.equal(gen.authoritative(), false,
+      'a later empty walk cannot recover ancestry that already disappeared');
+  });
+
+  // The other half, and the reason the check is CONTRADICTED rather than ABSENT. A
+  // short-lived stage that hands off and exits between the two walks is the ordinary
+  // case on every platform — its child is reparented to init and is exactly the
+  // process this whole mechanism exists to catch. Requiring the chain to still stand
+  // in the second walk would discard it.
+  test('an intermediate that merely exited still passes its child through', async () => {
+    const first = new Map([
+      [100, row(1, 'T100')],
+      [200, row(100, 'T200')],
+      [300, row(200, 'T300')],
+    ]);
+    const second = new Map([
+      [100, row(1, 'T100')],
+      [300, row(1, 'T300')],          // reparented: 200 handed off and exited
+    ]);
+    const gen = startGeneration(100, walks(first, second));
+    await gen.sample(true);
+
+    assert.ok(gen.has(300),
+      'a descendant whose parent exited between the walks is still ours');
+    assert.ok(!gen.has(200), 'while the stage that is gone is not carried along');
+  });
+
+  test('a member that is still itself keeps admitting its own descendants', async () => {
+    let table = new Map([[100, row(1, 'T100')], [200, row(100, 'T200')]]);
+    const gen = startGeneration(100, () => table);
+    await gen.sample(true);
+
+    // The launcher exits entirely. 200 is still ours and still proven, so the engine
+    // process it goes on to spawn is still admissible.
+    table = new Map([[200, row(1, 'T200')], [300, row(200, 'T300')]]);
+    await gen.sample(true);
+
+    assert.ok(gen.has(300), 'descent continues through a member that still proves out');
+  });
+
+  test('a launcher absent from the table admits nothing', async () => {
+    let table = new Map([[100, row(1, 'T100')]]);
+    const gen = startGeneration(100, () => table);
+    await gen.sample(true);
+    table = new Map([[555, row(100, 'T555')]]);   // 100 gone; 555 claims it as parent
+    await gen.sample(true);
+    assert.ok(!gen.has(555), 'a dead root is not a root');
+  });
+
+  test('an unknown launcher yields an empty generation', async () => {
+    const gen = startGeneration(4242, () => new Map());
+    await gen.sample(true);
+    assert.deepEqual(gen.members(), []);
+  });
+
+  // A generation that never managed to read the table has OBSERVED nothing, which is
+  // not the same claim as "there is nothing" — and cancellation reads an empty member
+  // set as quiescence. Seeding used to happen only in the constructor, so one failed
+  // first read left the set permanently empty and every later sample derived its
+  // roots from that emptiness. The cancelled start then reported a clean teardown
+  // while its detached descendant went on to bind.
+  test('a failed first table read does not permanently disarm the generation', async () => {
+    let table = new Map();                       // the query could not run at all
+    const gen = startGeneration(100, () => table);
+    await gen.sample(true);
+
+    assert.equal(gen.authoritative(), false,
+      'nothing was established, so emptiness here is not evidence of anything');
+    assert.deepEqual(gen.members(), []);
+
+    // The table recovers. Seeding must be retried rather than written off.
+    table = new Map([[100, row(1, 'T100')], [200, row(100, 'T200')]]);
+    await gen.sample(true);
+
+    assert.equal(gen.authoritative(), true, 'a later read can still seed the launcher');
+    assert.deepEqual(gen.members().map((m) => m.pid).sort((a, b) => a - b), [100, 200],
+      'and the descendants it was always responsible for are picked up');
+  });
+
+  // Retrying the seed reopened pid reuse one level up: if the launcher exited before
+  // it was ever enumerated and its number was reissued, the stranger's row would be
+  // taken as authoritative and its descendants admitted with valid tokens that
+  // cancellation would re-prove and signal. `launcherPid` is a number; only the
+  // ChildProcess handle knows whether that number is still the process we spawned.
+  test('a retried seed is refused once the child handle says the pid is not ours', async () => {
+    const table = new Map([
+      [100, row(1, 'STRANGER')],       // 100 was reused while we were not looking
+      [200, row(100, 'T200')],         // the stranger's child
+    ]);
+    const exited = startGeneration(100, () => table, () => false);
+    await exited.sample(true);
+
+    assert.equal(exited.authoritative(), false,
+      'a dead child handle must not let a reused pid seed the generation');
+    assert.deepEqual(exited.members(), [],
+      'and the replacement\'s children must never be admitted');
+
+    // The control: the same table with a handle that still vouches for the number.
+    const live = startGeneration(100, () => table, () => true);
+    await live.sample(true);
+    assert.equal(live.authoritative(), true, 'a live handle still seeds normally');
+  });
+
+  test('a table that never recovers never becomes authoritative', async () => {
+    const gen = startGeneration(100, () => new Map());
+    await gen.sample(true);
+    await gen.sample(true);
+    assert.equal(gen.authoritative(), false,
+      'repeated failures must not quietly promote "I could not look" to "all clear"');
+  });
+
+  // An adopted listener was proven ours by command line and carries a token, so it is
+  // as good a root as the launcher — and equally good evidence that we could look.
+  test('adopting a proven listener makes the generation authoritative', async () => {
+    const gen = startGeneration(100, () => new Map());
+    await gen.sample(true);
+    assert.equal(gen.authoritative(), false);
+    gen.adopt({ pid: 500, token: 'T500' });
+    assert.equal(gen.authoritative(), true);
+    assert.ok(gen.has(500));
+  });
+
+  // The parent link and the token must come from the same row, or the pairing has a
+  // reuse window in it. This is the structural version of that claim: the table the
+  // walk reads is the table the token is taken from.
+  test('the real process table pairs a parent link with a start token',
+    { timeout: 30_000 }, async () => {
+      const child = await startBystander();
+
+      const { ok, table } = processTable();
+      assert.equal(ok, true, 'the walk should have run');
+      const self = table.get(process.pid);
+      assert.ok(self, 'this process should be in its own process table');
+      assert.equal(self.start, startToken(process.pid),
+        'and the token in the table must equal the one identity reports');
+
+      // The claim that matters: the walk and the token come from the same snapshot,
+      // so a pid found by descent already carries a token comparable with the ones in
+      // pid files. Checked against the real OS, not the fabricated table above.
+      assert.ok(descendantsOf([process.pid], table).includes(child.pid),
+        'a child we just spawned should be discoverable by descent');
+      assert.equal(table.get(child.pid).start, startToken(child.pid),
+        'and the row that supplied its parent link must supply a matching token');
+
+      try { child.kill('SIGKILL'); } catch { /* ignore */ }
+    });
+
+  test('an asynchronous query has a bounded failure path', async () => {
+    const started = Date.now();
+    const result = await _queries.runAsync(process.execPath,
+      ['-e', 'setInterval(() => {}, 1000)'], { timeoutMs: 100 });
+
+    assert.equal(result.ok, false, 'a query that outlives its bound is not an answer');
+    assert.ok(Date.now() - started < 5000, 'the hung child must not hold startup indefinitely');
+  });
+});
+
+describe('cancelling a start whose descendant has not bound yet', () => {
+  /**
+   * The hard case, and the one a listener-based search cannot see.
+   *
+   * A launcher stage hands off to a detached descendant and exits. That descendant
+   * spends tens of seconds initialising an engine before it binds anything, so for
+   * that whole window every "who holds the port" question truthfully answers
+   * "nobody" — while a process that will shortly serve is very much alive.
+   *
+   * Cancellation used to call that quiescence: three empty samples, two 400ms waits,
+   * roughly 800ms of silence treated as proof that nothing was left running. The
+   * descendant then bound anyway, unrecorded, which is the exact outcome cancelling
+   * exists to prevent.
+   *
+   * A preload counter makes the ordering exact instead of betting on how long a
+   * process-table query takes. It acknowledges the generation sampler's post-walk
+   * checkpoint only after `grandchild.pid` exists, and the test requires TWO such
+   * acknowledgements: even if the marker appeared just after the first walk, the
+   * second walk necessarily started after it. The stage exits only then, and the stop
+   * lands after the stage is confirmed gone. Accumulation during startup is the whole
+   * answer.
+   */
+  function installHandoffLitertLm(binDir, workDir, port) {
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(workDir, { recursive: true });
+
+    const exe = join(binDir, process.platform === 'win32' ? 'litert-lm.exe' : 'litert-lm');
+    try { linkSync(process.execPath, exe); } catch { copyFileSync(process.execPath, exe); }
+    if (process.platform !== 'win32') chmodSync(exe, 0o755);
+
+    // Binds only after a long delay — an engine warming up, not a fast HTTP server.
+    writeFileSync(join(workDir, 'grandchild.js'), `
+      const { createServer } = require('node:http');
+      const { writeFileSync } = require('node:fs');
+      const { join } = require('node:path');
+      writeFileSync(join(__dirname, 'grandchild.pid'), String(process.pid), 'utf8');
+      setTimeout(() => {
+        createServer((req, res) => {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ object: 'list', data: [{ id: 'fake' }] }));
+        }).listen(${port}, '127.0.0.1');
+      }, 60000);
+      setInterval(() => {}, 1000);
+    `, 'utf8');
+
+    // Stay alive until the test observes that the client has completed its second
+    // process-tree sample. Fixed 1.5-second survival raced cold PowerShell startup on
+    // Windows, letting the fixture exit before the sample it was meant to exercise.
+    writeFileSync(join(workDir, 'serve'), `
+      const { spawn } = require('node:child_process');
+      const { existsSync, writeFileSync } = require('node:fs');
+      const { join } = require('node:path');
+      writeFileSync(join(__dirname, 'launcher.pid'), String(process.pid), 'utf8');
+      spawn(process.execPath, [join(__dirname, 'grandchild.js')],
+        { detached: true, stdio: 'ignore' }).unref();
+      setInterval(() => {
+        if (existsSync(join(__dirname, 'release-launcher'))) process.exit(0);
+      }, 50);
+    `, 'utf8');
+
+    writeFileSync(join(workDir, 'sample-ack.cjs'), `
+      const { existsSync, readFileSync, writeFileSync } = require('node:fs');
+      const { join } = require('node:path');
+      const realSetImmediate = global.setImmediate;
+      if ((process.argv[1] || '').endsWith('litertlm-client.mjs')) {
+        global.setImmediate = (callback, ...args) => realSetImmediate(() => {
+          const child = join(process.cwd(), 'grandchild.pid');
+          const ack = join(process.cwd(), 'sample-ack');
+          if (existsSync(child)) {
+            let count = 0;
+            try { count = Number.parseInt(readFileSync(ack, 'utf8'), 10) || 0; }
+            catch { /* first acknowledgement */ }
+            writeFileSync(ack, String(count + 1), 'utf8');
+          }
+          callback(...args);
+        });
+      }
+    `, 'utf8');
+  }
+
+  /**
+   * Make the first successful readiness probe publish the same tombstone a concurrent
+   * `--stop` would have written. The preload advances only the client's clock after
+   * that response, putting the probe in the final startup-loop iteration without
+   * making this regression take the production 90-second timeout.
+   */
+  function installProbeTombstoneLitertLm(binDir, workDir, port) {
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(workDir, { recursive: true });
+
+    const exe = join(binDir, process.platform === 'win32' ? 'litert-lm.exe' : 'litert-lm');
+    try { linkSync(process.execPath, exe); } catch { copyFileSync(process.execPath, exe); }
+    if (process.platform !== 'win32') chmodSync(exe, 0o755);
+
+    writeFileSync(join(workDir, 'clock.cjs'), `
+      const { existsSync } = require('node:fs');
+      const realNow = Date.now.bind(Date);
+      if ((process.argv[1] || '').endsWith('litertlm-client.mjs')) {
+        Date.now = () => realNow()
+          + (existsSync(process.env.LITERT_TEST_CLOCK_MARKER) ? 90000 : 0);
+      }
+    `, 'utf8');
+
+    writeFileSync(join(workDir, 'serve'), `
+      const { createServer } = require('node:http');
+      const { mkdirSync, readFileSync, writeFileSync } = require('node:fs');
+      const { join } = require('node:path');
+      const dir = join(process.env.LITERT_LM_PLUGIN_RUNTIME, String(${port}));
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(__dirname, 'server.pid'), String(process.pid), 'utf8');
+      createServer((req, res) => {
+        const spawnedAt = Number.parseInt(
+          readFileSync(join(dir, 'starting'), 'utf8').split(/\\s+/)[0], 10);
+        writeFileSync(join(dir, 'stopped-at'), String(spawnedAt + 1), 'utf8');
+        writeFileSync(process.env.LITERT_TEST_CLOCK_MARKER, 'seen', 'utf8');
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', data: [{ id: 'fake' }] }));
+      }).listen(${port}, '127.0.0.1');
+      setInterval(() => {}, 1000);
+    `, 'utf8');
+  }
+
+  test('kills a descendant that is alive but has not yet bound', { timeout: 120_000 },
+    async (t) => {
+      const port = PORT.preBindCancel;
+      const runtime = runtimeDir();
+      const workDir = join(runtime, 'work');
+      const binDir = join(runtime, 'bin');
+      installHandoffLitertLm(binDir, workDir, port);
+
+      const sep = process.platform === 'win32' ? ';' : ':';
+      const client = reap(spawn(process.execPath,
+        [CLIENT, '--list', '--port', String(port), '--idle-timeout', '0'], {
+          cwd: workDir,
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: {
+            ...process.env,
+            LITERT_LM_PLUGIN_RUNTIME: runtime,
+            NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=./sample-ack.cjs`.trim(),
+            PATH: `${binDir}${sep}${process.env.PATH ?? ''}`,
+            Path: `${binDir}${sep}${process.env.Path ?? ''}`,
+          },
+        }));
+      let stderr = '';
+      client.stderr.setEncoding('utf8');
+      client.stderr.on('data', (d) => { stderr += d; });
+      const finished = new Promise((r) => client.on('close', (status) => r(status)));
+
+      const pidFile = join(workDir, 'grandchild.pid');
+      assert.ok(await waitFor(() => readIfPresent(pidFile) !== null),
+        'the descendant should have been spawned');
+      const grandchild = Number.parseInt(readIfPresent(pidFile), 10);
+      assert.ok(alive(grandchild), 'and should be running but not yet listening');
+      t.after(async () => {
+        if (alive(grandchild)) {
+          try { process.kill(grandchild, 'SIGKILL'); } catch { /* already gone */ }
+          await waitFor(() => !alive(grandchild));
+        }
+      });
+
+      const sampleAck = join(workDir, 'sample-ack');
+      assert.ok(await waitFor(() => Number.parseInt(readIfPresent(sampleAck) ?? '', 10) >= 2,
+        { timeout: 30_000 }), 'two post-spawn process-table samples should be acknowledged');
+      writeFileSync(join(workDir, 'release-launcher'), 'release', 'utf8');
+      const launcher = Number.parseInt(readIfPresent(join(workDir, 'launcher.pid')), 10);
+      assert.ok(Number.isInteger(launcher), 'the fixture should report its launcher pid');
+      assert.ok(await waitFor(() => !alive(launcher)),
+        'the launcher must be gone before cancellation starts');
+
+      const stop = runClient(['--stop', '--port', String(port)], runtime);
+      assert.equal(stop.status, 0, `--stop should succeed: ${stop.stderr}`);
+
+      const status = await finished;
+      assert.notEqual(status, 0, 'a cancelled start must fail, not quietly succeed');
+      assert.match(stderr, /cancelled by a --stop/);
+
+      // THE ASSERTION. Reporting a clean cancellation is only honest if the
+      // descendant is actually gone; the old code reported exactly this while the
+      // process went on to bind the port seconds later.
+      assert.ok(await waitFor(() => !alive(grandchild), { timeout: 30_000 }),
+        'a descendant that had not bound yet must still be stopped by cancellation');
+
+      assert.doesNotMatch(stderr, /could not be confirmed torn down/,
+        'and having tracked it, cancellation should be able to confirm the teardown');
+    });
+
+  test('cancels when stop lands during the final readiness probe',
+    { timeout: 60_000 }, async (t) => {
+      const port = PORT.postProbeCancel;
+      const runtime = runtimeDir();
+      const workDir = join(runtime, 'work');
+      const binDir = join(runtime, 'bin');
+      const clockMarker = join(workDir, 'probe-complete');
+      installProbeTombstoneLitertLm(binDir, workDir, port);
+
+      let serverPid = null;
+      t.after(async () => {
+        serverPid = Number.parseInt(readIfPresent(join(workDir, 'server.pid')) ?? '', 10);
+        if (alive(serverPid)) {
+          try { process.kill(serverPid, 'SIGKILL'); } catch { /* already gone */ }
+          await waitFor(() => !alive(serverPid));
+        }
+      });
+
+      const sep = process.platform === 'win32' ? ';' : ':';
+      const client = reap(spawn(process.execPath,
+        [CLIENT, '--list', '--port', String(port), '--idle-timeout', '0'], {
+          cwd: workDir,
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: {
+            ...process.env,
+            LITERT_LM_PLUGIN_RUNTIME: runtime,
+            LITERT_TEST_CLOCK_MARKER: clockMarker,
+            NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=./clock.cjs`.trim(),
+            PATH: `${binDir}${sep}${process.env.PATH ?? ''}`,
+            Path: `${binDir}${sep}${process.env.Path ?? ''}`,
+          },
+        }));
+      let stderr = '';
+      client.stderr.setEncoding('utf8');
+      client.stderr.on('data', (d) => { stderr += d; });
+      const status = await new Promise((resolve) => client.on('close', resolve));
+
+      serverPid = Number.parseInt(readIfPresent(join(workDir, 'server.pid')) ?? '', 10);
+      assert.ok(Number.isInteger(serverPid), 'the readiness-probe server should have started');
+      assert.notEqual(status, 0, 'a stop that overtakes start must cancel the request');
+      assert.match(stderr, /cancelled by a --stop/,
+        'the post-probe tombstone must take cancellation, not startup timeout');
+      assert.ok(await waitFor(() => !alive(serverPid)),
+        'the server made ready during the stop must not be left running unsupervised');
     });
 });
 

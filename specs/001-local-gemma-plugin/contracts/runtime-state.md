@@ -78,10 +78,22 @@ the same port on different local addresses at once — ours on `127.0.0.1:9379`,
 `ss`) reports both. Matching on the number alone therefore let the command-line test prove a
 second, unrelated litert-lm "ours" and signal it: identity passed, location was never asked.
 Discovery now reads the local address alongside the pid and keeps only listeners that would
-answer the host this client talks to. Wildcards count, because they genuinely do answer it
-(`0.0.0.0` serves v4 callers, `::` is dual-stack); a literal host is compared literally, since a
+answer the host this client talks to. A literal host is compared literally, since a
 socket on `::1` is unreachable from a client configured with `127.0.0.1`. The watchdog is passed
 `--host` for the same reason — supervising the socket we talk to means asking about that socket.
+
+**A wildcard serves its own family, and only its own.** `0.0.0.0` answers v4 callers; `::`
+answers v6 callers. Reading `::` as dual-stack — true on many hosts, and the obvious
+generalisation — was wrong: dual-stack depends on `IPV6_V6ONLY`, which none of the three
+platform queries reports. An IPv6-only `litert-lm serve` on `:::9379` would then be admitted as
+the owner of a socket a `127.0.0.1` client cannot reach, and `--stop` would terminate it —
+exactly the cross-interface kill the filter exists to prevent, reintroduced by the case meant to
+be generous. A cross-family wildcard is therefore `unprovable`: its pid enters the unidentified
+bucket rather than being classified as a stranger, and the incomplete picture defers the whole
+shutdown — nothing is signalled or cleared. That is visible and recoverable, while treating the
+listener as absent could strand an unsupervised server. `localhost` is the one exception, and not
+a grudging one: it is a name that resolves to either family, so neither wildcard can be ruled out
+and both are accepted.
 
 An address the platform query did not yield is treated as a match. That is the absence of
 evidence, not evidence of a foreign bind, and dropping such a listener would silently disarm
@@ -96,6 +108,18 @@ of a server that has just been torn down. The watchdog therefore compares this s
 when it was spawned (`--spawned-at`), before claiming and again after, and stands down if a stop
 has intervened.
 
+**The comparison is repeated on every poll, not only at start-up.** A stop can land *after* a
+watchdog has published: the tombstone is written last, at the very end of `--stop`, so a
+watchdog that published anywhere inside that command passed both of its start-up checks against
+a `stopped-at` that did not yet exist. It then supervised a server that had already been torn
+down and — worse — stayed the registered supervisor, so the next client saw a live
+`watchdog.pid`, declined to spawn one, and had its server adopted by a process running under the
+previous invocation's idle-timeout. `--stop` closes the same hole from its own side by re-reading
+the `watchdog.pid` slot before the success verdict rather than trusting the snapshot it took at
+the start; neither check makes the other redundant. The client's keeps the *verdict* honest — a
+stop must not report both processes gone while a supervisor it never saw is running — and the
+watchdog's bounds how long a superseded supervisor lives.
+
 It is deliberately a timestamp rather than a reachability check. "The server does not answer"
 and "the server is gone" are different claims — a model switch produces the first for tens of
 seconds, which is what `UNREACHABLE_TOLERANCE` exists for — and a watchdog that stood down for
@@ -107,6 +131,22 @@ this file: an older stop is simply earlier than the next watchdog's spawn.
 a listener, for instance. The extra identity used to exist only in the error text, so a retry
 could not find it once it had closed its socket and left port discovery blind. `survivors` has
 no such ceiling and is cleared the moment a stop actually succeeds.
+
+**A discovery that could not run is not an empty port.** Every socket query returned an empty
+string for both "the tool is not here" and "it ran and found nothing", so a host with neither
+`lsof` nor `ss` reported a free port — and a recorded launcher that had exited while its
+unrecorded listener carried on then looked exactly like a server already gone. Failure to *spawn*
+is now distinguished from a non-zero *exit* (`lsof` exits 1 when it matches nothing, which is a
+real answer) and surfaces as `discoveryFailed`.
+
+It blocks a success verdict when the endpoint answers **or recorded state says a process may still
+need accounting**: a recorded server target, watchdog, or carried survivor. The latter matters
+during startup and model switches, when a genuine server can be unreachable and its recorded
+launcher can already have exited while an unrecorded descendant owns the socket. Discovery failure
+with neither an answer nor any recorded state remains non-blocking; otherwise a minimal image with
+no server would make `--stop` refuse forever. The watchdog likewise treats a failed discovery as
+unjudgeable before its stand-down branch, rather than spending an empty result as proof that no
+server remains.
 
 **An incomplete picture cancels the whole operation.** If any listener on the port cannot be
 identified, `--stop` signals nothing and clears nothing. Signalling only what is provable would
@@ -137,6 +177,14 @@ newer start had just published. Not signalling a process whose only identity you
 is not restraint. Every release compares the claim first, and `server.pid` is cleared only
 while it still names one of the cancelling invocation's own targets.
 
+**The generation is `<spawned-at-ms> <client-pid>`, and ownership compares both.** The timestamp
+alone is not an identity: it is `Date.now()`, so two clients that both find no claim and then
+stamp the same millisecond write different records that compare equal, and each reads the
+other's claim as its own. The older one could then clear or overwrite the newer one's
+`server.pid`, release a claim it did not hold, or adopt its listener while cancelling — every
+failure the claim exists to prevent, reached through a tie the comparison could not see. The pid
+breaks the tie, because only the process that wrote a claim can match it.
+
 **Recording a spawned pid is gated on the claim at both ends, and the opening gate matters as
 much as the closing one.** `server.pid` is a single shared slot. Recording used to clear it on
 the way in — before any identity work — so an older generation erased a record it did not own,
@@ -148,11 +196,75 @@ the clear, re-checked immediately before the write, and checked once more afterw
 the claim moved in that last gap, the record is withdrawn only while the bytes on disk are
 still the ones this invocation wrote.
 
-Cancellation also requires **quiescence rather than one empty sample**. The launcher exits
-before the detached descendant it spawned has bound the socket, so a single pass can see no live
-process and no listener while the grandchild is still on its way up. Consecutive empty
-observations are required before a cancellation is called complete — a heuristic, not a proof,
-and it is written down as one.
+**Cancellation tracks descendants, and does not wait to be shown a socket.** The launcher exits
+before the detached descendant it spawned has bound anything, and that descendant then spends
+tens of seconds initialising an engine — so for the whole of that window, every "who holds the
+port" question truthfully answers "nobody" while a process that will shortly serve is very much
+alive. Consecutive empty observations were the only defence, and they bought about 800ms: three
+samples, two 400ms waits. The descendant bound anyway, unrecorded, which is precisely what
+cancelling exists to prevent.
+
+The start therefore walks the process table from the pid it spawned and accumulates everything
+descended from it, sampling from the moment of the spawn and throughout the startup poll. This
+is **not** the ancestry test that ownership rejected, and the distinction is the whole reason it
+is admissible here: `--stop` must be able to stop a server this plugin *adopted*, so requiring
+descent there would refuse exactly the servers `ensureServer` is designed to take over.
+Cancellation is the opposite situation — we spawned the launcher moments ago, and "descended
+from the process I just started" is a stronger claim than any command line, one no bystander can
+forge and no heuristic has to guess at.
+
+Two properties make it sound, and the second was got wrong once in exactly the way this document
+keeps warning about.
+
+**It must sample early and keep sampling**, because a detached grandchild is reparented to init
+the moment its parent exits and no later walk can recover the relationship — verified directly:
+a three-level tree yields two descendants while the middle stage lives and *zero* once it exits.
+
+**A root must be PROVEN, not merely alive.** The first version admitted descendants of any member
+that answered `pidAlive`, ignoring the token already stored beside it — the weak test authorising
+what only the strong one may. When a launcher exited and its number was reissued, the unrelated
+replacement became a live root, its children were admitted carrying their own genuine tokens, and
+every later identity check confirmed them: real processes, real tokens, not ours. Cancellation
+would have signalled a stranger's children with proof in hand. Liveness says a number is in use;
+identity says by whom, and only the second may authorise anything.
+
+**The parent link and the token come from one snapshot.** Reading the tree first and establishing
+identity second reopens the same window one step along: a candidate exits in between, its number
+is reissued, and the token captured describes the replacement — which then passes every check
+downstream. Socket discovery had this shape and fixed it by re-asking the port; here it is
+designed out, because one read answers both questions on every platform. Linux takes fields 4 and
+22 from a single read of a single `/proc/<pid>/stat`; `ps` and `Win32_Process` each carry ppid and
+creation time on the same row. The tokens are byte-identical to what `identity` produces, so a
+token from the table and a token from a pid file are directly comparable.
+
+Descent gets a process into the set; it never authorises a signal. Every member is re-proved
+before each signal, so a reissued pid drops out like any other. The quiescence counter stays as a
+backstop for the one case descent cannot cover — a grandchild spawned after the last sample *and*
+after its parent had exited — rather than as the primary evidence.
+
+**"I observed nothing" is only evidence if you were able to look.** The generation seeds itself
+from the process table, and seeding used to happen once, in the constructor. A first read that
+missed the launcher — the query could not run, or the stage was gone before it was enumerated —
+left the set permanently empty, and every later sample derived its roots from that emptiness, so
+no recovered table could bootstrap it. Cancellation then read the empty set as quiescence and
+reported a clean teardown while the detached descendant went on to bind: the pre-bind false
+success, re-entered through initialisation. Seeding is now retried on every sample, and the
+generation reports separately whether it ever established a trusted member. Emptiness is spent as
+proof only by a caller that gets `true` from that — the same three-state discipline as everywhere
+else, where unjudgeable is never a verdict.
+
+Admission takes an injectable process table, because real pid reuse cannot be forced in a test:
+the OS decides when a number comes back around. The rules above are therefore driven against a
+fabricated table, which is what makes the reuse case deterministic coverage rather than a
+hopeful comment.
+
+Sampling is throttled by what a walk costs. Linux reads `/proc` and starts nothing. Windows starts
+PowerShell (~930ms), but the walk is asynchronous so it no longer blocks the readiness probe. For
+the first 15 seconds, while launcher handoffs occur, Windows samples on every roughly 750ms startup
+iteration; after that dense window it falls back to a 3-second cadence while the long-running engine
+initialisation is unlikely to spawn new stages. Each asynchronous tool query is capped at 10 seconds;
+exceeding that bound is a failed, unjudgeable walk rather than an empty process table. This narrows
+rather than eliminates the handoff window, so cancellation's quiescence check remains the backstop.
 
 **A teardown that lost its supervisor is unfinished, not finished.** If the watchdog dies
 mid-shutdown, `stopping` is released but `server.pid` is preserved, and the next start must
@@ -200,6 +312,23 @@ failure, kept state it should have cleared, and named a pid that no longer exist
 re-asks the OS and returns a fresh verdict, so the last answer is the only one that counts. The
 watchdog is not skipped for having failed an earlier lookup either — it gets the same fresh
 check, which is what makes the failure recoverable rather than permanent.
+
+**A failed idle stop keeps supervising rather than standing down.** The watchdog persisted
+survivor identities and then exited, on the reasoning that the next client would reconcile and
+start a fresh supervisor. That reasoning does not hold on the idle path: nothing guarantees a next
+client. A server that refused the signal, or that hit a transient identity failure, would sit
+resident with its accelerator memory held and no watchdog at all — the outcome this process exists
+to prevent. It now releases the handshake, so clients are not blocked by a shutdown that did not
+complete, and retries on the next poll; one poll plus a full escalation is roughly twenty seconds
+between attempts. Relinquishing the slot is only safe when someone is known to be coming.
+
+**Stop ordering compares `>=`, not `>`.** Both `stopped-at` and a start's `spawnedAt` are
+`Date.now()`, so a stop landing in the same millisecond as a spawn is genuinely ambiguous — and
+strict ordering resolved that by ignoring the stop, which is the one direction that cannot be
+recovered from. An explicit `--stop` could be overtaken by a start it should have cancelled, and a
+watchdog could go on supervising a server that command had torn down. Reading the tie as an
+overtaking stop costs a start that has to be retried and says so, or a watchdog the next client
+replaces.
 
 **Existence is `kill(pid, 0)`, and `EPERM` means alive.** That call has two distinct failures.
 `ESRCH` is "no such process"; `EPERM` is "it exists and you may not touch it". Flattening them

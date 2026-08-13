@@ -114,8 +114,13 @@ function stateWrittenAt(name) {
  */
 /** Has a `--stop` landed since we were spawned? */
 function invalidatedByStop() {
+  // `>=`, not `>`. Both stamps are `Date.now()`, so a stop landing in the same
+  // millisecond as our spawn is ambiguous — and strict ordering resolved it by
+  // ignoring the stop, leaving this process supervising a server that command had
+  // already torn down. Standing down in the ambiguous case costs a watchdog the next
+  // client will replace; the other reading costs the supervision itself.
   const stoppedAt = Number.parseInt(readState('stopped-at', ''), 10);
-  return Number.isFinite(stoppedAt) && stoppedAt > opts.spawnedAt;
+  return Number.isFinite(stoppedAt) && stoppedAt >= opts.spawnedAt;
 }
 
 function publish(record) {
@@ -236,13 +241,13 @@ function ourTargets() {
   // Scoped to `opts.host` too — the same address this watchdog probes for liveness.
   // A litert-lm bound to another interface on this port is a different server, and
   // supervising the socket we talk to means asking about that socket, not the number.
-  const { ours: targets, unidentified } =
+  const { ours: targets, unidentified, discoveryFailed } =
     identifyPortOwners(opts.port, looksLikeLitertLmServe, opts.host);
   const recorded = ownedPid('server.pid');
   if (recorded !== null && !targets.some((t) => t.pid === recorded)) {
     targets.push({ pid: recorded, token: startToken(recorded) });
   }
-  return { targets, unidentified };
+  return { targets, unidentified, discoveryFailed };
 }
 
 /**
@@ -329,6 +334,12 @@ async function main() {
   // to clear, so withdraw rather than stand as supervisor over nothing.
   if (invalidatedByStop()) cleanupAndExit(0);
 
+  // Targets from a shutdown that did not finish. Held across polls because they are
+  // the one case where "unreachable" must not mean "gone": we know they are alive
+  // precisely because we failed to kill them, and a survivor that closed its listener
+  // will fail every probe from here on.
+  let pendingSurvivors = [];
+
   const idleMs = opts.idleTimeout * 1000;
   const ceilingMs = Math.max(idleMs * HARD_CEILING_MULTIPLIER, HARD_CEILING_FLOOR_MS);
   let missedProbes = 0;
@@ -339,6 +350,121 @@ async function main() {
     // Another watchdog took over — stand down rather than double-terminate.
     const owner = parsePidRecord(readState('watchdog.pid', ''));
     if (owner?.pid !== process.pid) process.exit(0);
+
+    // A stop can also land AFTER we published, and the two checks at start-up cannot
+    // see it. The tombstone is written last, at the very end of a successful `--stop`,
+    // so a watchdog that published anywhere inside that command passed both of its
+    // checks against a `stopped-at` that did not exist yet. It then supervised a
+    // server the stop had already torn down — and, worse, stayed the registered
+    // supervisor, so the next client saw a live `watchdog.pid`, declined to spawn one,
+    // and its server was adopted by this process under the previous invocation's
+    // idle-timeout. The predicate is the same one used at start-up and needs no
+    // clearing: a watchdog spawned after the stop has a later `spawnedAt` and is
+    // untouched by it.
+    if (invalidatedByStop()) cleanupAndExit(0);
+
+    // AN UNFINISHED SHUTDOWN OUTRANKS THE REACHABILITY GATE BELOW.
+    //
+    // Retrying by falling through was wrong in a way that undid the fix it was part
+    // of: the survivor has closed its listener, so every probe from here fails, and
+    // after UNREACHABLE_TOLERANCE the gate below concludes the engine died, clears
+    // `server.pid`, and exits successfully — destroying the identity of a process we
+    // KNOW is alive, because we just failed to kill it, and abandoning the
+    // supervision in the same breath. "Unreachable means gone" is a reasonable
+    // default and a catastrophic one here.
+    //
+    // So the survivors are chased directly, on their identities rather than on the
+    // socket, until they are provably gone.
+    if (pendingSurvivors.length) {
+      // A RETRY IS STILL AN IDLE SHUTDOWN, and FR-024 does not lapse because the
+      // first attempt failed. `stopping` was released when it did, so a client may
+      // legitimately have connected to the surviving server and taken a marker since
+      // — and this branch reaches SIGKILL directly. Killing mid-generation because an
+      // earlier attempt was unlucky is exactly the guarantee the marker files exist
+      // to provide, so the same check the normal path makes is made here.
+      // CLAIM THE HANDSHAKE BEFORE COUNTING, and hold it through the signal.
+      // Counting first was a check with nothing behind it: the earlier failure
+      // cleared `stopping`, so a client could take a marker between the count and the
+      // kill and have its request truncated anyway — and the identity lookup sitting
+      // between them makes that window seconds wide on Windows. `stopping` is what
+      // stops a new client entering at all, which is the only thing that makes the
+      // count mean something by the time it is acted on.
+      writeState('stopping', Date.now());
+      // THE SAME RULE AS THE NORMAL IDLE PATH, not a second one written alongside it.
+      //
+      // Two attempts at this branch each got half of it. Yielding to live work
+      // without re-applying the configured delay turned a 900-second timeout into the
+      // poll interval; then re-applying the delay while REFRESHING `last-activity` on
+      // every poll broke the other half — `idleFor` could never grow, so the hard
+      // ceiling never fired, and a leaked marker whose owner pid had been reused
+      // pinned the survivor and its accelerator memory indefinitely. That ceiling
+      // exists for exactly that case (T056), and this branch had quietly opted out of
+      // it.
+      //
+      // The activity stamp belongs to the client, which writes it around each
+      // request; a supervisor refreshing it is a supervisor manufacturing the evidence
+      // it then reads. So the timestamp is left alone and the normal path's own test
+      // is applied verbatim.
+      const busy = countInFlight();
+      const since = Number.parseInt(readState('last-activity', String(Date.now())), 10)
+        || Date.now();
+      const idleFor = Date.now() - since;
+
+      if ((busy > 0 && idleFor < ceilingMs) || idleFor < idleMs) {
+        clearState('stopping');        // let live work through, or wait out the delay
+        continue;
+      }
+
+      const left = stillOurs(pendingSurvivors);
+      if (!left.outstanding.length) {
+        const chased = pendingSurvivors;
+        pendingSurvivors = [];
+        clearState('survivors');
+
+        // A REPLACEMENT START MAY OWN THIS PORT BY NOW, and its state is not ours to
+        // tidy. `stopping` was released when the shutdown failed, so a client could
+        // prove the old records stale, start server B, and publish B's `server.pid` —
+        // while declining to spawn a supervisor, because this watchdog still holds the
+        // slot. Clearing unconditionally here deleted B's identity and then exited,
+        // leaving B running with neither a record nor a watchdog.
+        // THE WHOLE IDENTITY, not the number. If the survivor's pid was reused by
+        // replacement server B, a numeric comparison finds it in `chased` and clears
+        // B's record anyway — the same pid-reuse mistake this file is built around,
+        // arriving through the guard meant to prevent a neighbouring one.
+        const rec = parsePidRecord(readState('server.pid', ''));
+        const isOurs = rec !== null
+          && chased.some((t) => t.pid === rec.pid && t.token === rec.token);
+        if (rec !== null && !isOurs) {
+          // B's, not ours — and supervising it is not ours to do either.
+          //
+          // Carrying on looked like the careful option and smuggled in a policy this
+          // process has no right to apply: the idle timeout is per START, and B chose
+          // its own. `--idle-timeout 0` disables shutdown entirely, which is why B
+          // spawned no watchdog of its own — so continuing here would idle-stop a
+          // server the user explicitly said never to stop, using a superseded
+          // invocation's settings.
+          //
+          // Standing down leaves B unsupervised until the next client, which then
+          // finds no live supervisor and spawns one under B's policy. That is the
+          // self-correcting direction the rest of this file already prefers, and it
+          // is strictly better than enforcing a rule nobody asked for.
+          cleanupAndExit(0);
+        }
+
+        clearState('server.pid');
+        clearState('loaded-model');
+        writeState('stopped-idle', Date.now());     // it did stop, just not first time
+        cleanupAndExit(0);
+      }
+      for (const pid of left.alive) {
+        try { process.kill(pid, process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL'); }
+        catch { /* ignore */ }
+      }
+      // Released between rounds so clients are not blocked for the whole retry
+      // schedule; the next round re-claims it before it counts again.
+      clearState('stopping');
+      continue;
+    }
 
     // A model switch tears the engine down and re-initialises it, so the server is
     // legitimately unreachable for tens of seconds *while a request is in flight*.
@@ -375,7 +501,16 @@ async function main() {
     // bookkeeping: clearing state and writing `stopped-idle` would record that we
     // released accelerator memory we never held, and the next client would be told a
     // server had been idle-stopped when it is still running and still unsupervised.
-    const { targets, unidentified } = ourTargets();
+    const { targets, unidentified, discoveryFailed } = ourTargets();
+
+    // The socket query could not RUN. Ordered ahead of the stand-down below because
+    // that branch reads an empty target set as "nothing here is ours" — and a query
+    // that never ran produces exactly that set. This point is only reached once the
+    // server has answered a probe, so something IS on the port; standing down on a
+    // failed lookup would abandon a live server on the strength of a question we
+    // never managed to ask. Wait and ask again.
+    if (discoveryFailed) continue;
+
     // Nothing provable AND nothing unprovable: genuinely not ours, stand down clean.
     if (!targets.length && !unidentified.length) cleanupAndExit(0);
 
@@ -447,9 +582,21 @@ async function main() {
         writeState('survivors', outstanding.map((t) => `${t.pid} ${t.token}`).join('\n'));
       }
 
-      // Standing down without a report leaves the next client free to reconcile and
-      // start a fresh supervisor, which will try again once the server goes idle.
-      cleanupAndExit(1);
+      // KEEP SUPERVISING. This used to stand down, on the reasoning that the next
+      // client would reconcile and start a fresh supervisor — but this is the IDLE
+      // path, and nothing guarantees a next client. A server that refused the signal,
+      // or that hit a transient identity failure, would then sit resident with its
+      // accelerator memory held and no watchdog at all, which is the exact outcome
+      // this process exists to prevent. Relinquishing the slot is only safe when
+      // someone is known to be coming.
+      //
+      // The handshake is released so clients are not blocked by a shutdown that did
+      // not complete, and the loop retries: one poll interval plus a full escalation
+      // is roughly twenty seconds between attempts, which is a retry rather than a
+      // spin.
+      clearState('stopping');
+      pendingSurvivors = targets.filter((t) => left.outstanding.includes(t.pid) && t.token);
+      continue;
     }
 
     clearState('server.pid');

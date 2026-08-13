@@ -43,9 +43,9 @@
  * Node standard library only (constitution, Principle III).
  */
 
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 
 // The boot-session test and pid liveness already have a home; ownership builds on
 // them rather than restating them. marker-state imports nothing from here, so this
@@ -74,6 +74,86 @@ const cache = new Map();
 
 /** Collapse whitespace so a wrapped or padded command line still matches. */
 const flatten = (s) => (s ?? '').replace(/\s+/g, ' ').trim();
+
+/**
+ * Run a query tool and preserve whether the query produced an answer at all.
+ *
+ * Shared by socket discovery and the process-table walk. `ok` is the load-bearing
+ * part: an empty successful answer means "nothing matched" while a failed query means
+ * "I could not tell", and callers must never spend the second as the first.
+ *
+ * `nonZeroIsAnswer` IS FOR `lsof` ALONE, and it has to be opt-in rather than the
+ * default. `lsof` exits 1 for "nothing matched", so for that one tool a nonzero exit
+ * really is a result. Extending the same generosity to PowerShell, `ss` and `ps` meant
+ * a query that STARTED and then failed handed its empty stdout back as an
+ * authoritative scan: in `--stop` an operational failure became "no owners", state was
+ * cleared and success reported while the server carried on running. Every other tool
+ * here exits 0 on an empty result, so nonzero from them is a broken question.
+ */
+function run(cmd, args, { nonZeroIsAnswer = false } = {}) {
+  try {
+    const r = spawnSync(cmd, args, { encoding: 'utf8', windowsHide: true });
+    // `error` is ENOENT, EACCES, or a failure to spawn at all — the query never ran.
+    // That is NOT the same answer as "it ran and found nothing", and returning '' for
+    // both is how a failed lookup comes back looking like an empty port.
+    // A SIGNAL is a failure too, and a quieter one: `spawnSync` leaves `error` unset
+    // when the process started fine and was then killed, so a terminated PowerShell
+    // or lsof would hand back its partial (usually empty) stdout as an authoritative
+    // answer — turning a query someone interrupted straight into an empty port.
+    if (r.error || r.signal) return { ok: false, out: '', status: null };
+    if (!nonZeroIsAnswer && r.status !== 0) return { ok: false, out: '', status: r.status };
+    return { ok: true, out: r.stdout ?? '', status: r.status };
+  } catch {
+    return { ok: false, out: '', status: null };
+  }
+}
+
+/**
+ * `run`, off the event loop.
+ *
+ * Same contract, same three-state answer; the caller keeps its timers and sockets
+ * while the query runs, and a query that exceeds its bound becomes `{ ok: false }`.
+ * That is what makes a tight sampling cadence affordable on Windows, where a
+ * process-table walk is a PowerShell start-up measured at ~930ms — long enough that a
+ * blocking version had to be throttled to every 3s, which is itself long enough for a
+ * launcher stage to spawn a descendant and exit unobserved.
+ */
+const PROCESS_QUERY_TIMEOUT_MS = 10_000;
+
+function runAsync(cmd, args,
+  { nonZeroIsAnswer = false, timeoutMs = PROCESS_QUERY_TIMEOUT_MS } = {}) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      // A process-table query sits inside the startup deadline, but awaiting a child
+      // with no bound prevents that deadline from advancing at all. Abort the query
+      // and return the ordinary unjudgeable result; callers already know not to spend
+      // `{ ok: false }` as an empty process table.
+      child = spawn(cmd, args, {
+        windowsHide: true,
+        signal: AbortSignal.timeout(timeoutMs),
+        killSignal: 'SIGKILL',
+      });
+    } catch {
+      resolve({ ok: false, out: '', status: null });
+      return;
+    }
+    let out = '';
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+    child.stdout?.setEncoding('utf8');
+    child.stdout?.on('data', (d) => { out += d; });
+    child.stdout?.on('error', () => {});
+    child.stderr?.on('data', () => {});
+    child.stderr?.on('error', () => {});
+    child.on('error', () => done({ ok: false, out: '', status: null }));
+    child.on('close', (status, signal) => {
+      if (signal) { done({ ok: false, out: '', status: null }); return; }
+      if (!nonZeroIsAnswer && status !== 0) { done({ ok: false, out: '', status }); return; }
+      done({ ok: true, out, status });
+    });
+  });
+}
 
 function inspectWindows(pids) {
   const filter = pids.map((p) => `ProcessId=${p}`).join(' or ');
@@ -151,7 +231,7 @@ function inspectLinux(pid) {
 function inspectPosixPs(pids) {
   let out = '';
   try {
-    out = spawnSync('ps', ['-p', pids.join(','), '-o', 'pid=,lstart=,args='],
+    out = spawnSync('ps', ['-ww', '-p', pids.join(','), '-o', 'pid=,lstart=,args='],
       { encoding: 'utf8' }).stdout ?? '';
   } catch { return; }
 
@@ -240,9 +320,20 @@ function normaliseAddress(addr) {
  * its command line and signal it, which is the same class of accident as killing a
  * bystander by pid: the identity test passed, the location test was never asked.
  *
- * Wildcards are a match, because they genuinely serve our host: a socket on
- * `0.0.0.0` receives what we send to 127.0.0.1, and `::` is dual-stack by default on
- * every platform this runs on, so it serves both families.
+ * A WILDCARD SERVES ITS OWN FAMILY, AND ONLY ITS OWN. `::` is dual-stack on some
+ * hosts and IPv6-only on others — it turns on `IPV6_V6ONLY`, which none of the three
+ * platform queries below reports, so we cannot tell the two apart from here. An
+ * earlier version read `::` as serving everything on the grounds that dual-stack is
+ * the common default. That admits an IPv6-only `litert-lm serve` on `:::9379` as the
+ * owner of a socket a client on 127.0.0.1 cannot reach, and `--stop` would then
+ * terminate it: precisely the cross-interface kill this function exists to prevent,
+ * reintroduced by the case meant to be generous. A cross-family wildcard is kept
+ * unprovable rather than discarded: it cannot authorise a signal, but its pid enters
+ * the unidentified bucket so an incomplete picture cannot authorise success either.
+ *
+ * `localhost` is the exception, and not a grudging one: it is a NAME that resolves to
+ * either family depending on the resolver, so neither wildcard can be ruled out and
+ * both are accepted.
  *
  * `host` of null means the caller wants every listener regardless of address.
  *
@@ -254,20 +345,37 @@ function normaliseAddress(addr) {
  * only ever narrows a set that is already gated; it is not the thing standing
  * between us and a stranger.
  */
-export function addressServes(listenAddress, host) {
-  if (host === null || host === undefined) return true;
+export function addressVerdict(listenAddress, host) {
+  if (host === null || host === undefined) return 'serves';
   const a = normaliseAddress(listenAddress);
-  if (a === '' || a === '*') return true;
+  if (a === '' || a === '*') return 'serves';
   const h = normaliseAddress(host);
-  if (a === h) return true;
-  if (a === '0.0.0.0') return !h.includes(':');      // v4 wildcard, v4 callers only
-  if (a === '::' || a === '0:0:0:0:0:0:0:0') return true;          // dual-stack
-  // `localhost` is a NAME, and it resolves to either loopback address depending on
-  // the host's resolver. A literal address is compared literally: a listener on ::1
-  // is unreachable from a client configured with 127.0.0.1, so it is not ours.
-  if (h === 'localhost') return a === '127.0.0.1' || a === '::1';
-  return false;
+  if (a === h) return 'serves';
+
+  const isWildcard = a === '0.0.0.0' || a === '::' || a === '0:0:0:0:0:0:0:0';
+  if (!isWildcard) {
+    // A literal address is compared literally: a listener on ::1 is unreachable from
+    // a client configured with 127.0.0.1, so it is not ours however loopback it looks.
+    return (h === 'localhost' && (a === '127.0.0.1' || a === '::1')) ? 'serves' : 'foreign';
+  }
+  if (h === 'localhost') return 'serves';              // either family may be the one
+  if (h.includes(':') ? a !== '0.0.0.0' : a === '0.0.0.0') return 'serves';
+
+  // A CROSS-FAMILY WILDCARD IS UNPROVABLE, NOT ABSENT — and the difference is the
+  // whole verdict. `::` serves v4 callers when IPV6_V6ONLY is off and does not when
+  // it is on, and no platform query here reports which. Excluding it outright was the
+  // first correction and it overshot: a filtered pid appears in none of `ours`,
+  // `strangers` or `unidentified`, so a genuinely dual-stack server that IS answering
+  // us vanished from discovery entirely and `--stop` reported "not running", cleared
+  // state, and left it holding accelerator memory. Unjudgeable keeps it out of the
+  // kill set and out of the success verdict at the same time, which is the only
+  // reading that is honest in both directions.
+  return 'unprovable';
 }
+
+/** Convenience for callers that only care whether it definitely serves `host`. */
+export const addressServes = (listenAddress, host) =>
+  addressVerdict(listenAddress, host) === 'serves';
 
 /**
  * Every listening socket on `port`, as `{ pid, address }`.
@@ -282,28 +390,62 @@ export function addressServes(listenAddress, host) {
  * quietly do nothing.
  */
 function listenersOnPort(port) {
-  const run = (cmd, args) => {
-    try {
-      return spawnSync(cmd, args, { encoding: 'utf8', windowsHide: true }).stdout ?? '';
-    } catch {
-      return '';
-    }
-  };
-
   if (process.platform === 'win32') {
-    return parseGetNetTcpConnection(run('powershell.exe', ['-NoProfile', '-Command',
-      `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue `
-      + '| ForEach-Object { ($_.LocalAddress, $_.OwningProcess) -join [char]9 }']));
+    // THE EXIT CODE IS MADE MEANINGFUL HERE RATHER THAN INTERPRETED.
+    //
+    // `Get-NetTCPConnection` reports "no matching connections" as a non-terminating
+    // ERROR, so `powershell.exe -Command` exits 1 for an empty port — measured, and
+    // identical to the exit it gives when the query genuinely fails. Read naively,
+    // nonzero would mean `--stop` refuses on every idle port; ignored, as it was, a
+    // broken query hands back empty stdout that becomes an authoritative "no owners",
+    // and `--stop` clears state and reports success while the server runs.
+    //
+    // Neither reading is available from the outside, so the script settles it itself:
+    // the one error id that means "nothing matched" is swallowed and exits 0, anything
+    // else exits 3. `run` then applies its ordinary rule — nonzero is a failed query —
+    // and both cases are finally distinguishable. Verified on this host: empty port 0
+    // with no rows, live port 0 with a row, malformed query 3.
+    const r = run('powershell.exe', ['-NoProfile', '-Command',
+      'try { '
+      + `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction Stop `
+      + '| ForEach-Object { ($_.LocalAddress, $_.OwningProcess) -join [char]9 } '
+      + "} catch { if ($_.FullyQualifiedErrorId -notlike 'CmdletizationQuery_NotFound*')"
+      + ' { exit 3 } }; exit 0']);
+    return { ok: r.ok, listeners: parseGetNetTcpConnection(r.out) };
   }
 
   // `-F pn` is lsof's machine-readable mode: `p<pid>` opens a process set and each
   // `n<addr>:<port>` under it is one of its sockets. The previous `-ti` form printed
   // pids alone, which is why there was no address to check.
-  const viaLsof = parseLsofFields(
-    run('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-F', 'pn']));
-  if (viaLsof.length) return viaLsof;
+  const lsof = run('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-F', 'pn'],
+    { nonZeroIsAnswer: true });
+  if (lsof.ok) {
+    const found = parseLsofFields(lsof.out);
+    if (found.length) return { ok: true, listeners: found };
+  }
+  // lsof's EXIT STATUS IS NOT A USABLE ERROR SIGNAL, and it is worth saying why
+  // rather than leaving it to be rediscovered. It returns 1 both for "nothing
+  // matched" and for an operational failure, and "nothing matched" is overwhelmingly
+  // the common case — an idle port. Treating nonzero as failure was tried and made
+  // `--stop` refuse on every empty port, because that is what an empty port looks
+  // like. Its stderr cannot arbitrate either: real installations emit `WARNING:
+  // can't stat()` for unreadable mounts on perfectly successful runs.
+  //
+  // So the ambiguity is accepted and mitigated rather than resolved: `ss` is
+  // consulted below and, where it runs, supplies an independent answer. Where neither
+  // tool runs at all, that IS detected — `ok` is false and the caller refuses.
 
-  return parseSs(run('ss', ['-ltnp', 'sport', `= :${port}`]));
+  // Minimal container and CI images routinely ship iproute2 without lsof, so `ss` is
+  // not a fallback for a failed lsof so much as the other half of the same question.
+  const ss = run('ss', ['-ltnp', 'sport', `= :${port}`]);
+  if (ss.ok) return { ok: true, listeners: parseSs(ss.out) };
+
+  // Neither tool added anything. `lsof.ok` is the whole verdict here, and because lsof
+  // is the one tool run with `nonZeroIsAnswer` it stays true for an exit-1-nothing-
+  // matched run — an empty port on a host with lsof is a real observation, not a
+  // failure. It goes false only when lsof could not run at all, which with `ss` also
+  // unavailable leaves nobody to answer the question, and the caller refuses.
+  return { ok: lsof.ok, listeners: [] };
 }
 
 /** `<LocalAddress>\t<OwningProcess>`, one line per listening socket. */
@@ -369,12 +511,507 @@ function stripPort(endpoint) {
  * see `addressServes`. Pass `host` of null only when the question really is "who
  * holds this port at all", which is what the test suite asks.
  */
-export function pidsOnPort(port, host = null) {
+function scanPort(port, host) {
+  const { ok, listeners } = listenersOnPort(port);
   const pids = new Set();
-  for (const { pid, address } of listenersOnPort(port)) {
-    if (addressServes(address, host)) pids.add(pid);
+  const unprovable = new Set();
+  for (const { pid, address } of listeners) {
+    const verdict = addressVerdict(address, host);
+    if (verdict === 'serves') pids.add(pid);
+    else if (verdict === 'unprovable') unprovable.add(pid);
   }
-  return [...pids];
+  return { ok, pids: [...pids], unprovable: [...unprovable] };
+}
+
+export function pidsOnPort(port, host = null) {
+  return scanPort(port, host).pids;
+}
+
+// ---------------------------------------------------------------------------
+// Descent
+//
+// WHY THIS IS HERE AT ALL, GIVEN THE FILE HEADER REJECTS ANCESTRY.
+//
+// That rejection is about OWNERSHIP: `--stop` must be able to stop a server this
+// plugin adopted but did not start, so requiring descent from our recorded pid would
+// refuse exactly the servers `ensureServer` is designed to take over. Nothing here
+// changes that — `--stop` still identifies socket owners by their command line.
+//
+// Cancellation is a different question with a different answer. There, we DID spawn
+// the launcher moments ago, and "descended from the process I just started" is a
+// stronger claim than any command line: it cannot be forged by a bystander and needs
+// no heuristic. It is also the only thing that can see a descendant which has not
+// bound a socket yet, which is the gap a listener-based search cannot close.
+// ---------------------------------------------------------------------------
+
+/**
+ * One snapshot of the process table: pid -> { ppid, start }.
+ *
+ * THE PARENT LINK AND THE START TOKEN COME FROM THE SAME OBSERVATION, and that is the
+ * entire reason this exists rather than a `pid -> ppid` map with token lookups bolted
+ * on afterwards. Reading the tree first and establishing identity second reopens the
+ * exact window this module was written to close: a candidate exits between the two
+ * steps, its number is reissued, and the token captured describes the replacement —
+ * which then passes every later identity check, because it is a real token for a real
+ * process that simply is not ours. Socket discovery had this bug and fixed it by
+ * re-asking the port; here it is designed out instead, because one read can answer
+ * both questions at once on every platform that matters.
+ *
+ * The `start` values are byte-identical to what `identity` produces, so a token from
+ * here and a token from a pid file are directly comparable. That is load-bearing —
+ * `resolveTargets` re-proves generation members against `identity`, not against this.
+ */
+const WIN_TABLE_QUERY =
+  'try { Get-CimInstance Win32_Process -ErrorAction Stop '
+  + '| ForEach-Object { ($_.ProcessId, $_.ParentProcessId, '
+  + '$_.CreationDate.ToFileTimeUtc()) -join [char]9 } '
+  + '} catch { exit 3 }; exit 0';
+
+function tableWindows() {
+  const r = run('powershell.exe', ['-NoProfile', '-Command', WIN_TABLE_QUERY]);
+  return { ok: r.ok, table: parseTableWindows(r.out) };
+}
+
+/** `<ProcessId>\t<ParentProcessId>\t<CreationDate as FILETIME>` per row. */
+function parseTableWindows(out) {
+  const table = new Map();
+  for (const line of out.split(/\r?\n/)) {
+    const [pidStr, ppidStr, start] = line.split('\t');
+    const pid = Number.parseInt(pidStr, 10);
+    const ppid = Number.parseInt(ppidStr, 10);
+    if (!Number.isInteger(pid) || !Number.isInteger(ppid) || !start) continue;
+    table.set(pid, { ppid, start: start.trim() });
+  }
+  return table;
+}
+
+/**
+ * Linux: fields 4 and 22 of /proc/<pid>/stat, from ONE read of ONE file — which makes
+ * the pairing atomic rather than merely quick. No subprocess either, so this is cheap
+ * enough to run on every poll, and the whole point is to catch a short-lived
+ * intermediate before it exits.
+ *
+ * `comm` (field 2) is parenthesised and may itself contain spaces and parentheses, so
+ * fields are counted from the LAST ')', exactly as `inspectLinux` does. Zombies are
+ * omitted for the same reason they are elsewhere: they hold nothing, serve nothing,
+ * and `pidAlive` already calls them dead.
+ */
+function tableLinux() {
+  const table = new Map();
+  let entries;
+  try { entries = readdirSync('/proc'); } catch { return { ok: false, table }; }
+  for (const name of entries) {
+    const pid = Number.parseInt(name, 10);
+    if (!Number.isInteger(pid) || String(pid) !== name) continue;
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+      if (fields[0] === 'Z') continue;                      // exited, not yet reaped
+      const ppid = Number.parseInt(fields[1], 10);          // field 4, 1-indexed
+      const start = fields[19];                             // field 22, 1-indexed
+      if (Number.isInteger(ppid) && start) table.set(pid, { ppid, start });
+    } catch { /* it exited between the readdir and the read */ }
+  }
+  return { ok: true, table };
+}
+
+/**
+ * macOS and other POSIX: one `ps` for the whole table, carrying `args` because the
+ * token on this platform includes a command-line digest — `lstart` has no subsecond
+ * field, so time alone cannot separate two processes created in the same second.
+ * Built exactly as `inspectPosixPs` builds it, or the two would not compare equal.
+ */
+function tablePosixPs() {
+  const r = run('ps', ['-ww', '-Ao', 'pid=,ppid=,lstart=,args=']);
+  return { ok: r.ok, table: parseTablePosix(r.out) };
+}
+
+/** `<pid> <ppid> <Www Mmm dd HH:MM:SS YYYY> <args...>` per row. */
+function parseTablePosix(out) {
+  const table = new Map();
+  for (const line of out.split('\n')) {
+    const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.*)$/);
+    if (m === null) continue;
+    const cmdline = flatten(m[4]);
+    const digest = createHash('sha256').update(cmdline).digest('hex').slice(0, 16);
+    table.set(Number.parseInt(m[1], 10), {
+      ppid: Number.parseInt(m[2], 10),
+      start: `${flatten(m[3])}#${digest}`,
+    });
+  }
+  return table;
+}
+
+/**
+ * `{ ok, table }` — because a walk that FAILED is not a walk that saw nothing.
+ *
+ * Every builder returns an empty Map when its query cannot run, and an empty Map is
+ * indistinguishable from a machine with no processes on it. A caller that treats that
+ * as an observation concludes quiescence from a question it never managed to ask,
+ * which is how a generation stayed "authoritative" across failed lookups and reported
+ * a clean teardown while its descendant was still starting.
+ */
+export function processTable() {
+  if (process.platform === 'win32') return tableWindows();
+  if (process.platform === 'linux') return tableLinux();
+  return tablePosixPs();
+}
+
+/**
+ * `processTable`, without blocking the event loop.
+ *
+ * Same output, same `{ ok, table }` contract. Linux needs no async form — it reads
+ * /proc and starts no subprocess — so it simply reuses the sync one.
+ *
+ * This exists so the sampling cadence can be set by what a walk COSTS rather than by
+ * what it blocks. The blocking version forced a 3s throttle on Windows to keep the
+ * readiness probe alive, and 3s is long enough for a launcher stage to spawn a
+ * detached descendant and exit between two samples — after which the descendant is
+ * reparented and nothing can link it back to us.
+ */
+export async function processTableAsync() {
+  if (process.platform === 'win32') {
+    const r = await runAsync('powershell.exe', ['-NoProfile', '-Command', WIN_TABLE_QUERY]);
+    return { ok: r.ok, table: parseTableWindows(r.out) };
+  }
+  if (process.platform === 'linux') return tableLinux();
+  const r = await runAsync('ps', ['-ww', '-Ao', 'pid=,ppid=,lstart=,args=']);
+  return { ok: r.ok, table: parseTablePosix(r.out) };
+}
+
+/**
+ * Every process descended from `roots`, transitively, in the CURRENT process table.
+ *
+ * TWO THINGS THIS DOES NOT DO, both deliberate:
+ *
+ * 1. It does not remember. A detached grandchild is reparented to init the moment
+ *    its parent exits, and after that no snapshot can connect it to us. So a single
+ *    late call finds nothing useful — the caller has to sample WHILE the intermediate
+ *    is alive and accumulate what it sees. That is the whole reason sampling happens
+ *    during the startup poll rather than only at cancellation.
+ *
+ * 2. It does not vouch for a dead root. A ppid is a number, and the number of an
+ *    exited process gets reissued like any other; "child of pid 4123" means nothing
+ *    once 4123 has died and been handed to someone else. The caller must pass only
+ *    roots it has just confirmed alive, which is what makes the link trustworthy —
+ *    a live pid cannot be simultaneously held by anything else.
+ */
+export function descendantsOf(roots, table = processTable().table) {
+  const known = new Set(roots);
+  const found = new Set();
+
+  // Fixed point rather than one pass: the table is in no particular order, so a
+  // grandchild can be visited before the child that links it to us.
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const [pid, { ppid }] of table) {
+      if (known.has(pid) || found.has(pid)) continue;
+      if (known.has(ppid) || found.has(ppid)) { found.add(pid); grew = true; }
+    }
+  }
+  return [...found];
+}
+
+/**
+ * How often to walk the process table, set by what a walk costs here.
+ *
+ * Linux reads /proc and starts nothing, so it can sample at the poll rate. Windows
+ * means a PowerShell start-up measured at ~930ms; that used to also block the event
+ * loop, which forced a 3s throttle to keep the readiness probe alive. `processTableAsync`
+ * removes the blocking half, so what is left to ration is CPU rather than latency.
+ *
+ * THE STEADY RATE IS STILL NOT FAST ENOUGH TO OBSERVE A HANDOFF, so it is not asked
+ * to. A stage that spawns a detached descendant and exits between two samples takes
+ * the only link to that descendant with it — reparenting to init is immediate and no
+ * later walk recovers it. Handoffs happen while the launcher chain is assembling, in
+ * the first seconds of a start, so that window is sampled at the poll rate and the
+ * long tail — a single process initialising an engine, spawning nothing — is not.
+ *
+ * This narrows the gap; it does not close it. A stage that hands off for the first
+ * time after the dense window still escapes, and the quiescence counter in
+ * `cancelStartedServer` remains the backstop for exactly that. Sampling every 750ms
+ * for the whole start would cost a PowerShell process per poll for the full startup
+ * timeout, on a machine simultaneously loading a model onto the GPU.
+ */
+const DESCENDANT_SAMPLE_MS = process.platform === 'win32' ? 3000 : 250;
+
+/** How long a start is treated as still assembling, and sampled at the poll rate. */
+const DESCENDANT_DENSE_MS = 15000;
+
+/**
+ * The pids between `pid` and the first root in `roots`, per `table`, or null if the
+ * walk never reaches one.
+ *
+ * Separate from `descendantsOf` because admission needs the PATH and not merely the
+ * fact of descent: every link on it is a claim the second walk gets to contradict.
+ */
+function chainToRoot(pid, table, roots) {
+  const rootSet = new Set(roots);
+  const chain = [];
+  const seen = new Set([pid]);
+  let cur = table.get(pid)?.ppid;
+  while (Number.isInteger(cur) && !seen.has(cur)) {
+    if (rootSet.has(cur)) return chain;
+    const row = table.get(cur);
+    if (!row) return null;
+    chain.push(cur);
+    seen.add(cur);
+    cur = row.ppid;
+  }
+  return null;
+}
+
+/**
+ * The set of processes one start is responsible for.
+ *
+ * Seeded with the launcher we spawned and grown by sampling the process table while
+ * that launcher — or something already admitted from it — is still provably itself.
+ *
+ * ACCUMULATION IS THE POINT. A detached grandchild is reparented to init the instant
+ * its parent exits, so a single walk at cancellation time finds nothing: by then the
+ * only evidence of the relationship is gone. Sampling during the startup poll catches
+ * the link while it still exists, and what is captured stays captured.
+ *
+ * A ROOT MUST BE PROVEN, NOT MERELY ALIVE — and getting this wrong is how the first
+ * version of this recreated the accident the whole module exists to prevent. It
+ * admitted descendants of anything in the set that answered `pidAlive`, ignoring the
+ * token already stored beside each member. So when a launcher exited and its number
+ * was reissued, the unrelated replacement became a "live" root, its children were
+ * admitted with their own genuine tokens, and every later identity check faithfully
+ * confirmed them — because they were real processes with real tokens that simply were
+ * not ours. Cancellation would then have signalled a stranger's children, with proof.
+ *
+ * Liveness says a number is in use. Identity says by whom. Only the second can
+ * authorise anything here, which is the rule the rest of this file already follows.
+ *
+ * Descent gets a process INTO the set; it never authorises a signal on its own. Every
+ * member carries the token captured when it was first seen, and `resolveTargets`
+ * re-proves each one before anything is signalled.
+ *
+ * `readTable` is a seam. Real pid reuse cannot be forced reliably in a test, so the
+ * admission rules are exercised against a fabricated table instead — which is the
+ * only way the case above gets deterministic coverage rather than a hopeful comment.
+ */
+export function startGeneration(launcherPid, readTable = processTableAsync,
+  launcherIsStillOurs = () => true) {
+  const mine = new Map();
+  const startedAt = Date.now();
+  let lastSample = 0;
+  let seeded = false;
+  let lastWalkSaw = false;
+  let handoffUncertain = false;
+
+  // The seam hands back a bare Map; production hands back a promise of
+  // `{ ok, table }`. Normalised here so a test can stay as simple as `() => table`
+  // while the real caller keeps the distinction between a walk that saw nothing and
+  // one that never ran. `await` on a plain value is a no-op, so both shapes work.
+  const walk = async () => {
+    const r = await readTable();
+    return r instanceof Map ? { ok: true, table: r } : r;
+  };
+
+  const admitFrom = async (table) => {
+    // SEEDING IS RETRIED, NOT DONE ONCE. It used to happen only in the constructor,
+    // so a first read that missed the launcher — the table query failed to run at
+    // all, or the stage exited before it was enumerated — left the set permanently
+    // empty. Every later sample then derived its roots from that empty set and found
+    // nothing to work from, so no recovered table could ever bootstrap it.
+    //
+    // BUT A RETRY IS ONLY SAFE WHILE THE HANDLE STILL VOUCHES FOR THE NUMBER. The
+    // first version of this retry took whatever row carried `launcherPid`, which is
+    // the pid-reuse hole again one level up: if the launcher exited before it was
+    // ever enumerated and its number was reissued, the stranger's row would be taken
+    // as authoritative, its token stored as ours, and its descendants admitted with
+    // valid tokens that cancellation would then re-prove and signal. `launcherPid` is
+    // a number; the ChildProcess handle is the only thing that knows whether that
+    // number is still the process we spawned.
+    //
+    // So a failed first read is recoverable only for as long as our child is alive.
+    // Once it has exited unseen, the generation stays unauthoritative — which is the
+    // honest answer, and one cancellation already knows how to handle.
+    if (!seeded && launcherPid && launcherIsStillOurs()) {
+      const row = table.get(launcherPid);
+      if (row) {
+        mine.set(launcherPid, { pid: launcherPid, token: row.start });
+        seeded = true;
+      }
+    }
+
+    // Members whose recorded token still matches this snapshot. Anything else is a
+    // number we used to know, and a number vouches for nothing.
+    const roots = [];
+    for (const { pid, token } of mine.values()) {
+      if (table.get(pid)?.start === token) roots.push(pid);
+    }
+    if (!roots.length) return;
+
+    // Numeric membership is not identity. A later genuine descendant can receive a
+    // pid held by an exited member; suppressing it here preserves the stale token and
+    // prevents the two-walk proof below from replacing it with the current process.
+    // Matching identities need no work, while a different token is a fresh candidate
+    // that still has to pass every confirmation and ancestry check below.
+    const candidates = descendantsOf(roots, table)
+      .filter((pid) => mine.get(pid)?.token !== table.get(pid)?.start);
+    if (!candidates.length) return;
+
+    // A SECOND WALK BEFORE ADMITTING ANYTHING, because one walk is not a snapshot. On
+    // Linux the table is built by reading each /proc/<pid>/stat in turn, so a root can
+    // be read, exit, and have its number reissued before a replacement's child is read
+    // later in the same enumeration — at which point the stale root row still matches
+    // its token and the unrelated child is admitted carrying a genuine one. The rows
+    // agree; they just describe two different moments.
+    //
+    // Paid only when there is something to admit, which is rare: most samples find
+    // nothing new and return above. That matters on Windows, where a walk is a
+    // PowerShell start-up.
+    const confirmed = await walk();
+    if (!confirmed.ok) { lastWalkSaw = false; return; }
+    const confirm = confirmed.table;
+
+    // Roots that survived the whole enumeration, judged against the second walk.
+    const proven = roots.filter((pid) => confirm.get(pid)?.start === mine.get(pid).token);
+    if (!proven.length) {
+      // Both queries ran, but validation lost the only identities that could vouch
+      // for the candidates. That is not an authoritative empty observation: the
+      // child may simply have reparented after the first walk. Cancellation must keep
+      // this sample unjudgeable instead of converting rejected admission to proof of
+      // quiescence.
+      handoffUncertain = true;
+      return;
+    }
+
+    for (const pid of candidates) {
+      // Present in BOTH walks with the SAME identity...
+      const first = table.get(pid);
+      const second = confirm.get(pid);
+      if (!second || first.start !== second.start) {
+        // The candidate identity may have handed off after the first walk and exited
+        // or had its pid reused before confirmation. A surviving root proves neither
+        // that handoff nor quiescence, so failed identity confirmation must remain
+        // unjudgeable for this generation.
+        handoffUncertain = true;
+        continue;
+      }
+
+      // ...and descended, in the first walk, from a root that survived BOTH. Checking
+      // only that SOME proven root exists was too weak: with two roots in the set, a
+      // candidate descended from the one that turned out to be a reused number was
+      // admitted on the strength of the other one's survival.
+      const chain = chainToRoot(pid, table, proven);
+      if (chain === null) {
+        // Some root survived, but not the one that vouched for this candidate. Once
+        // that ancestry disappears no later empty walk can recover it, so remember
+        // the uncertainty rather than letting a different root manufacture global
+        // authority for the generation.
+        handoffUncertain = true;
+        continue;
+      }
+
+      // EVERY LINK ON THE PATH IS A CLAIM, not just its two ends. One walk is not a
+      // snapshot: an intermediate can be read, exit, and have its number reissued
+      // before a later row in the SAME enumeration records an unrelated child under
+      // that number. Both ends then survive both walks honestly — the root is ours,
+      // the child is a real process with a real token — while the row that joined them
+      // described two different processes. Cancellation would re-prove that bystander
+      // and signal it, which is the accident this module exists to prevent.
+      //
+      // CONTRADICTED, NOT MERELY ABSENT, and the distinction is the whole reason this
+      // can be checked at all. An intermediate MISSING from the second walk is the
+      // ordinary case — a short-lived stage that handed off and exited, reparenting
+      // its child to init — and rejecting that would discard exactly the descendant
+      // this mechanism exists to catch. An intermediate PRESENT under a different
+      // identity is the tear: the number is in use by someone who is not who the first
+      // walk said it was.
+      const torn = chain.some((mid) => {
+        const then = table.get(mid);
+        const now = confirm.get(mid);
+        return now !== undefined && then !== undefined && now.start !== then.start;
+      });
+      if (torn) {
+        // The candidate is correctly rejected, but the contradicted link may have
+        // handed off before its pid was reused. No later walk can reconstruct that
+        // lost ancestry, so rejection cannot strengthen this generation's authority.
+        handoffUncertain = true;
+        continue;
+      }
+
+      mine.set(pid, { pid, token: second.start });
+    }
+  };
+
+  return {
+    members: () => [...mine.values()],
+    has: (pid) => mine.has(pid),
+    /** The recorded member, so a caller can compare the TOKEN and not just the pid. */
+    member: (pid) => mine.get(pid) ?? null,
+
+    /**
+     * Did we ever establish a trusted member — or have we simply never managed to look?
+     *
+     * "I OBSERVED NOTHING" AND "THERE IS NOTHING" ARE THE SAME SENTENCE ONLY WHEN YOU
+     * WERE ABLE TO LOOK, and cancellation is where the difference bites. It reads an
+     * empty member set as quiescence, so a generation that never seeded reported
+     * "nothing is left running" without ever having been able to see anything —
+     * clearing the child's record while the detached descendant went on to bind. That
+     * is the pre-bind false success this tracker exists to remove, re-entered through
+     * its own initialisation.
+     *
+     * So emptiness is only evidence for a caller that this returns true to. It is the
+     * same three-state discipline the rest of the module uses: gone, ours, or
+     * unjudgeable — and unjudgeable must never be spent as proof.
+     */
+    // ALL THREE PARTS. Seeding proves we once identified the launcher; the last walk
+    // succeeding proves the emptiness a caller is about to read is an observation
+    // rather than a failed question; and no candidate may have lost the roots that
+    // vouched for it during confirmation. A later empty walk cannot recover that
+    // vanished ancestry. Without these distinctions cancellation concludes quiescence
+    // from either a question never asked or a handoff it failed to follow.
+    // Handoff uncertainty is sticky. A later empty walk cannot prove what happened
+    // to a candidate after the last root that vouched for it disappeared.
+    authoritative: () => seeded && lastWalkSaw && !handoffUncertain,
+
+    adopt(owner) {
+      // A MATCHING NUMBER IS NOT A MATCHING MEMBER. If an exited launcher's pid was
+      // reissued to this start's eventual listener, the set already holds that number
+      // under the OLD token — so discarding the adoption keeps a member that
+      // `resolveTargets` will reject, cancellation counts as gone, and a clean
+      // teardown is reported while the listener runs. A freshly proven identity for
+      // the same number replaces the stale one rather than losing to it.
+      const held = mine.get(owner.pid);
+      if (held !== undefined && held.token === owner.token) return;
+      // An adopted listener was proven ours by command line and carries a token, so
+      // it is as good a root as the launcher and equally good evidence that we were
+      // able to look at all. It does not erase an earlier uncertain handoff: another
+      // candidate may still be starting without a socket.
+      mine.set(owner.pid, owner);
+      seeded = true;
+      // An adoption is itself a successful observation: it comes from socket discovery
+      // having answered, so the generation is not blind even if the last table walk was.
+      lastWalkSaw = true;
+    },
+
+    /**
+     * Async because the seed retry needs an EVENT-LOOP YIELD before it may trust the
+     * child handle, and for exactly the reason `recordSpawnedPid` documents: the table
+     * read is `spawnSync` and blocks the loop, so a child that exited during it has
+     * not had its exit event delivered yet and `exitCode` still reads null. Checking
+     * the handle straight after a blocking read is how a guard looks correct while
+     * doing nothing — and here it would let a reused pid seed the generation.
+     */
+    async sample(force = false) {
+      // Dense while the launcher chain is still assembling, throttled afterwards.
+      // See DESCENDANT_SAMPLE_MS: a handoff is only observable if a sample lands
+      // between the descendant's creation and its parent's exit, and that window is
+      // at the start of a start.
+      const interval = Date.now() - startedAt < DESCENDANT_DENSE_MS ? 0 : DESCENDANT_SAMPLE_MS;
+      if (!force && Date.now() - lastSample < interval) return;
+      lastSample = Date.now();
+      const seen = await walk();
+      await new Promise((r) => { setImmediate(r); });
+      lastWalkSaw = seen.ok;
+      if (seen.ok) await admitFrom(seen.table);
+    },
+  };
 }
 
 /** The token to store alongside a pid so it can be re-identified later. */
@@ -622,20 +1259,51 @@ export function signallablePid(record, writtenAtMs) {
  * line test and is emphatically not ours; without the address it was signalled.
  */
 export function identifyPortOwners(port, isOurs, host = null) {
-  const before = pidsOnPort(port, host);
-  identities(before);
-  const after = new Set(pidsOnPort(port, host));
+  const first = scanPort(port, host);
+  identities(first.pids);
+  const second = scanPort(port, host);
+  const after = new Set(second.pids);
 
   const ours = [];
   const strangers = [];
   const unidentified = [];
-  for (const pid of before) {
+  for (const pid of first.pids) {
     if (!after.has(pid)) continue;                  // no longer holds this port
     if (identity(pid) === null) unidentified.push(pid);
     else if (isOurs(pid)) ours.push({ pid, token: startToken(pid) });
     else strangers.push(pid);
   }
-  return { ours, strangers, unidentified };
+
+  // "I could not ask who holds this port" is a THIRD answer, and it used to be
+  // indistinguishable from "nobody does": every query failure returned an empty
+  // string, which became an empty pid list, which became an empty owner set. A host
+  // where neither lsof nor ss will run then reads as a free port, so a recorded
+  // launcher that has exited while its unrecorded listener carries on looks exactly
+  // like a server that is already gone. Reported rather than folded into
+  // `unidentified`, because the two need different handling: an unidentified listener
+  // is a process we know is there, while this is the absence of the question.
+  // A listener we cannot prove either way about is unidentified — never signalled,
+  // never counted as gone. See `addressVerdict`: a cross-family wildcard may or may
+  // not be the socket answering us, and dropping it was how a live server became
+  // invisible.
+  //
+  // ONE PROCESS CAN HOLD BOTH KINDS OF SOCKET, and that is not an unproven process.
+  // A server bound to 127.0.0.1:P and :::P appears in `pids` for the first socket and
+  // in `unprovable` for the second, so the loop above rightly calls it ours while this
+  // one used to append the same pid to `unidentified` as well. Both `--stop` and the
+  // watchdog treat any unidentified listener as an incomplete picture and refuse the
+  // whole operation, so a server that had been conclusively identified deferred its
+  // own shutdown for ever. A pid already judged — either way — is judged; the
+  // unprovable socket adds nothing the proven one has not already settled.
+  const judged = new Set([...ours.map((o) => o.pid), ...strangers, ...unidentified]);
+  for (const pid of first.unprovable) {
+    if (judged.has(pid)) continue;
+    if (!second.unprovable.includes(pid)) continue;
+    unidentified.push(pid);
+    judged.add(pid);
+  }
+
+  return { ours, strangers, unidentified, discoveryFailed: !first.ok || !second.ok };
 }
 
 export function resolveTargets(targets) {
@@ -666,7 +1334,12 @@ export const _parsers = {
   getNetTcpConnection: parseGetNetTcpConnection,
   lsof: parseLsofFields,
   ss: parseSs,
+  tableWindows: parseTableWindows,
+  tablePosix: parseTablePosix,
 };
+
+/** Test seam: query completion and timeout behavior without a platform-specific tool. */
+export const _queries = { runAsync };
 
 /** Test seam: forget everything looked up so far. */
 export function _resetIdentityCache() {

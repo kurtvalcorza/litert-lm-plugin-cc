@@ -31,8 +31,8 @@ import { BOOT_TIME_MS, pidAlive, reapMarkers } from './marker-state.mjs';
 // choosing one.
 import {
   commandLaunches, formatPidRecord, identifyPortOwners, identities, identity,
-  looksLikeLitertLmServe, parsePidRecord, recordIsStale, resolveTargets, signallablePid,
-  startToken,
+  looksLikeLitertLmServe, parsePidRecord, recordIsStale, resolveTargets,
+  signallablePid, startGeneration, startToken,
 } from './process-identity.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -107,16 +107,53 @@ function clearState(port, name) {
  */
 const IN_FLIGHT_DIR = 'in-flight.d';
 
-function acquireInFlight(port) {
+async function acquireInFlight(port, opts = null) {
   const dir = join(stateDir(port), IN_FLIGHT_DIR);
-  const marker = join(dir, `${process.pid}-${Date.now()}`);
-  try {
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(marker, '', 'utf8');
-    return marker;
-  } catch {
-    return null;   // tracking is best-effort; never fail a request over it
+
+  const publish = () => {
+    const marker = join(dir, `${process.pid}-${Date.now()}`);
+    try {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(marker, '', 'utf8');
+      return marker;
+    } catch {
+      return null;   // tracking is best-effort; never fail a request over it
+    }
+  };
+
+  // PUBLISH, THEN RE-CHECK THE HANDSHAKE. Checking `stopping` before creating the
+  // marker — which is what `awaitNotStopping` does, earlier and further away — is a
+  // read whose answer expires immediately: a supervisor can claim the handshake, count
+  // zero markers, and still be inside its identity lookup when this marker appears,
+  // after which it signals a server with a live request against it. Writing the
+  // handshake first on the watchdog side does not fix that on its own, because
+  // nothing here looked again.
+  //
+  // Two one-way tests in opposite orders is the whole protocol: the watchdog claims
+  // then counts, this claims then re-reads. A marker that appears before the
+  // handshake is counted; one that appears after is withdrawn by its own author. Both
+  // cannot miss each other.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const marker = publish();
+    if (marker === null) return null;
+    if (readState(port, 'stopping') === null) return marker;
+
+    // A shutdown owns the server right now. Stand aside rather than pin it open, wait
+    // for the handshake to clear, and try again.
+    releaseInFlight(marker);
+    if (opts === null) return null;
+    await awaitNotStopping(opts);
   }
+
+  // NEVER FALL THROUGH UNTRACKED. Returning null here and letting the request proceed
+  // would be worse than not having this protocol at all: the watchdog counts markers
+  // to decide whether anything is in flight, so a request running without one is
+  // exactly the request it is free to kill mid-generation. Giving up loudly is
+  // recoverable — the user retries — and running unprotected is not.
+  throw new Error(
+    'the server is shutting down and the shutdown has not finished.\n'
+    + '  This request was not started, rather than started without protection from\n'
+    + '  the idle watchdog. Retry in a moment.');
 }
 
 function releaseInFlight(marker) {
@@ -192,8 +229,25 @@ function liveStartClaim(port) {
   return pidAlive(claim.pid) ? claim : null;
 }
 
-/** Does this invocation's generation still own the claim? */
-const ownsStartClaim = (port, spawnedAt) => readStartClaim(port)?.spawnedAt === spawnedAt;
+/**
+ * Does this invocation's generation still own the claim?
+ *
+ * BOTH FIELDS, because a millisecond is not an identity. This compared `spawnedAt`
+ * alone, and `spawnedAt` is `Date.now()`: two clients that both find no claim and
+ * then stamp the same millisecond write different records that compare equal, so each
+ * reads the OTHER's claim as its own. The older one may then clear or overwrite the
+ * newer one's `server.pid`, release a claim it does not hold, or adopt its listener
+ * while cancelling — every failure the claim was introduced to prevent, reachable
+ * through a tie the comparison could not see.
+ *
+ * The pid is what breaks the tie. Only the process that wrote the claim can match it,
+ * and a claim is always written with `process.pid`, so a collision on the timestamp
+ * alone no longer collides on the generation.
+ */
+const ownsStartClaim = (port, spawnedAt) => {
+  const claim = readStartClaim(port);
+  return claim !== null && claim.spawnedAt === spawnedAt && claim.pid === process.pid;
+};
 
 /**
  * Record a process we just spawned, with the token that re-identifies it.
@@ -252,8 +306,15 @@ async function recordSpawnedPid(port, name, child, exe, spawnedAt) {
   // that nothing of ours is running. Publishing now would contradict it and leave a
   // record of a server the user was told had been stopped. Same tombstone the
   // watchdog uses, same reason: whoever stopped could not see us yet.
+  //
+  // `>=`, not `>`. Both stamps are `Date.now()`, so a stop landing in the same
+  // millisecond as this spawn is genuinely ambiguous — and strict ordering resolved
+  // that ambiguity by ignoring the stop, which is the one direction that cannot be
+  // recovered from. Treating it as an overtaking stop costs a start that has to be
+  // retried and says so; the other reading leaves a server running that the user was
+  // told had been stopped.
   const stoppedAt = Number.parseInt(readState(port, 'stopped-at', ''), 10);
-  if (Number.isFinite(stoppedAt) && stoppedAt > spawnedAt) return false;
+  if (Number.isFinite(stoppedAt) && stoppedAt >= spawnedAt) return false;
 
   // Warm — `identity(child.pid)` above already paid for it — so the gap between this
   // check and the write is a couple of syscalls rather than a PowerShell start-up.
@@ -560,22 +621,27 @@ function releaseStartClaim(port, spawnedAt) {
  * Undo a start that a concurrent `--stop` cancelled.
  *
  * Only touches what this invocation is responsible for: the launcher we spawned,
- * and any listener on the port we can prove is a litert-lm serve. Everything else is
- * left exactly as found — a cancelled start is not a licence to tidy up the machine.
+ * everything `generation` has observed descending from it, and any listener on the
+ * port we can prove is a litert-lm serve. Everything else is left exactly as found —
+ * a cancelled start is not a licence to tidy up the machine.
+ *
+ * DESCENT IS WHAT MAKES THE VERDICT MEAN ANYTHING. Listener discovery can only see a
+ * process that has already bound, and the whole difficulty here is the descendant
+ * that has NOT: the launcher exits, its grandchild is still initialising an engine,
+ * and every search that asks "who holds the port" truthfully answers "nobody". The
+ * quiescence counter below used to be the only thing standing between that and a
+ * report of "nothing is left running" — three samples, two 400ms waits, about 800ms
+ * of silence treated as proof. A litert-lm descendant binds after engine init, which
+ * is tens of seconds, so that window could be missed by two orders of magnitude.
+ *
+ * `generation` closes it from the other side: the descendant was admitted while its
+ * parent was still alive, long before it binds anything, so it is already a target
+ * when cancellation starts. The counter stays, now as a backstop for the one case
+ * descent cannot cover — a grandchild spawned in the gap after the last sample and
+ * after its parent had exited — rather than as the primary evidence.
  */
-async function cancelStartedServer(opts, child, spawnedAt) {
+async function cancelStartedServer(opts, generation, child, spawnedAt) {
   const port = opts.port;
-
-  // Start from the one thing we know is ours: the process we spawned. Its listener
-  // descendants are discovered each pass rather than snapshotted once — the whole
-  // reason socket discovery exists is that signalling the launcher does not reach
-  // the grandchild that holds the port, and that grandchild may not have bound yet
-  // when cancellation begins. A single snapshot at the top would miss it entirely.
-  const mine = new Map();
-  if (child.pid) {
-    const token = startToken(child.pid);
-    if (token) mine.set(child.pid, { pid: child.pid, token });
-  }
 
   let conclusive = false;
   let quiet = 0;
@@ -591,13 +657,26 @@ async function cancelStartedServer(opts, child, spawnedAt) {
     // and clean up only the child we spawned.
     const generationIsOurs = ownsStartClaim(port, spawnedAt);
 
+    // Descent is sampled unconditionally: it asks about OUR processes and cannot
+    // reach a newer start's, so the generation boundary has nothing to protect here.
+    // Listener adoption is gated, because the port is shared and a newer start's
+    // socket would otherwise be adopted by a cancellation that has already lost it.
+    await generation.sample(true);
     if (generationIsOurs) {
-      for (const owner of classifyPortOwners(opts).ours) {
-        if (!mine.has(owner.pid)) mine.set(owner.pid, owner);
+      // Both the sample above and the owner lookup below are slow — on Windows each
+      // launches PowerShell — so the claim read at the top of this pass is already
+      // history by the time its result is used. If B took the claim inside that gap
+      // and bound the port, adopting here pulls B's listener into A's generation with
+      // a valid identity, and the loop below signals it: a cancelled start killing the
+      // valid newer one, which is the exact failure the generation boundary exists to
+      // prevent, re-entered through the staleness of its own check.
+      const owners = classifyPortOwners(opts).ours;
+      if (ownsStartClaim(port, spawnedAt)) {
+        for (const owner of owners) generation.adopt(owner);
       }
     }
 
-    const { alive, unknown } = resolveTargets([...mine.values()]);
+    const { alive, unknown } = resolveTargets(generation.members());
     // `unknown` is not "gone". Ending the loop on a transient lookup failure would
     // let this report "nothing is left running" while the overtaken server carried
     // on coming up, unrecorded — the exact outcome cancellation exists to prevent.
@@ -607,7 +686,19 @@ async function cancelStartedServer(opts, child, spawnedAt) {
       // process AND no listener while the grandchild is still on its way up. Require
       // the picture to stay empty across consecutive passes before believing it.
       quiet += 1;
-      if (quiet >= 3 || !generationIsOurs) { conclusive = true; break; }
+
+      // And an empty picture is only evidence at all if we were ever able to look.
+      //
+      // The generation seeds itself from the process table; if that read never
+      // yielded the launcher — the query could not run, or the stage was gone before
+      // it was enumerated — then there are no members, and "no members" arrives here
+      // looking exactly like "everything has exited". Spending that as proof reported
+      // a clean teardown while the detached descendant was still on its way up, which
+      // is the pre-bind false success this tracker exists to remove, re-entered
+      // through its own initialisation. Unjudgeable is not a verdict.
+      const provable = generation.authoritative();
+      if (!generationIsOurs) { conclusive = provable; break; }
+      if (provable && quiet >= 3) { conclusive = true; break; }
       await sleep(400);
       continue;
     }
@@ -631,20 +722,38 @@ async function cancelStartedServer(opts, child, spawnedAt) {
     // gone, and wiped the identity B had just published — losing a live server to
     // the cleanup rather than to the kill. Not signalling a process whose only
     // identity you then discard is not restraint.
+    // THE WHOLE IDENTITY, not the number. Once B has taken the claim, a dead member
+    // of our generation can have its pid reissued to B — and a numeric test then finds
+    // that pid in our set and clears the record B had just published, losing a live
+    // server to the cleanup rather than to the kill. That is the mistake this branch
+    // already carries a paragraph about, made again one comparison lower down.
     const rec = parsePidRecord(readState(port, 'server.pid', ''));
-    if (rec === null || mine.has(rec.pid) || rec.pid === child.pid) {
-      clearState(port, 'server.pid');
-    }
+    const mineToo = rec !== null && generation.member(rec.pid)?.token === rec.token;
+    if (rec === null || mineToo) clearState(port, 'server.pid');
     return true;
   }
 
   // Could not finish. Leave the identity behind so `--stop` can pick it up, rather
   // than reporting a clean cancellation we did not achieve.
-  const left = [...mine.values()].filter((t) => t.token);
+  const left = generation.members().filter((t) => t.token);
   if (left.length) {
     writeState(port, 'survivors', left.map((t) => `${t.pid} ${t.token}`).join('\n'));
   }
   return false;
+}
+
+/** Cancel this start immediately when a concurrent `--stop` has overtaken it. */
+async function cancelIfStopped(opts, generation, child, spawnedAt) {
+  const stoppedAt = Number.parseInt(readState(opts.port, 'stopped-at', ''), 10);
+  if (!Number.isFinite(stoppedAt) || stoppedAt < spawnedAt) return;
+
+  const clean = await cancelStartedServer(opts, generation, child, spawnedAt);
+  throw new Error(clean
+    ? 'the server start was cancelled by a --stop that ran at the same time.\n'
+      + '  Nothing is left running. Retry if you did want it started.'
+    : 'the server start was cancelled by a --stop that ran at the same time,\n'
+      + '  but it could not be confirmed torn down. Its identity has been recorded;\n'
+      + '  run --stop again to finish the job.');
 }
 
 /**
@@ -794,10 +903,28 @@ async function ensureServer(opts) {
       + `  (underlying error: ${err.message})`);
   }
 
+  // Start tracking descendants NOW, not when cancellation begins.
+  //
+  // The link between our launcher and the process that will actually serve exists
+  // only while the launcher is alive — a detached grandchild is reparented to init
+  // the moment its parent exits, and no later walk can recover the relationship. The
+  // first sample is taken immediately for exactly that reason: on Linux a stage that
+  // hands off and exits can be gone within milliseconds of `recordSpawnedPid`.
+  // The third argument is what keeps a retried seed honest: if the first table read
+  // missed this launcher, seeding may be re-attempted only while the child handle
+  // still says the number is ours. `exitCode`/`signalCode` are the only evidence that
+  // distinguishes our process from whoever inherits its pid.
+  const generation = startGeneration(child.pid, undefined,
+    () => child.exitCode === null && child.signalCode === null);
+  // Seeding happens here rather than in the constructor: it has to yield to the event
+  // loop before the handle above means anything, and a constructor cannot await.
+  await generation.sample(true);
+
   // Record the identity now, while the process is still the one we just spawned —
   // and only if the OS still says so. Asked for later, the answer could already be
   // about whoever inherited the pid.
   await recordSpawnedPid(opts.port, 'server.pid', child, exe, spawnedAt);
+  await generation.sample(true);   // again, now the identity lookup has cost us time
   // Prune, not wipe: another client may have acquired a marker against this same
   // new server between our spawn and this line.
   pruneInFlight(opts.port);
@@ -807,6 +934,14 @@ async function ensureServer(opts) {
   while (Date.now() < deadline) {
     await sleep(750);
 
+    // Keep watching the tree while the server comes up. The walk no longer blocks the
+    // event loop, so this awaits a subprocess rather than freezing on one — an
+    // in-flight probe keeps making progress across it. What the cadence rations now is
+    // CPU: dense while the launcher chain is assembling and a handoff could be missed,
+    // throttled once the start is a single process loading a model. See
+    // DESCENDANT_SAMPLE_MS.
+    await generation.sample();
+
     // A concurrent `--stop` cancels this start, and cancelling has to mean stopping.
     //
     // Declining to RECORD the pid was not enough, and left the worse outcome of the
@@ -814,18 +949,18 @@ async function ensureServer(opts) {
     // anyway — running, unrecorded, and therefore harder to find than if we had
     // never suppressed the record at all. A start that has been overtaken has to
     // undo itself, not just stay quiet about it.
-    const stoppedAt = Number.parseInt(readState(opts.port, 'stopped-at', ''), 10);
-    if (Number.isFinite(stoppedAt) && stoppedAt > spawnedAt) {
-      const clean = await cancelStartedServer(opts, child, spawnedAt);
-      throw new Error(clean
-        ? 'the server start was cancelled by a --stop that ran at the same time.\n'
-          + '  Nothing is left running. Retry if you did want it started.'
-        : 'the server start was cancelled by a --stop that ran at the same time,\n'
-          + '  but it could not be confirmed torn down. Its identity has been recorded;\n'
-          + '  run --stop again to finish the job.');
-    }
+    await cancelIfStopped(opts, generation, child, spawnedAt);
 
     const up = await probe(opts);
+
+    // Re-read the tombstone AFTER the probe, not only before it. The check at the top
+    // of this iteration is already stale by the time the probe resolves, and a `--stop`
+    // landing inside that await is exactly the one that cannot see us: our server
+    // binds just after its ownership scan, the probe then succeeds, and accepting
+    // readiness here would return a running server that stop had already reported as
+    // gone — without ever entering cancellation.
+    await cancelIfStopped(opts, generation, child, spawnedAt);
+
     if (up) {
       releaseStartClaim(opts.port, spawnedAt);   // ours only — a newer start may own it
       startWatchdog(opts);
@@ -895,13 +1030,13 @@ const stillAlive = (targets) => resolveTargets(targets);
  * State is cleared either way. "We could not identify anything to stop" and "there
  * is stale state here" are different facts, and the second is safe to act on alone.
  */
-async function stopProcesses(opts) {
+async function stopProcesses(opts, endpointAnswered = false) {
   const port = opts.port;
 
   const PID_FILES = ['watchdog.pid', 'server.pid'];
   const recordedByName = ownedPids(port, PID_FILES);
   const recorded = [...recordedByName.values()];
-  const { ours, strangers, unidentified } = classifyPortOwners(opts);
+  const { ours, strangers, unidentified, discoveryFailed } = classifyPortOwners(opts);
 
   // Survivors of a PREVIOUS failed stop, which the two pid slots could not hold.
   //
@@ -916,7 +1051,7 @@ async function stopProcesses(opts) {
       && !recordIsStale(rec, stateWrittenAt(port, 'survivors')));
 
   // The SERVER targets. The watchdog is deliberately not among them — see below.
-  const watchdogRecord = recordedByName.get('watchdog.pid') ?? null;
+  let watchdogRecord = recordedByName.get('watchdog.pid') ?? null;
   const targets = [];
   for (const t of [...recorded, ...ours, ...carried]) {
     if (t.pid === watchdogRecord?.pid) continue;
@@ -944,10 +1079,36 @@ async function stopProcesses(opts) {
   // a refusal is recoverable by retrying, an unsupervised server is not recoverable
   // by anything except noticing. So when the picture is incomplete, nothing is
   // signalled and nothing is cleared.
-  if (unidentified.length) {
+  //
+  // A discovery that could not RUN counts here too, but only while something is
+  // actually answering on the port. The two facts have to be taken together: on a
+  // host with neither lsof nor ss the query always fails, and treating that alone as
+  // a blocker would make `--stop` refuse forever on exactly the minimal images the
+  // `ss` fallback was added for. With the endpoint answering it is a different claim
+  // — something is there and we cannot ask who — which is the unidentified case in
+  // all but name.
+  //
+  // `endpointAnswered` alone was not enough, and leaned on the one inference this
+  // codebase spends most of its comments warning against. A genuine server is
+  // legitimately unreachable during startup and for tens of seconds across a model
+  // switch — that is what UNREACHABLE_TOLERANCE exists for in the watchdog — so a
+  // failed probe is not evidence the server is gone. With discovery also unavailable
+  // and the recorded launcher already exited, `targets` comes back empty, and the
+  // command cleared state, wrote the success tombstone, and reported completion while
+  // the unrecorded grandchild carried on holding the socket.
+  //
+  // So the question is not "did the endpoint answer" but "is there anything here we
+  // cannot account for". Recorded identities count even when they turn out to be
+  // gone: the process that owns the socket was never one of them, so proving our
+  // records exited says nothing about it. Only a port with nothing answering AND
+  // nothing recorded is genuinely a case of "there was never anything to stop".
+  const somethingUnaccountedFor = endpointAnswered
+    || targets.length > 0 || watchdogRecord !== null || carried.length > 0;
+  const blindPort = discoveryFailed && somethingUnaccountedFor;
+  if (unidentified.length || blindPort) {
     return {
       signalled: [], strangers, surviving: [], unknown: unidentified,
-      heldPort: false, down: false,
+      heldPort: false, down: false, blindPort,
     };
   }
 
@@ -1018,6 +1179,33 @@ async function stopProcesses(opts) {
   // `stillAlive` drops the identity cache and asks the OS again, which answers all
   // three cases properly — gone, ours and signallable, or still unreadable.
   const serverGone = remaining.length === 0 && unknown.length === 0;
+
+  // The slot is RE-READ here rather than taken from the snapshot at the top.
+  //
+  // A watchdog spawned before this stop can publish DURING it. It is in no pid file
+  // when `ownedPids` runs, so the snapshot says there is no supervisor; its own two
+  // invalidation checks pass because the tombstone they look for is written last, at
+  // the end of this function. The stop then signalled nothing, cleared `watchdog.pid`
+  // — destroying the identity of a process it had never seen — and reported both
+  // processes confirmed gone while a live supervisor went on running.
+  //
+  // Everything below already knows how to chase and re-check a watchdog record, so
+  // the fix is to give it the current one. The watchdog now re-checks the tombstone on
+  // every poll as well; that closes the same hole from the other side, and neither
+  // makes the other redundant — this one keeps the VERDICT honest, that one bounds how
+  // long a superseded supervisor lives.
+  // Unconditional, not only when the snapshot was empty. Gating it on a null snapshot
+  // covered the watchdog that published during this stop and missed the one that
+  // REPLACED a record we already held: the old supervisor dies, a new one publishes,
+  // and the stale identity we are still carrying is the only thing consulted before
+  // the new one's record is cleared.
+  {
+    const now = pidRecord(port, 'watchdog.pid');
+    const live = now !== null && now.token !== null
+      && !recordIsStale(now, stateWrittenAt(port, 'watchdog.pid'));
+    watchdogRecord = live ? now : watchdogRecord;
+  }
+
   if (serverGone && watchdogRecord !== null) {
     let watchdogState = stillAlive([watchdogRecord]);
     for (const pid of watchdogState.alive) {
@@ -1055,7 +1243,16 @@ async function stopProcesses(opts) {
   const survivors = new Set([...remaining, ...unknown]);
   const kept = new Set();
   for (const name of PID_FILES) {
-    const rec = recordedByName.get(name);
+    // The watchdog's record comes from `watchdogRecord`, not the opening snapshot: a
+    // supervisor that published mid-stop is absent from the snapshot, and reading the
+    // slot from there would clear the identity of a process that is still running.
+    // Re-read once more here, immediately before the decision to clear. Everything
+    // between the check above and this point is escalation waits — seconds — and a
+    // watchdog can publish inside them; clearing on a stale reading deletes the live
+    // supervisor's identity and then reports success.
+    const rec = name === 'watchdog.pid'
+      ? (pidRecord(port, 'watchdog.pid') ?? watchdogRecord ?? undefined)
+      : recordedByName.get(name);
     // The watchdog we chose not to signal keeps its record too. Clearing it would
     // orphan a live supervisor: still running, but invisible to the next client,
     // which would start a second one and leave this one de-supervising nothing.
@@ -1123,6 +1320,7 @@ async function stopProcesses(opts) {
     unknown,
     heldPort: ours.length > 0,
     down: remaining.length === 0 && unknown.length === 0,
+    blindPort: false,
   };
 }
 
@@ -1248,8 +1446,8 @@ async function main() {
     // The probe reports; it does not authorise. Whether anything gets signalled is
     // decided inside stopProcesses, from process identity.
     const wasUp = await probe(opts);
-    const { signalled, strangers, surviving, unknown, heldPort, down } =
-      await stopProcesses(opts);
+    const { signalled, strangers, surviving, unknown, heldPort, down, blindPort } =
+      await stopProcesses(opts, Boolean(wasUp));
 
     const noteStrangers = () => {
       if (!strangers.length) return;
@@ -1274,6 +1472,12 @@ async function main() {
       // port-based look-up the reader would otherwise try, which is exactly why the
       // state records were kept rather than cleared.
       const parts = [];
+      if (blindPort) {
+        parts.push(`something is answering on port ${opts.port}, but who owns it could not\n`
+          + '  be determined — neither lsof nor ss could be run here, so the question was\n'
+          + '  never asked rather than answered "nobody". Nothing was signalled and no\n'
+          + '  state was cleared. Install lsof or iproute2, or stop the process yourself.');
+      }
       if (surviving.length) {
         parts.push(`pid ${surviving.join(', ')} did not stop. It is this plugin's process\n`
           + '  and it is still running, so it may still hold accelerator memory even if it\n'
@@ -1372,7 +1576,7 @@ async function main() {
   // Activity accounting (T057). in-flight MUST fall on every exit path, or a crashed
   // client pins the server alive forever.
   touchActivity(opts.port);
-  const marker = acquireInFlight(opts.port);
+  const marker = await acquireInFlight(opts.port, opts);
 
   let released = false;
   const release = () => {
