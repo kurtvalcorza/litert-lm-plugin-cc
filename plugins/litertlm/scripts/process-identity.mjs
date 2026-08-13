@@ -884,7 +884,14 @@ export function startGeneration(launcherPid, readTable = processTableAsync,
       // Present in BOTH walks with the SAME identity...
       const first = table.get(pid);
       const second = confirm.get(pid);
-      if (!second || first.start !== second.start) continue;
+      if (!second) {
+        // The candidate may have handed off after the first walk and exited before
+        // confirmation. A surviving root proves neither that handoff nor quiescence,
+        // so the lost observation must remain unjudgeable for this generation.
+        handoffUncertain = true;
+        continue;
+      }
+      if (first.start !== second.start) continue;
 
       // ...and descended, in the first walk, from a root that survived BOTH. Checking
       // only that SOME proven root exists was too weak: with two roots in the set, a

@@ -1511,6 +1511,37 @@ describe('admitting a descendant into a start generation', () => {
       'losing the candidate\'s specific root makes the generation unjudgeable');
   });
 
+  test('a candidate lost during confirmation makes the generation unjudgeable', async () => {
+    const seeded = new Map([
+      [100, row(1, 'T100')],
+      [200, row(100, 'T200')],
+    ]);
+    const first = new Map([
+      [100, row(1, 'T100')],
+      [200, row(1, 'T200')],
+      [300, row(200, 'T300')],       // observed after a possible handoff
+    ]);
+    const second = new Map([
+      [100, row(1, 'T100')],
+      [200, row(1, 'T200')],         // trusted roots survive, but 300 does not
+    ]);
+    const stable = new Map([
+      [100, row(1, 'T100')],
+      [200, row(1, 'T200')],
+    ]);
+    const gen = startGeneration(100, walks(seeded, seeded, first, second, stable));
+    await gen.sample(true);            // admit 200 while it descends from 100
+    await gen.sample(true);            // observe 300, then lose it before confirmation
+
+    assert.ok(!gen.has(300), 'an unconfirmed candidate must not be admitted');
+    assert.equal(gen.authoritative(), false,
+      'another surviving root cannot turn a lost handoff into proven quiescence');
+
+    await gen.sample(true);
+    assert.equal(gen.authoritative(), false,
+      'a later stable walk cannot recover a handoff that was never accounted for');
+  });
+
   test('losing every root during confirmation makes the sample unjudgeable', async () => {
     const first = new Map([
       [100, row(1, 'T100')],
