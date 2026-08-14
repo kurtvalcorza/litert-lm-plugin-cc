@@ -1401,7 +1401,14 @@ async function stopProcesses(opts, endpointAnswered = false, stopClaim = null) {
     const finalEndpointAnswered = Boolean(await probe(opts, 1000));
     const fresh = classifyPortOwners(opts);
     const lateRecord = pidRecord(port, 'server.pid');
-    const liveLateRecord = lateRecord !== null
+    const openingRecord = recordedByName.get('server.pid');
+    // Do not weaken the strong post-signal verdict for an opening target. On macOS
+    // kill(pid, 0) can still see the unreaped zombie after the identity walk has
+    // proven that target gone. Only a new or replaced record is late evidence.
+    const changedRecord = lateRecord !== null
+      && (openingRecord === undefined || lateRecord.pid !== openingRecord.pid
+        || lateRecord.token !== openingRecord.token);
+    const liveLateRecord = changedRecord
       && !recordIsStale(lateRecord, stateWrittenAt(port, 'server.pid'));
     const lateBlindPort = fresh.discoveryFailed
       && (finalEndpointAnswered || starting !== null || liveLateRecord);
