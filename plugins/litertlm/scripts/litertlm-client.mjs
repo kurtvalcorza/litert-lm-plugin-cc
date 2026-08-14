@@ -332,7 +332,6 @@ function releaseStopClaim(port, claim) {
  */
 async function recordSpawnedPid(port, name, child, exe, spawnedAt) {
   if (!ownsStartClaim(port, spawnedAt)) return false;
-  clearState(port, name);
   if (!child.pid) return false;
 
   // argv[0] must BE the executable we launched. A substring search over the whole

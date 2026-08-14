@@ -119,6 +119,7 @@ const PORT = {
   watchdogAdmission: reservePort(19521),
   watchdogStartupClaim: reservePort(19531),
   stopStartFinalization: reservePort(19541),
+  startRecordHandoff: reservePort(19551),
 };
 
 const spawned = [];
@@ -1221,6 +1222,61 @@ describe('recording a process we spawned', () => {
       process.exit(0);
     `, 'utf8');
   }
+
+  test('an older start never clears a newer start record on entry',
+    { timeout: 90_000 }, async (t) => {
+      const port = PORT.startRecordHandoff;
+      const runtime = runtimeDir();
+      const dir = stateDir(runtime, port);
+      const workDir = join(runtime, 'record-handoff');
+      const binDir = join(runtime, 'record-handoff-bin');
+      installFakeLitertLm(binDir, workDir, port);
+
+      const newerRecord = '424242 newer-start-token';
+      const preload = join(workDir, 'replace-start-claim.cjs');
+      writeFileSync(preload, `
+        const fs = require('node:fs');
+        const { syncBuiltinESMExports } = require('node:module');
+        const starting = ${JSON.stringify(join(dir, 'starting'))};
+        const serverRecord = ${JSON.stringify(join(dir, 'server.pid'))};
+        const realRead = fs.readFileSync.bind(fs);
+        const realWrite = fs.writeFileSync.bind(fs);
+        let replaced = false;
+        if ((process.argv[1] || '').endsWith('litertlm-client.mjs')) {
+          fs.readFileSync = (path, ...args) => {
+            const value = realRead(path, ...args);
+            if (!replaced && String(path) === starting) {
+              replaced = true;
+              realWrite(starting, String(Date.now() + 1) + ' 424242', 'utf8');
+              realWrite(serverRecord, ${JSON.stringify(newerRecord)}, 'utf8');
+            }
+            return value;
+          };
+          syncBuiltinESMExports();
+        }
+      `, 'utf8');
+
+      const sep = process.platform === 'win32' ? ';' : ':';
+      const r = spawnSync(process.execPath,
+        [CLIENT, '--list', '--port', String(port), '--idle-timeout', '0'], {
+          encoding: 'utf8', windowsHide: true, cwd: workDir,
+          env: {
+            ...process.env,
+            LITERT_LM_PLUGIN_RUNTIME: runtime,
+            NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${JSON.stringify(preload)}`.trim(),
+            PATH: `${binDir}${sep}${process.env.PATH ?? ''}`,
+            Path: `${binDir}${sep}${process.env.Path ?? ''}`,
+          },
+        });
+
+      const grandchild = Number.parseInt(readIfPresent(join(workDir, 'grandchild.pid')) ?? '', 10);
+      t.after(() => {
+        if (alive(grandchild)) try { process.kill(grandchild, 'SIGKILL'); } catch { /* gone */ }
+      });
+      assert.equal(r.status, 0, `the staged start should become ready: ${r.stderr}`);
+      assert.equal(readIfPresent(join(dir, 'server.pid')), newerRecord,
+        'start A must not erase the record published after start B took the claim');
+    });
 
   test('a launcher stage that exits leaves nothing signallable',
     { timeout: 90_000 }, async (t) => {
