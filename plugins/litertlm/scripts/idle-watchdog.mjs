@@ -314,20 +314,40 @@ function cleanupAndExit(code = 0) {
  * not success: this process waits for a live successor claim, and reclaims its own
  * exact record for another attempt if the child fails before publishing one.
  */
-function requestedReplacement(request, chased) {
+function requestedReplacement(request, chased, host) {
+  if (request?.discoveryPending === true) {
+    // Only a request written after survivor mode began may ask the incumbent to keep
+    // that mode alive. Otherwise a stale tokenless request could pin an unrelated old
+    // watchdog indefinitely.
+    const survivorsAt = stateWrittenAt('survivors');
+    if (!Number.isFinite(request.requestedAt) || survivorsAt === null
+        || request.requestedAt < survivorsAt || request.server !== null) {
+      return { status: 'none', replacement: null };
+    }
+
+    const discovered = identifyPortOwners(opts.port, looksLikeLitertLmServe, host);
+    if (discovered.discoveryFailed || discovered.unidentified.length) {
+      return { status: 'pending', replacement: null };
+    }
+    const replacement = discovered.ours.find((rec) => rec.token
+      && !chased.some((old) => old.pid === rec.pid && old.token === rec.token));
+    return { status: replacement ? 'ready' : 'none', replacement: replacement ?? null };
+  }
+
   const wanted = parsePidRecord(request?.server);
-  if (wanted?.token == null) return null;
+  if (wanted?.token == null) return { status: 'none', replacement: null };
   const isChased = chased.some((rec) => rec.pid === wanted.pid && rec.token === wanted.token);
-  if (isChased) return null;
+  if (isChased) return { status: 'none', replacement: null };
 
   const candidates = [];
   const recorded = parsePidRecord(readState('server.pid', ''));
   if (recorded?.token) candidates.push(recorded);
-  const discovered = identifyPortOwners(opts.port, looksLikeLitertLmServe, opts.host);
+  const discovered = identifyPortOwners(opts.port, looksLikeLitertLmServe, host);
   if (!discovered.discoveryFailed && !discovered.unidentified.length) {
     candidates.push(...discovered.ours.filter((rec) => rec.token));
   }
-  return candidates.find((rec) => rec.pid === wanted.pid && rec.token === wanted.token) ?? null;
+  const replacement = candidates.find((rec) => rec.pid === wanted.pid && rec.token === wanted.token);
+  return { status: replacement ? 'ready' : 'none', replacement: replacement ?? null };
 }
 
 async function successorClaimed(childPid) {
@@ -363,9 +383,12 @@ function restoreIncumbent(record) {
 async function handoffReplacement(chased) {
   let request = null;
   try { request = JSON.parse(readState('watchdog-request', 'null')); } catch { return 'none'; }
-  const replacement = requestedReplacement(request, chased);
-  if (replacement === null || !Number.isFinite(request.idleTimeout) || request.idleTimeout < 0
+  if (!Number.isFinite(request?.idleTimeout) || request.idleTimeout < 0
       || typeof request.host !== 'string' || !request.host) return 'none';
+  const selection = requestedReplacement(request, chased, request.host);
+  if (selection.status === 'pending') return 'retry';
+  const replacement = selection.replacement;
+  if (replacement === null) return 'none';
 
   const mineRaw = readState('watchdog.pid', '');
   const mine = parsePidRecord(mineRaw);

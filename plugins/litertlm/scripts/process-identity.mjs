@@ -722,11 +722,11 @@ export function descendantsOf(roots, table = processTable().table) {
  * the first seconds of a start, so that window is sampled at the poll rate and the
  * long tail — a single process initialising an engine, spawning nothing — is not.
  *
- * This narrows the gap; it does not close it. A stage that hands off for the first
- * time after the dense window still escapes, and the quiescence counter in
- * `cancelStartedServer` remains the backstop for exactly that. Sampling every 750ms
- * for the whole start would cost a PowerShell process per poll for the full startup
- * timeout, on a machine simultaneously loading a model onto the GPU.
+ * This narrows the gap; it does not close it. A stage that hands off between complete
+ * walks can still escape, so a later walk that loses an admitted identity makes the
+ * generation permanently unauthoritative. Sampling every 750ms for the whole start
+ * would cost a PowerShell process per poll for the full startup timeout, on a machine
+ * simultaneously loading a model onto the GPU, and still would not constitute proof.
  */
 const DESCENDANT_SAMPLE_MS = process.platform === 'win32' ? 3000 : 250;
 
@@ -1004,7 +1004,22 @@ export function startGeneration(launcherPid, readTable = processTableAsync,
       const seen = await walk();
       await new Promise((r) => { setImmediate(r); });
       lastWalkSaw = seen.ok;
-      if (seen.ok) await admitFrom(seen.table);
+      if (seen.ok) {
+        // A MEMBER THAT VANISHES BETWEEN WALKS MAY HAVE HANDED OFF FIRST. Periodic
+        // sampling can narrow that window but cannot close it: a stage can spawn a
+        // detached child and exit entirely after one walk and before the next, taking
+        // the only ancestry link with it. Once that happens, later empty walks prove
+        // only that the identities we knew are gone — not that every process they
+        // started is gone. Cancellation must therefore stay fail-closed instead of
+        // promoting three quiet samples to authoritative quiescence.
+        for (const { pid, token } of mine.values()) {
+          if (seen.table.get(pid)?.start !== token) {
+            handoffUncertain = true;
+            break;
+          }
+        }
+        await admitFrom(seen.table);
+      }
     },
   };
 }

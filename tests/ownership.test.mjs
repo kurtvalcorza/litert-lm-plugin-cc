@@ -117,6 +117,7 @@ const PORT = {
   postProbeCancel: reservePort(19501),
   watchdogHandoff: reservePort(19511),
   watchdogAdmission: reservePort(19521),
+  watchdogStartupClaim: reservePort(19531),
 };
 
 const spawned = [];
@@ -232,10 +233,10 @@ async function startFakeLitertLmServer(port, root) {
   return child;
 }
 
-const runClient = (args, runtime) => spawnSync(process.execPath, [CLIENT, ...args], {
+const runClient = (args, runtime, env = {}) => spawnSync(process.execPath, [CLIENT, ...args], {
   encoding: 'utf8',
   windowsHide: true,
-  env: { ...process.env, LITERT_LM_PLUGIN_RUNTIME: runtime },
+  env: { ...process.env, LITERT_LM_PLUGIN_RUNTIME: runtime, ...env },
 });
 
 /**
@@ -940,6 +941,8 @@ describe('the idle watchdog', () => {
       const failNextClaim = join(workDir, 'fail-next-watchdog-claim');
       const failedClaim = join(workDir, 'failed-watchdog-claim');
       const preload = join(workDir, 'block-signals.cjs');
+      const failDiscovery = join(workDir, 'fail-next-discovery');
+      const discoveryPreload = join(workDir, 'fail-discovery.cjs');
       writeFileSync(preload, `
         const fs = require('node:fs');
         const childProcess = require('node:child_process');
@@ -981,6 +984,32 @@ describe('the idle watchdog', () => {
           return realKill(pid, signal);
         };
       `, 'utf8');
+      writeFileSync(discoveryPreload, `
+        const fs = require('node:fs');
+        const childProcess = require('node:child_process');
+        const { syncBuiltinESMExports } = require('node:module');
+        if ((process.argv[1] || '').endsWith('litertlm-client.mjs')) {
+          const realSpawnSync = childProcess.spawnSync.bind(childProcess);
+          childProcess.spawnSync = (command, args, ...rest) => {
+            const cmd = String(command).toLowerCase();
+            const query = Array.isArray(args) ? args.join(' ') : '';
+            const marker = process.env.LITERT_TEST_FAIL_DISCOVERY;
+            const relevant = cmd.endsWith('lsof') || cmd.endsWith('ss')
+              || (cmd.includes('powershell') && query.includes('Get-NetTCPConnection'));
+            if (relevant && fs.existsSync(marker)) {
+              if (cmd.endsWith('ss') || cmd.includes('powershell')) {
+                fs.rmSync(marker, { force: true });
+              }
+              const error = new Error('staged socket-discovery failure');
+              error.code = 'ENOENT';
+              return { pid: 0, output: [], stdout: '', stderr: '', status: null,
+                signal: null, error };
+            }
+            return realSpawnSync(command, args, ...rest);
+          };
+          syncBuiltinESMExports();
+        }
+      `, 'utf8');
 
       writeFileSync(join(dir, 'server.pid'), formatPidRecord(oldTarget.pid), 'utf8');
       writeFileSync(join(dir, 'last-activity'), String(Date.now() - 600_000), 'utf8');
@@ -1010,15 +1039,20 @@ describe('the idle watchdog', () => {
       assert.ok(await waitFor(() => !pidsOnPort(port).includes(responder.pid),
         { timeout: 20_000 }), 'the old responder should release the endpoint');
       replacement = await startFakeLitertLmServer(port, join(workDir, 'replacement'));
-      try { rmSync(join(dir, 'server.pid'), { force: true }); } catch { /* ignore */ }
 
+      writeFileSync(failDiscovery, 'fail once', 'utf8');
       const adopted = runClient(
-        ['--list', '--port', String(port), '--idle-timeout', '900'], runtime);
+        ['--list', '--port', String(port), '--idle-timeout', '900'], runtime, {
+          LITERT_TEST_FAIL_DISCOVERY: failDiscovery,
+          NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${JSON.stringify(discoveryPreload)}`.trim(),
+        });
       assert.equal(adopted.status, 0,
         `the client should adopt the manual replacement: ${adopted.stderr}`);
       const request = JSON.parse(readFileSync(join(dir, 'watchdog-request'), 'utf8'));
-      assert.equal(parsePidRecord(request.server)?.pid, replacement.pid,
-        'the durable request must name the proven listener without server.pid');
+      assert.equal(request.server, null,
+        'a transient discovery failure must not fall back to the recorded retired identity');
+      assert.equal(request.discoveryPending, true,
+        'the durable request must preserve discovery as work the incumbent will retry');
 
       // The first successor starts but cannot establish its own identity. Creation
       // alone must not make the incumbent exit; it has to reclaim and retry.
@@ -1040,6 +1074,77 @@ describe('the idle watchdog', () => {
         'the incumbent should exit after completing the handoff');
 
       successor = recordedPid(dir);
+    });
+
+  test('retries initial startup until a watchdog claims the slot',
+    { timeout: 90_000 }, async (t) => {
+      if (!(await canDiscoverPortOwners())) {
+        t.skip('no socket-owner discovery on this host (needs lsof or ss)');
+        return;
+      }
+      const port = PORT.watchdogStartupClaim;
+      const runtime = runtimeDir();
+      const dir = stateDir(runtime, port);
+      const workDir = join(runtime, 'startup-claim');
+      mkdirSync(workDir, { recursive: true });
+      const server = await startFakeLitertLmServer(port, join(workDir, 'server-root'));
+      let watchdogPid = null;
+      t.after(async () => {
+        if (alive(watchdogPid)) try { process.kill(watchdogPid, 'SIGKILL'); } catch { /* gone */ }
+        if (alive(server.pid)) try { process.kill(server.pid, 'SIGKILL'); } catch { /* gone */ }
+      });
+
+      const failNextClaim = join(workDir, 'fail-next-watchdog-claim');
+      const failedClaim = join(workDir, 'failed-watchdog-claim');
+      const preload = join(workDir, 'fail-first-claim.cjs');
+      writeFileSync(failNextClaim, 'fail once', 'utf8');
+      writeFileSync(preload, `
+        const fs = require('node:fs');
+        const childProcess = require('node:child_process');
+        const { syncBuiltinESMExports } = require('node:module');
+        if ((process.argv[1] || '').endsWith('idle-watchdog.mjs')) {
+          const failIdentity = () => {
+            const marker = process.env.LITERT_TEST_FAIL_NEXT_CLAIM;
+            if (!fs.existsSync(marker)) return false;
+            fs.rmSync(marker, { force: true });
+            fs.writeFileSync(process.env.LITERT_TEST_FAILED_CLAIM, String(process.pid), 'utf8');
+            return true;
+          };
+          const realRead = fs.readFileSync.bind(fs);
+          fs.readFileSync = (path, ...args) => {
+            if (String(path) === '/proc/' + process.pid + '/stat' && failIdentity()) {
+              const error = new Error('staged identity failure');
+              error.code = 'ENOENT';
+              throw error;
+            }
+            return realRead(path, ...args);
+          };
+          const realSpawnSync = childProcess.spawnSync.bind(childProcess);
+          childProcess.spawnSync = (command, args, ...rest) => {
+            const query = Array.isArray(args) ? args.join(' ') : '';
+            if ((String(command).includes('powershell') || String(command) === 'ps')
+                && query.includes(String(process.pid)) && failIdentity()) {
+              return { pid: 0, output: [], stdout: '', stderr: '', status: 1, signal: null };
+            }
+            return realSpawnSync(command, args, ...rest);
+          };
+          syncBuiltinESMExports();
+        }
+      `, 'utf8');
+
+      const adopted = runClient(
+        ['--list', '--port', String(port), '--idle-timeout', '900'], runtime, {
+          LITERT_TEST_FAIL_NEXT_CLAIM: failNextClaim,
+          LITERT_TEST_FAILED_CLAIM: failedClaim,
+          NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${JSON.stringify(preload)}`.trim(),
+        });
+      assert.equal(adopted.status, 0,
+        `the client should retry supervision before returning: ${adopted.stderr}`);
+      const failedPid = Number.parseInt(readIfPresent(failedClaim) ?? '', 10);
+      assert.ok(Number.isInteger(failedPid), 'the first watchdog must exercise failed identity');
+      watchdogPid = recordedPid(dir);
+      assert.ok(Number.isInteger(watchdogPid) && watchdogPid !== failedPid && alive(watchdogPid),
+        'a different live watchdog must claim the slot before the client succeeds');
     });
 
   // The other half of an exclusive claim: it must not become a lock. A record left
@@ -1892,6 +1997,23 @@ describe('admitting a descendant into a start generation', () => {
     assert.ok(gen.has(300), 'descent continues through a member that still proves out');
   });
 
+  test('a member lost entirely between walks makes later silence unjudgeable', async () => {
+    const present = new Map([[100, row(1, 'T100')]]);
+    const empty = new Map();
+    const gen = startGeneration(100, walks(present, empty, empty, empty));
+    await gen.sample(true);            // the launcher is proven and admitted
+    assert.equal(gen.authoritative(), true);
+
+    // The launcher may have spawned a detached descendant and exited wholly between
+    // these walks. No later table can reconstruct that ancestry, so the old three-
+    // empty-sample rule must not convert the lost handoff into proven quiescence.
+    await gen.sample(true);
+    await gen.sample(true);
+    await gen.sample(true);
+    assert.equal(gen.authoritative(), false,
+      'silence after an unobserved handoff window must remain fail-closed');
+  });
+
   test('a launcher absent from the table admits nothing', async () => {
     let table = new Map([[100, row(1, 'T100')]]);
     const gen = startGeneration(100, () => table);
@@ -2192,8 +2314,8 @@ describe('cancelling a start whose descendant has not bound yet', () => {
       assert.ok(await waitFor(() => !alive(grandchild), { timeout: 30_000 }),
         'a descendant that had not bound yet must still be stopped by cancellation');
 
-      assert.doesNotMatch(stderr, /could not be confirmed torn down/,
-        'and having tracked it, cancellation should be able to confirm the teardown');
+      assert.match(stderr, /could not be confirmed torn down/,
+        'a vanished launcher leaves an unobservable handoff gap even when known descendants died');
     });
 
   test('cancels when stop lands during the final readiness probe',

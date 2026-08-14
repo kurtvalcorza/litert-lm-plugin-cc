@@ -31,7 +31,7 @@ import { BOOT_TIME_MS, pidAlive, reapMarkers } from './marker-state.mjs';
 // note above them explains which belongs where, and it is worth reading before
 // choosing one.
 import {
-  commandLaunches, formatPidRecord, identifyPortOwners, identities, identity,
+  commandLaunches, forgetIdentities, formatPidRecord, identifyPortOwners, identities, identity,
   looksLikeLitertLmServe, parsePidRecord, portOwnerDiscoveryHelp, recordIsStale, resolveTargets,
   signallablePid, startGeneration, startToken,
 } from './process-identity.mjs';
@@ -537,7 +537,9 @@ function requestedServerIdentity(opts) {
   // owns the endpoint. The `survivors` record tells us that exceptional state is
   // active, so pay for discovery only there and publish the proven listener's full
   // identity for the incumbent's handoff.
-  if (readState(opts.port, 'survivors') === null) return recorded;
+  if (readState(opts.port, 'survivors') === null) {
+    return { server: recorded, discoveryPending: false };
+  }
 
   const survivors = new Set(String(readState(opts.port, 'survivors', ''))
     .split('\n').map((raw) => parsePidRecord(raw))
@@ -545,14 +547,47 @@ function requestedServerIdentity(opts) {
     .map((rec) => `${rec.pid} ${rec.token}`));
   const { ours, unidentified, discoveryFailed } =
     identifyPortOwners(opts.port, looksLikeLitertLmServe, opts.host);
-  if (discoveryFailed || unidentified.length) return recorded;
+  if (discoveryFailed || unidentified.length) {
+    // The old recorded identity belongs to the survivor being retired, not to the
+    // replacement that answered this client. Publishing it as the desired server
+    // makes the incumbent reject the request once that survivor exits, permanently
+    // losing the replacement's only watchdog-start opportunity. Preserve the missing
+    // observation explicitly so the incumbent keeps its slot and retries discovery.
+    return { server: null, discoveryPending: true };
+  }
 
   const replacement = ours.find((rec) => rec.token
     && !survivors.has(`${rec.pid} ${rec.token}`));
-  return replacement ? `${replacement.pid} ${replacement.token}` : recorded;
+  return {
+    server: replacement ? `${replacement.pid} ${replacement.token}` : null,
+    discoveryPending: false,
+  };
 }
 
-function startWatchdog(opts) {
+const WATCHDOG_CLAIM_TIMEOUT_MS = 15_000;
+const WATCHDOG_CLAIM_POLL_MS = 250;
+const WATCHDOG_START_ATTEMPTS = 2;
+
+async function liveWatchdogClaim(port, child) {
+  const deadline = Date.now() + WATCHDOG_CLAIM_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const record = parsePidRecord(readState(port, 'watchdog.pid', ''));
+    if (record?.token) {
+      // A first lookup can race identity publication and cache a miss. This is the
+      // confirmation boundary, so each observed claim gets a fresh authority-grade
+      // lookup rather than inheriting that stale answer.
+      forgetIdentities([record.pid]);
+      if (signallablePid(record, stateWrittenAt(port, 'watchdog.pid')) !== null) {
+        return true;                 // this child or a concurrent winner both supervise
+      }
+    }
+    if (child.exitCode !== null || child.signalCode !== null) return false;
+    await sleep(WATCHDOG_CLAIM_POLL_MS);
+  }
+  return false;
+}
+
+async function startWatchdog(opts) {
   // Publish the desired policy even when an older watchdog still owns the slot.
   // That incumbent may be finishing a failed shutdown while this invocation starts
   // replacement server B. B's only watchdog-start attempt used to stop here, then
@@ -560,8 +595,10 @@ function startWatchdog(opts) {
   // The durable request lets the incumbent hand the slot to a successor under B's
   // policy. A disabled request is meaningful too: it tells the old watchdog to
   // relinquish without replacing itself.
+  const requested = requestedServerIdentity(opts);
   const request = {
-    server: requestedServerIdentity(opts),
+    server: requested.server,
+    discoveryPending: requested.discoveryPending,
     host: opts.host,
     idleTimeout: opts.idleTimeout,
     requestedAt: Date.now(),
@@ -583,42 +620,45 @@ function startWatchdog(opts) {
   // and visible: `--stop` still identifies and stops the server correctly, since
   // that path IS authority-grade. Revisit if a phantom supervisor is ever observed.
   if (!staleRecord(opts.port, 'watchdog.pid')) return;
-  try {
-    const child = spawn(
-      process.execPath,
-      [join(HERE, 'idle-watchdog.mjs'), '--port', String(opts.port),
-        '--idle-timeout', String(opts.idleTimeout),
-        // The watchdog decides socket ownership by local address as well as port, so
-        // it has to be told the same address this client talks to. Left to its own
-        // default it would judge a different socket from the one being supervised.
-        '--host', opts.host,
-        // So a `--stop` landing before this child has published its pid can still
-        // invalidate it. Without this the child is invisible to that stop and would
-        // publish a supervisor record over the state it had just cleared.
-        '--spawned-at', String(request.requestedAt)],
-      { detached: true, stdio: 'ignore',
-        env: { ...process.env, LITERT_LM_PLUGIN_INSTANCE: randomUUID() } },
-    );
-    child.unref();
-    // Deliberately does NOT record the watchdog. The watchdog publishes its own pid,
-    // and it is the only writer of that file.
-    //
-    // Recording it here was an optimisation — the record appears immediately instead
-    // of after the watchdog's own identity lookup, so a client arriving in between
-    // does not spawn a redundant supervisor. It cost correctness. A parent can only
-    // publish a claim its child has already abandoned: two clients adopt one warm
-    // server, both spawn a watchdog, the loser's watchdog sees a proven owner and
-    // exits, and the loser's CLIENT then writes that now-dead pid over the winner's
-    // record. The survivor reads an owner that is not itself and exits too, leaving
-    // the server unsupervised.
-    //
-    // A watchdog never writes after deciding to stand down, so making it the sole
-    // writer removes the whole class rather than arbitrating it. The redundant spawn
-    // this reintroduces is a node start-up that immediately exits.
-  } catch {
-    process.stderr.write('[litertlm] warning: idle watchdog failed to start; the server will '
-      + 'stay resident until you run --stop.\n');
+  for (let attempt = 0; attempt < WATCHDOG_START_ATTEMPTS; attempt += 1) {
+    try {
+      const child = spawn(
+        process.execPath,
+        [join(HERE, 'idle-watchdog.mjs'), '--port', String(opts.port),
+          '--idle-timeout', String(opts.idleTimeout),
+          // The watchdog decides socket ownership by local address as well as port, so
+          // it has to be told the same address this client talks to. Left to its own
+          // default it would judge a different socket from the one being supervised.
+          '--host', opts.host,
+          // So a `--stop` landing before this child has published its pid can still
+          // invalidate it. Without this the child is invisible to that stop and would
+          // publish a supervisor record over the state it had just cleared.
+          '--spawned-at', String(request.requestedAt)],
+        { detached: true, stdio: 'ignore', windowsHide: true,
+          env: { ...process.env, LITERT_LM_PLUGIN_INSTANCE: randomUUID() } },
+      );
+      child.unref();
+      if (await liveWatchdogClaim(opts.port, child)) return;
+      // Deliberately does NOT record the watchdog. The watchdog publishes its own pid,
+      // and it is the only writer of that file.
+      //
+      // Recording it here was an optimisation — the record appears immediately instead
+      // of after the watchdog's own identity lookup, so a client arriving in between
+      // does not spawn a redundant supervisor. It cost correctness. A parent can only
+      // publish a claim its child has already abandoned: two clients adopt one warm
+      // server, both spawn a watchdog, the loser's watchdog sees a proven owner and
+      // exits, and the loser's CLIENT then writes that now-dead pid over the winner's
+      // record. The survivor reads an owner that is not itself and exits too, leaving
+      // the server unsupervised.
+      //
+      // A watchdog never writes after deciding to stand down, so making it the sole
+      // writer removes the whole class rather than arbitrating it. The redundant spawn
+      // this reintroduces is a node start-up that immediately exits.
+    } catch { /* retry below */ }
   }
+
+  throw new Error('the idle watchdog started but did not claim supervision.\n'
+    + '  The server is still running; retry this command or run --stop.');
 }
 
 /**
@@ -674,11 +714,12 @@ function releaseStartClaim(port, spawnedAt) {
  * of silence treated as proof. A litert-lm descendant binds after engine init, which
  * is tens of seconds, so that window could be missed by two orders of magnitude.
  *
- * `generation` closes it from the other side: the descendant was admitted while its
- * parent was still alive, long before it binds anything, so it is already a target
- * when cancellation starts. The counter stays, now as a backstop for the one case
- * descent cannot cover — a grandchild spawned in the gap after the last sample and
- * after its parent had exited — rather than as the primary evidence.
+ * `generation` closes the ordinary case from the other side: a descendant observed
+ * while its parent is alive is already a target when cancellation starts. It cannot
+ * close the residual gap where a parent hands off and exits wholly between walks.
+ * Once an admitted identity disappears, the generation therefore makes that
+ * uncertainty sticky; the counter may damp transient identity answers, but no amount
+ * of later silence may spend a missed handoff as proof.
  */
 async function cancelStartedServer(opts, generation, child, spawnedAt) {
   const port = opts.port;
@@ -721,10 +762,10 @@ async function cancelStartedServer(opts, generation, child, spawnedAt) {
     // let this report "nothing is left running" while the overtaken server carried
     // on coming up, unrecorded — the exact outcome cancellation exists to prevent.
     if (!alive.length && !unknown.length) {
-      // One empty sample is not quiescence. The launcher exits before the detached
-      // descendant it spawned has bound the socket, so a single pass can see no live
-      // process AND no listener while the grandchild is still on its way up. Require
-      // the picture to stay empty across consecutive passes before believing it.
+      // One empty sample is not quiescence. Consecutive emptiness only dampens a
+      // transient identity answer; it cannot repair ancestry. `authoritative()` turns
+      // permanently false when an admitted identity vanished between table walks, so
+      // a launcher -> detached-child handoff missed in that gap remains inconclusive.
       quiet += 1;
 
       // And an empty picture is only evidence at all if we were ever able to look.
@@ -738,7 +779,10 @@ async function cancelStartedServer(opts, generation, child, spawnedAt) {
       // through its own initialisation. Unjudgeable is not a verdict.
       const provable = generation.authoritative();
       if (!generationIsOurs) { conclusive = provable; break; }
-      if (provable && quiet >= 3) { conclusive = true; break; }
+      // While this invocation still owns the start, a finite quiet interval cannot
+      // prove that its launcher did not hand off wholly between process-table walks.
+      // Three empty confirmations end the bounded cleanup, but as INCONCLUSIVE.
+      if (quiet >= 3) break;
       await sleep(400);
       continue;
     }
@@ -837,7 +881,7 @@ async function ensureServer(opts) {
 
   const existing = await probe(opts);
   if (existing) {
-    startWatchdog(opts);              // adopt a server nothing is supervising
+    await startWatchdog(opts);        // adopt a server nothing is supervising
     return { models: existing, started: false };
   }
 
@@ -846,7 +890,7 @@ async function ensureServer(opts) {
   // situations produce identical state files and only `starting` tells them apart.
   const adopted = await awaitConcurrentStart(opts);
   if (adopted) {
-    startWatchdog(opts);
+    await startWatchdog(opts);
     return { models: adopted, started: false };
   }
 
@@ -1004,7 +1048,7 @@ async function ensureServer(opts) {
 
     if (up) {
       releaseStartClaim(opts.port, spawnedAt);   // ours only — a newer start may own it
-      startWatchdog(opts);
+      await startWatchdog(opts);
       return { models: up, started: true };
     }
   }

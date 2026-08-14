@@ -14,7 +14,7 @@ different ports never share state.
 |---|---|---|---|
 | `server.pid` | `<pid> <start-token>` | client, after successful start | watchdog |
 | `watchdog.pid` | `<pid> <start-token>` | **watchdog only** — see below | client, watchdog |
-| `watchdog-request` | JSON `{server, host, idleTimeout, requestedAt}` | client | retiring watchdog |
+| `watchdog-request` | JSON `{server, discoveryPending, host, idleTimeout, requestedAt}` | client | retiring watchdog |
 | `last-activity` | epoch ms | client, before and after each request | watchdog |
 | `in-flight.d/<pid>-<ts>` | **directory of marker files** | client, one per request | watchdog |
 | `stopping` | empty; presence is the signal | watchdog, before terminating | client |
@@ -88,6 +88,19 @@ replacement's policy, but does not treat process creation as completed supervisi
 a live successor to publish `watchdog.pid`. If that claim never appears, the incumbent republishes
 its own exact identity and retries the handoff on the next poll. A request with `idleTimeout: 0`
 deliberately releases the slot without starting a successor.
+
+If the replacement client cannot complete listener discovery transiently, it publishes
+`discoveryPending: true` with no server identity instead of falling back to the recorded survivor.
+Only a request newer than the `survivors` record may do this. The incumbent keeps its slot and
+retries discovery on later polls; a conclusive discovery then either proves the replacement and
+performs the handoff or proves that no replacement remains. This makes a failed observation
+recoverable without letting a tokenless stale request pin a watchdog indefinitely.
+
+The same claim rule applies to an ordinary initial watchdog start. The client does not treat a
+successful detached process creation as supervision: it waits for a live authority-grade
+`watchdog.pid` claim, retries when the child exits without one, and fails visibly if no attempt
+claims the slot. A concurrent watchdog that wins the slot is also success, because the invariant
+is live supervision rather than parentage by one particular client.
 
 **Shutdown is judged by the processes signalled, never by the port.** The socket is an endpoint;
 targets are processes. A stranger that holds or takes the port keeps answering, and treating
@@ -262,9 +275,12 @@ creation time on the same row. The tokens are byte-identical to what `identity` 
 token from the table and a token from a pid file are directly comparable.
 
 Descent gets a process into the set; it never authorises a signal. Every member is re-proved
-before each signal, so a reissued pid drops out like any other. The quiescence counter stays as a
-backstop for the one case descent cannot cover — a grandchild spawned after the last sample *and*
-after its parent had exited — rather than as the primary evidence.
+before each signal, so a reissued pid drops out like any other. Periodic walks cannot prove the
+one case descent cannot cover: a stage can spawn a detached child and exit wholly between two
+walks, erasing the only ancestry link. When any admitted identity disappears between successful
+walks, that handoff uncertainty is therefore sticky and later empty samples cannot authorise a
+quiescence verdict. Cancellation records the inconclusive teardown and asks for another `--stop`
+instead of reporting that nothing remains.
 
 **"I observed nothing" is only evidence if you were able to look.** The generation seeds itself
 from the process table, and seeding used to happen once, in the constructor. A first read that
@@ -287,8 +303,9 @@ PowerShell (~930ms), but the walk is asynchronous so it no longer blocks the rea
 the first 15 seconds, while launcher handoffs occur, Windows samples on every roughly 750ms startup
 iteration; after that dense window it falls back to a 3-second cadence while the long-running engine
 initialisation is unlikely to spawn new stages. Each asynchronous tool query is capped at 10 seconds;
-exceeding that bound is a failed, unjudgeable walk rather than an empty process table. This narrows
-rather than eliminates the handoff window, so cancellation's quiescence check remains the backstop.
+exceeding that bound is a failed, unjudgeable walk rather than an empty process table. The cadence
+reduces missed handoffs; the sticky uncertainty rule, not a finite quiet interval, is what prevents
+one from becoming a false proof.
 
 **A teardown that lost its supervisor is unfinished, not finished.** If the watchdog dies
 mid-shutdown, `stopping` is released but `server.pid` is preserved, and the next start must
