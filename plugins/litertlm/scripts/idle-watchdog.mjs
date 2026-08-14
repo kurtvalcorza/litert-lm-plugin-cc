@@ -33,6 +33,8 @@ import {
 } from './process-identity.mjs';
 
 const POLL_INTERVAL_MS = 5000;
+const HANDOFF_CLAIM_TIMEOUT_MS = 15_000;
+const HANDOFF_POLL_MS = 250;
 
 /**
  * Backstop for a leaked in-flight counter (T056). A client that crashes between
@@ -304,40 +306,106 @@ function cleanupAndExit(code = 0) {
 
 /**
  * Relinquish supervision of an old survivor and start the successor requested by
- * the client that owns replacement server `record`.
+ * the client that owns the proven replacement server.
  *
- * The request is matched by the complete server identity. A stale request must not
- * make this watchdog apply another invocation's timeout to an unrelated process,
- * and a bare pid is not enough under reuse. The slot is released before spawning so
- * the successor can claim it; if spawn fails the durable request remains for the
- * next client to repair rather than pretending a handoff occurred.
+ * The request is matched by complete identity against either `server.pid` or a
+ * currently proven listener, so an adopted manual server is covered without making
+ * a bare pid authoritative. The slot is released before spawning, but creation is
+ * not success: this process waits for a live successor claim, and reclaims its own
+ * exact record for another attempt if the child fails before publishing one.
  */
-function handoffReplacement(record) {
-  let request = null;
-  try { request = JSON.parse(readState('watchdog-request', 'null')); } catch { return false; }
-  const identity = record?.token ? `${record.pid} ${record.token}` : null;
-  if (identity === null || request?.server !== identity
-      || !Number.isFinite(request.idleTimeout) || request.idleTimeout < 0
-      || typeof request.host !== 'string' || !request.host) return false;
+function requestedReplacement(request, chased) {
+  const wanted = parsePidRecord(request?.server);
+  if (wanted?.token == null) return null;
+  const isChased = chased.some((rec) => rec.pid === wanted.pid && rec.token === wanted.token);
+  if (isChased) return null;
 
-  const mine = parsePidRecord(readState('watchdog.pid', ''));
-  if (mine?.pid === process.pid) clearState('watchdog.pid');
+  const candidates = [];
+  const recorded = parsePidRecord(readState('server.pid', ''));
+  if (recorded?.token) candidates.push(recorded);
+  const discovered = identifyPortOwners(opts.port, looksLikeLitertLmServe, opts.host);
+  if (!discovered.discoveryFailed && !discovered.unidentified.length) {
+    candidates.push(...discovered.ours.filter((rec) => rec.token));
+  }
+  return candidates.find((rec) => rec.pid === wanted.pid && rec.token === wanted.token) ?? null;
+}
+
+async function successorClaimed(childPid) {
+  const deadline = Date.now() + HANDOFF_CLAIM_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const record = parsePidRecord(readState('watchdog.pid', ''));
+    if (record?.pid !== process.pid
+        && signallablePid(record, stateWrittenAt('watchdog.pid')) !== null) {
+      return record.pid === childPid;
+    }
+    await sleep(HANDOFF_POLL_MS);
+  }
+  return false;
+}
+
+function restoreIncumbent(record) {
+  try {
+    publish(record);
+    return 'self';
+  } catch { /* a claimant may have published while the successor was starting */ }
+
+  const owner = ownedPid('watchdog.pid');
+  if (owner !== null && owner !== process.pid) return 'successor';
+
+  // An unprovable claimant must not strand this incumbent outside the slot. Reuse
+  // the authority-grade reclaim path; our own identity is already cached from the
+  // initial claim, so this does not depend on a fresh lookup succeeding.
+  if (claimWatchdogSlot()) return 'self';
+  const reclaimedBy = ownedPid('watchdog.pid');
+  return reclaimedBy !== null && reclaimedBy !== process.pid ? 'successor' : 'failed';
+}
+
+async function handoffReplacement(chased) {
+  let request = null;
+  try { request = JSON.parse(readState('watchdog-request', 'null')); } catch { return 'none'; }
+  const replacement = requestedReplacement(request, chased);
+  if (replacement === null || !Number.isFinite(request.idleTimeout) || request.idleTimeout < 0
+      || typeof request.host !== 'string' || !request.host) return 'none';
+
+  const mineRaw = readState('watchdog.pid', '');
+  const mine = parsePidRecord(mineRaw);
+  if (mine?.pid !== process.pid || mine.token == null) return 'retry';
+  clearState('watchdog.pid');
   clearState('stopping');
 
-  if (request.idleTimeout > 0) {
-    try {
-      const child = spawn(process.execPath,
-        [process.argv[1], '--port', String(opts.port),
-          '--idle-timeout', String(request.idleTimeout), '--host', request.host,
-          '--spawned-at', String(request.requestedAt ?? Date.now())],
-        { detached: true, stdio: 'ignore', windowsHide: true,
-          env: { ...process.env, LITERT_LM_PLUGIN_INSTANCE: randomUUID() } });
-      child.unref();
-    } catch {
-      return false;
-    }
+  if (request.idleTimeout === 0) {
+    clearState('watchdog-request');
+    return 'complete';
   }
-  process.exit(0);
+
+  let child = null;
+  try {
+    child = spawn(process.execPath,
+      [process.argv[1], '--port', String(opts.port),
+        '--idle-timeout', String(request.idleTimeout), '--host', request.host,
+        '--spawned-at', String(request.requestedAt ?? Date.now())],
+      { detached: true, stdio: 'ignore', windowsHide: true,
+        env: { ...process.env, LITERT_LM_PLUGIN_INSTANCE: randomUUID() } });
+    child.unref();
+  } catch { /* restore below */ }
+
+  if (child !== null && await successorClaimed(child.pid)) {
+    clearState('watchdog-request');
+    return 'complete';
+  }
+
+  // Process creation is not a handoff. If the child failed before publishing a
+  // live identity, take the slot back and retry on the next survivor poll.
+  for (;;) {
+    const restored = restoreIncumbent(mineRaw);
+    if (restored === 'self') return 'retry';
+    if (restored === 'successor') {
+      clearState('watchdog-request');
+      return 'complete';
+    }
+    if (invalidatedByStop()) return 'complete';
+    await sleep(HANDOFF_POLL_MS);
+  }
 }
 
 async function main() {
@@ -458,9 +526,6 @@ async function main() {
       const left = stillOurs(pendingSurvivors);
       if (!left.outstanding.length) {
         const chased = pendingSurvivors;
-        pendingSurvivors = [];
-        clearState('survivors');
-
         // A REPLACEMENT START MAY OWN THIS PORT BY NOW, and its state is not ours to
         // tidy. `stopping` was released when the shutdown failed, so a client could
         // prove the old records stale, start server B, and publish B's `server.pid` —
@@ -474,6 +539,19 @@ async function main() {
         const rec = parsePidRecord(readState('server.pid', ''));
         const isOurs = rec !== null
           && chased.some((t) => t.pid === rec.pid && t.token === rec.token);
+        const handoff = await handoffReplacement(chased);
+        if (handoff === 'complete') cleanupAndExit(0);
+        if (handoff === 'retry') {
+          // The successor did not prove that it owns the slot. The incumbent has
+          // reclaimed it, so keep the old survivor identities as the retry-state
+          // trigger even though they are now gone; next poll re-validates the fresh
+          // request and tries the handoff again without applying the old policy to B.
+          clearState('stopping');
+          continue;
+        }
+
+        pendingSurvivors = [];
+        clearState('survivors');
         if (rec !== null && !isOurs) {
           // B's, not ours — and supervising it is not ours to do either.
           //
@@ -489,7 +567,7 @@ async function main() {
           // so hand the slot to a successor under B's policy instead of assuming a
           // future request will repair the gap. If the request is absent, stale, or
           // does not name B's complete identity, stand down without guessing.
-          if (!handoffReplacement(rec)) cleanupAndExit(0);
+          cleanupAndExit(0);
         }
 
         clearState('server.pid');
@@ -524,17 +602,11 @@ async function main() {
     }
     missedProbes = 0;
 
-    const inFlight = countInFlight();
     const lastActivity = Number.parseInt(readState('last-activity', String(Date.now())), 10)
       || Date.now();
     const idleFor = Date.now() - lastActivity;
 
     if (idleFor < idleMs) continue;
-
-    // FR-024: a request in flight is never interrupted, however long it runs —
-    // unless activity has been silent past the hard ceiling, which means the
-    // counter leaked rather than work being genuinely in progress (T056).
-    if (inFlight > 0 && idleFor < ceilingMs) continue;
 
     // Nothing here is provably ours. That happens when the server on this port was
     // adopted and cannot be identified as a litert-lm — another OpenAI-compatible
@@ -565,7 +637,26 @@ async function main() {
     if (unidentified.length) continue;
 
     // Signal before acting, so a client cannot connect to a dying server (FR-025).
+    // Claim the handshake BEFORE counting. A marker published before this write is
+    // included below; one published after it is withdrawn by the client when that
+    // client re-reads `stopping`. The ownership walk above may take seconds, but it
+    // no longer sits between an unprotected count and the signal.
     writeState('stopping', Date.now());
+
+    const confirmedInFlight = countInFlight();
+    const confirmedActivity = Number.parseInt(
+      readState('last-activity', String(Date.now())), 10) || Date.now();
+    const confirmedIdleFor = Date.now() - confirmedActivity;
+
+    // FR-024: a request in flight is never interrupted, however long it runs —
+    // unless activity has been silent past the hard ceiling, which means the
+    // marker leaked rather than work being genuinely in progress (T056).
+    if (confirmedIdleFor < idleMs
+        || (confirmedInFlight > 0 && confirmedIdleFor < ceilingMs)) {
+      clearState('stopping');
+      continue;
+    }
+
     terminateServer(targets);
 
     // Wait on OUR targets, not on the endpoint: something else may hold or take the

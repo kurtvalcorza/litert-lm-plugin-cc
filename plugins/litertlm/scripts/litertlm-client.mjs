@@ -528,6 +528,30 @@ async function awaitNotStopping(opts) {
 }
 
 /** Start the watchdog only when we started a server, and only if none supervises (T060). */
+function requestedServerIdentity(opts) {
+  const recorded = readState(opts.port, 'server.pid', '') || null;
+
+  // Normally the recorded identity is both cheaper and stronger than another
+  // process-table walk. A failed idle shutdown is the exception: `server.pid` may
+  // still name the old off-port survivor while a manually launched replacement now
+  // owns the endpoint. The `survivors` record tells us that exceptional state is
+  // active, so pay for discovery only there and publish the proven listener's full
+  // identity for the incumbent's handoff.
+  if (readState(opts.port, 'survivors') === null) return recorded;
+
+  const survivors = new Set(String(readState(opts.port, 'survivors', ''))
+    .split('\n').map((raw) => parsePidRecord(raw))
+    .filter((rec) => rec?.token)
+    .map((rec) => `${rec.pid} ${rec.token}`));
+  const { ours, unidentified, discoveryFailed } =
+    identifyPortOwners(opts.port, looksLikeLitertLmServe, opts.host);
+  if (discoveryFailed || unidentified.length) return recorded;
+
+  const replacement = ours.find((rec) => rec.token
+    && !survivors.has(`${rec.pid} ${rec.token}`));
+  return replacement ? `${replacement.pid} ${replacement.token}` : recorded;
+}
+
 function startWatchdog(opts) {
   // Publish the desired policy even when an older watchdog still owns the slot.
   // That incumbent may be finishing a failed shutdown while this invocation starts
@@ -537,7 +561,7 @@ function startWatchdog(opts) {
   // policy. A disabled request is meaningful too: it tells the old watchdog to
   // relinquish without replacing itself.
   const request = {
-    server: readState(opts.port, 'server.pid', '') || null,
+    server: requestedServerIdentity(opts),
     host: opts.host,
     idleTimeout: opts.idleTimeout,
     requestedAt: Date.now(),

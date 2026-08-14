@@ -22,7 +22,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import {
-  chmodSync, copyFileSync, linkSync, mkdirSync, mkdtempSync, readFileSync, statSync,
+  chmodSync, copyFileSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync,
   utimesSync, writeFileSync,
 } from 'node:fs';
 import { after, describe, test } from 'node:test';
@@ -116,6 +116,7 @@ const PORT = {
   discoveryBlind: reservePort(19491),
   postProbeCancel: reservePort(19501),
   watchdogHandoff: reservePort(19511),
+  watchdogAdmission: reservePort(19521),
 };
 
 const spawned = [];
@@ -203,6 +204,31 @@ async function startBystander() {
   const child = reap(spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'],
     { stdio: 'ignore', windowsHide: true }));
   await sleep(600);
+  return child;
+}
+
+/** A real listener whose argv shape is indistinguishable from `litert-lm serve`. */
+async function startFakeLitertLmServer(port, root) {
+  const binDir = join(root, 'bin');
+  const workDir = join(root, 'server');
+  mkdirSync(binDir, { recursive: true });
+  mkdirSync(workDir, { recursive: true });
+  const exe = join(binDir, process.platform === 'win32' ? 'litert-lm.exe' : 'litert-lm');
+  try { linkSync(process.execPath, exe); } catch { copyFileSync(process.execPath, exe); }
+  if (process.platform !== 'win32') chmodSync(exe, 0o755);
+
+  writeFileSync(join(workDir, 'serve'), `
+    const { createServer } = require('node:http');
+    createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ object: 'list', data: [{ id: 'fake' }] }));
+    }).listen(${port}, '127.0.0.1');
+    setInterval(() => {}, 1000);
+  `, 'utf8');
+  const child = reap(spawn(exe, ['serve', '--host', '127.0.0.1', '--port', String(port)],
+    { cwd: workDir, stdio: 'ignore', windowsHide: true }));
+  assert.ok(await waitFor(() => alive(child.pid) && pidsOnPort(port).includes(child.pid),
+    { timeout: 30_000 }), 'the fake litert-lm server should own the test endpoint');
   return child;
 }
 
@@ -828,6 +854,65 @@ describe('the idle watchdog', () => {
         'and release the slot, so the next client is free to start a fresh one');
     });
 
+  test('claims the stopping handshake before counting in-flight work',
+    { timeout: 90_000 }, async (t) => {
+      if (!(await canDiscoverPortOwners())) {
+        t.skip('no socket-owner discovery on this host (needs lsof or ss)');
+        return;
+      }
+      const port = PORT.watchdogAdmission;
+      const runtime = runtimeDir();
+      const dir = stateDir(runtime, port);
+      const workDir = join(runtime, 'admission');
+      mkdirSync(workDir, { recursive: true });
+      const server = await startFakeLitertLmServer(port, workDir);
+      const paused = join(workDir, 'paused-before-stopping-write');
+      const release = join(workDir, 'release-stopping-write');
+      const preload = join(workDir, 'pause-stopping.cjs');
+      writeFileSync(preload, `
+        const fs = require('node:fs');
+        const realWrite = fs.writeFileSync.bind(fs);
+        fs.writeFileSync = (path, ...args) => {
+          if (String(path).endsWith('stopping') && !fs.existsSync(${JSON.stringify(paused)})) {
+            realWrite(${JSON.stringify(paused)}, 'ready', 'utf8');
+            while (!fs.existsSync(${JSON.stringify(release)})) {
+              Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+            }
+          }
+          return realWrite(path, ...args);
+        };
+      `, 'utf8');
+
+      writeFileSync(join(dir, 'server.pid'), formatPidRecord(server.pid), 'utf8');
+      writeFileSync(join(dir, 'last-activity'), String(Date.now() - 600_000), 'utf8');
+      const watchdog = reap(spawn(process.execPath,
+        [WATCHDOG, '--port', String(port), '--idle-timeout', '1'], {
+          stdio: 'ignore', windowsHide: true,
+          env: {
+            ...process.env,
+            LITERT_LM_PLUGIN_RUNTIME: runtime,
+            NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${JSON.stringify(preload)}`.trim(),
+          },
+        }));
+
+      assert.ok(await waitFor(() => readIfPresent(paused) !== null, { timeout: 40_000 }),
+        'the watchdog should pause exactly when it establishes the handshake');
+      const markerDir = join(dir, 'in-flight.d');
+      mkdirSync(markerDir, { recursive: true });
+      writeFileSync(join(markerDir, `${process.pid}-${Date.now()}`), '', 'utf8');
+      writeFileSync(release, 'go', 'utf8');
+
+      assert.ok(await waitFor(() => readIfPresent(join(dir, 'stopping')) === null,
+        { timeout: 20_000 }), 'the marker counted under the handshake should defer shutdown');
+      await sleep(1500);
+      assert.ok(alive(server.pid), 'work admitted at the boundary must not be terminated');
+      assert.equal(readIfPresent(join(dir, 'stopped-idle')), null,
+        'a deferred shutdown must not publish an idle-stop result');
+
+      try { watchdog.kill('SIGKILL'); } catch { /* already gone */ }
+      try { server.kill('SIGKILL'); } catch { /* already gone */ }
+    });
+
   test('hands supervision to a replacement server before exiting',
     { timeout: 180_000 }, async (t) => {
       if (!(await canDiscoverPortOwners())) {
@@ -852,9 +937,39 @@ describe('the idle watchdog', () => {
         try { responder.kill('SIGKILL'); } catch { /* already gone */ }
       });
       const allowSignals = join(workDir, 'allow-signals');
+      const failNextClaim = join(workDir, 'fail-next-watchdog-claim');
+      const failedClaim = join(workDir, 'failed-watchdog-claim');
       const preload = join(workDir, 'block-signals.cjs');
       writeFileSync(preload, `
-        const { existsSync } = require('node:fs');
+        const fs = require('node:fs');
+        const childProcess = require('node:child_process');
+        const { syncBuiltinESMExports } = require('node:module');
+        const { existsSync, rmSync, writeFileSync } = fs;
+        const failIdentity = () => {
+          if (!existsSync(process.env.LITERT_TEST_FAIL_NEXT_CLAIM)) return false;
+          rmSync(process.env.LITERT_TEST_FAIL_NEXT_CLAIM, { force: true });
+          writeFileSync(process.env.LITERT_TEST_FAILED_CLAIM, String(process.pid), 'utf8');
+          return true;
+        };
+        const realRead = fs.readFileSync.bind(fs);
+        fs.readFileSync = (path, ...args) => {
+          if (String(path) === '/proc/' + process.pid + '/stat' && failIdentity()) {
+            const error = new Error('staged identity failure');
+            error.code = 'ENOENT';
+            throw error;
+          }
+          return realRead(path, ...args);
+        };
+        const realSpawnSync = childProcess.spawnSync.bind(childProcess);
+        childProcess.spawnSync = (command, args, ...rest) => {
+          const query = Array.isArray(args) ? args.join(' ') : '';
+          if ((String(command).includes('powershell') || String(command) === 'ps')
+              && query.includes(String(process.pid)) && failIdentity()) {
+            return { pid: 0, output: [], stdout: '', stderr: '', status: 1, signal: null };
+          }
+          return realSpawnSync(command, args, ...rest);
+        };
+        syncBuiltinESMExports();
         const realKill = process.kill.bind(process);
         process.kill = (pid, signal) => {
           if (pid === Number(process.env.LITERT_TEST_BLOCK_PID)
@@ -877,6 +992,8 @@ describe('the idle watchdog', () => {
             LITERT_LM_PLUGIN_RUNTIME: runtime,
             LITERT_TEST_BLOCK_PID: String(oldTarget.pid),
             LITERT_TEST_ALLOW_SIGNALS: allowSignals,
+            LITERT_TEST_FAIL_NEXT_CLAIM: failNextClaim,
+            LITERT_TEST_FAILED_CLAIM: failedClaim,
             NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${JSON.stringify(preload)}`.trim(),
           },
         }));
@@ -886,23 +1003,38 @@ describe('the idle watchdog', () => {
       assert.ok(await waitFor(() => readIfPresent(join(dir, 'survivors')) !== null,
         { timeout: 120_000 }), 'the staged refusal should put it in survivor-retry mode');
 
-      replacement = await startBystander();
-      const replacementRecord = formatPidRecord(replacement.pid);
-      writeFileSync(join(dir, 'server.pid'), replacementRecord, 'utf8');
-      writeFileSync(join(dir, 'watchdog-request'), JSON.stringify({
-        server: replacementRecord,
-        host: '127.0.0.1',
-        idleTimeout: 900,
-        requestedAt: Date.now(),
-      }), 'utf8');
+      // Replace the responder with a manually launched LiteRT-LM-shaped server. It
+      // publishes no plugin state, so the client must derive the request identity
+      // from the proven listener rather than from `server.pid`.
+      try { responder.kill('SIGKILL'); } catch { /* already gone */ }
+      assert.ok(await waitFor(() => !pidsOnPort(port).includes(responder.pid),
+        { timeout: 20_000 }), 'the old responder should release the endpoint');
+      replacement = await startFakeLitertLmServer(port, join(workDir, 'replacement'));
+      try { rmSync(join(dir, 'server.pid'), { force: true }); } catch { /* ignore */ }
+
+      const adopted = runClient(
+        ['--list', '--port', String(port), '--idle-timeout', '900'], runtime);
+      assert.equal(adopted.status, 0,
+        `the client should adopt the manual replacement: ${adopted.stderr}`);
+      const request = JSON.parse(readFileSync(join(dir, 'watchdog-request'), 'utf8'));
+      assert.equal(parsePidRecord(request.server)?.pid, replacement.pid,
+        'the durable request must name the proven listener without server.pid');
+
+      // The first successor starts but cannot establish its own identity. Creation
+      // alone must not make the incumbent exit; it has to reclaim and retry.
+      writeFileSync(failNextClaim, 'fail once', 'utf8');
       writeFileSync(allowSignals, 'yes', 'utf8');
 
       assert.ok(await waitFor(() => !alive(oldTarget.pid), { timeout: 60_000 }),
         'the old survivor should become stoppable');
+      assert.ok(await waitFor(() => readIfPresent(failedClaim) !== null,
+        { timeout: 60_000 }), 'the first successor should exercise the failed-claim path');
+      assert.ok(alive(oldWatchdog.pid),
+        'the incumbent must remain responsible after process creation without a claim');
       assert.ok(await waitFor(() => {
         const pid = recordedPid(dir);
         return pid !== null && pid !== oldWatchdog.pid && alive(pid);
-      }, { timeout: 60_000 }),
+      }, { timeout: 90_000 }),
       'a successor under the replacement policy must claim the slot before the gap persists');
       assert.ok(await waitFor(() => oldWatchdog.exitCode !== null, { timeout: 20_000 }),
         'the incumbent should exit after completing the handoff');

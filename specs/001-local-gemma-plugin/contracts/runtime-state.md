@@ -73,14 +73,21 @@ create (`wx`), and a stale record is reclaimed only after re-reading the exact b
 stale, so reclamation cannot delete a live winner.
 
 **A retiring watchdog hands replacement supervision forward.** A client records its desired
-policy and the complete current `server.pid` identity in `watchdog-request` before it decides
-whether a supervisor already exists. This matters when the incumbent is still retrying an older
-failed shutdown: the replacement client's one start attempt sees that live incumbent and backs
-off, then the incumbent observes the replacement on its next poll and exits. Without a durable
-request both events are locally correct and the replacement is nevertheless left unsupervised.
-The incumbent accepts a request only when its complete server identity matches the replacement
-record, releases its slot, and starts the successor under the replacement's policy. A request
-with `idleTimeout: 0` deliberately releases the slot without starting a successor.
+policy and the replacement's complete identity in `watchdog-request` before it decides whether a
+supervisor already exists. Usually that identity comes from `server.pid`; during a failed-shutdown
+handoff the client instead discovers the current proven listener, because a manually launched
+replacement has no pid file and the existing file may still name the old survivor. This matters
+when the incumbent is still retrying: the replacement client's one start attempt sees that live
+incumbent and backs off, then the incumbent observes the replacement on its next poll and exits.
+Without a durable request both events are locally correct and the replacement is nevertheless
+left unsupervised.
+
+The incumbent accepts a request only when its complete identity matches either the replacement
+record or a currently proven listener. It releases its slot and starts the successor under the
+replacement's policy, but does not treat process creation as completed supervision: it waits for
+a live successor to publish `watchdog.pid`. If that claim never appears, the incumbent republishes
+its own exact identity and retries the handoff on the next poll. A request with `idleTimeout: 0`
+deliberately releases the slot without starting a successor.
 
 **Shutdown is judged by the processes signalled, never by the port.** The socket is an endpoint;
 targets are processes. A stranger that holds or takes the port keeps answering, and treating
@@ -373,9 +380,11 @@ watchdog reap a server that had just started.
 every POLL_INTERVAL:
   if idle_timeout == 0:            exit            # disabled
   if server not reachable:         cleanup; exit   # nothing to supervise
-  if in-flight > 0:                continue        # FR-024: never interrupt work
   if now - last-activity < idle_timeout: continue
+  discover and prove termination targets
   write stopping
+  recount in-flight and re-read activity
+  if active below hard ceiling:    remove stopping; continue
   terminate server.pid
   wait for exit
   remove stopping, server.pid
@@ -384,8 +393,10 @@ every POLL_INTERVAL:
 
 **Guarantees**:
 
-1. **Never truncates work** (FR-024) — `in-flight > 0` is checked before the timeout, so a long
-   generation cannot be cut off however long it runs.
+1. **Never truncates admitted work** (FR-024) — the watchdog writes `stopping` before its
+   authoritative in-flight count. A marker published before that handshake is counted; a client
+   publishing after it withdraws the marker when it re-reads the handshake. The watchdog rechecks
+   both activity and live markers under that handshake before signalling.
 2. **Exits when redundant** — an unreachable server means the watchdog has nothing to supervise;
    it cleans up and exits rather than lingering.
 3. **Single supervisor** — a watchdog that finds a live `server.pid` it did not start exits
@@ -395,8 +406,9 @@ every POLL_INTERVAL:
 
 ## Client obligations
 
-1. Increment `in-flight` **before** the request; decrement on **every** exit path, including
-   error and interrupt. A leaked increment pins the server alive.
+1. Publish an `in-flight.d` marker **before** the request, then re-read `stopping`. If it is set,
+   withdraw the marker and wait rather than starting work. Remove the marker on **every** exit
+   path, including error and interrupt.
 2. Write `last-activity` both before and after — a long request must not appear idle throughout.
 3. Before connecting, check `stopping`. If present, wait for exit, clear state, start fresh
    (FR-025). Never connect to a dying server.
