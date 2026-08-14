@@ -118,6 +118,7 @@ const PORT = {
   watchdogHandoff: reservePort(19511),
   watchdogAdmission: reservePort(19521),
   watchdogStartupClaim: reservePort(19531),
+  stopStartFinalization: reservePort(19541),
 };
 
 const spawned = [];
@@ -2253,6 +2254,60 @@ describe('cancelling a start whose descendant has not bound yet', () => {
     `, 'utf8');
   }
 
+  function installControlledHandoffLitertLm(binDir, workDir, port) {
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(workDir, { recursive: true });
+    const exe = join(binDir, process.platform === 'win32' ? 'litert-lm.exe' : 'litert-lm');
+    try { linkSync(process.execPath, exe); } catch { copyFileSync(process.execPath, exe); }
+    if (process.platform !== 'win32') chmodSync(exe, 0o755);
+
+    writeFileSync(join(workDir, 'grandchild.js'), `
+      const { createServer } = require('node:http');
+      const { existsSync, writeFileSync } = require('node:fs');
+      const { join } = require('node:path');
+      writeFileSync(join(__dirname, 'grandchild.pid'), String(process.pid), 'utf8');
+      const timer = setInterval(() => {
+        if (!existsSync(join(__dirname, 'allow-bind'))) return;
+        clearInterval(timer);
+        createServer((req, res) => {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ object: 'list', data: [{ id: 'fake' }] }));
+        }).listen(${port}, '127.0.0.1');
+      }, 25);
+    `, 'utf8');
+
+    writeFileSync(join(workDir, 'serve'), `
+      const { spawn } = require('node:child_process');
+      const { existsSync, writeFileSync } = require('node:fs');
+      const { join } = require('node:path');
+      writeFileSync(join(__dirname, 'launcher.pid'), String(process.pid), 'utf8');
+      spawn(process.execPath, [join(__dirname, 'grandchild.js')],
+        { detached: true, stdio: 'ignore' }).unref();
+      setInterval(() => {
+        if (existsSync(join(__dirname, 'release-launcher'))) process.exit(0);
+      }, 25);
+    `, 'utf8');
+
+    writeFileSync(join(workDir, 'sample-ack.cjs'), `
+      const { existsSync, readFileSync, writeFileSync } = require('node:fs');
+      const { join } = require('node:path');
+      const realSetImmediate = global.setImmediate;
+      if ((process.argv[1] || '').endsWith('litertlm-client.mjs')) {
+        global.setImmediate = (callback, ...args) => realSetImmediate(() => {
+          const child = join(process.cwd(), 'grandchild.pid');
+          const ack = join(process.cwd(), 'sample-ack');
+          if (existsSync(child)) {
+            let count = 0;
+            try { count = Number.parseInt(readFileSync(ack, 'utf8'), 10) || 0; }
+            catch { /* first acknowledgement */ }
+            writeFileSync(ack, String(count + 1), 'utf8');
+          }
+          callback(...args);
+        });
+      }
+    `, 'utf8');
+  }
+
   test('kills a descendant that is alive but has not yet bound', { timeout: 120_000 },
     async (t) => {
       const port = PORT.preBindCancel;
@@ -2363,6 +2418,110 @@ describe('cancelling a start whose descendant has not bound yet', () => {
         'the post-probe tombstone must take cancellation, not startup timeout');
       assert.ok(await waitFor(() => !alive(serverPid)),
         'the server made ready during the stop must not be left running unsupervised');
+    });
+
+  test('a stop claim blocks a start across the finalization window',
+    { timeout: 120_000 }, async (t) => {
+      const port = PORT.stopStartFinalization;
+      const runtime = runtimeDir();
+      const workDir = join(runtime, 'work');
+      const binDir = join(runtime, 'bin');
+      installControlledHandoffLitertLm(binDir, workDir, port);
+
+      const paused = join(workDir, 'stop-opening-snapshot-complete');
+      const releaseStop = join(workDir, 'release-stop');
+      const stopPreload = join(workDir, 'pause-stop-discovery.cjs');
+      writeFileSync(stopPreload, `
+        const fs = require('node:fs');
+        const childProcess = require('node:child_process');
+        const { syncBuiltinESMExports } = require('node:module');
+        if ((process.argv[1] || '').endsWith('litertlm-client.mjs')
+            && process.argv.includes('--stop')) {
+          const realSpawnSync = childProcess.spawnSync.bind(childProcess);
+          childProcess.spawnSync = (command, args, ...rest) => {
+            const result = realSpawnSync(command, args, ...rest);
+            const cmd = String(command).toLowerCase();
+            const query = Array.isArray(args) ? args.join(' ') : '';
+            const boundary = cmd.endsWith('ss')
+              || (cmd.includes('powershell') && query.includes('Get-NetTCPConnection'));
+            if (boundary && !fs.existsSync(${JSON.stringify(paused)})) {
+              fs.writeFileSync(${JSON.stringify(paused)}, 'ready', 'utf8');
+              while (!fs.existsSync(${JSON.stringify(releaseStop)})) {
+                Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+              }
+            }
+            return result;
+          };
+          syncBuiltinESMExports();
+        }
+      `, 'utf8');
+
+      const sep = process.platform === 'win32' ? ';' : ':';
+      const start = reap(spawn(process.execPath,
+        [CLIENT, '--list', '--port', String(port), '--idle-timeout', '0'], {
+          cwd: workDir, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+          env: {
+            ...process.env,
+            LITERT_LM_PLUGIN_RUNTIME: runtime,
+            NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=./sample-ack.cjs`.trim(),
+            PATH: `${binDir}${sep}${process.env.PATH ?? ''}`,
+            Path: `${binDir}${sep}${process.env.Path ?? ''}`,
+          },
+        }));
+      let startStderr = '';
+      start.stderr.setEncoding('utf8');
+      start.stderr.on('data', (d) => { startStderr += d; });
+      const startDone = new Promise((resolve) => start.on('close', resolve));
+
+      const grandchildFile = join(workDir, 'grandchild.pid');
+      assert.ok(await waitFor(() => readIfPresent(grandchildFile) !== null),
+        'the pre-bind descendant should exist');
+      const grandchild = Number.parseInt(readIfPresent(grandchildFile), 10);
+      t.after(async () => {
+        writeFileSync(releaseStop, 'release', 'utf8');
+        if (alive(grandchild)) try { process.kill(grandchild, 'SIGKILL'); } catch { /* gone */ }
+      });
+
+      assert.ok(await waitFor(() => Number.parseInt(
+        readIfPresent(join(workDir, 'sample-ack')) ?? '', 10) >= 2, { timeout: 30_000 }),
+      'the generation must admit the descendant before its launcher exits');
+      writeFileSync(join(workDir, 'release-launcher'), 'release', 'utf8');
+      const launcher = Number.parseInt(readIfPresent(join(workDir, 'launcher.pid')), 10);
+      assert.ok(await waitFor(() => !alive(launcher)),
+        'the opening stop snapshot must see no listener');
+
+      const stop = reap(spawn(process.execPath, [CLIENT, '--stop', '--port', String(port)], {
+        windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+          ...process.env,
+          LITERT_LM_PLUGIN_RUNTIME: runtime,
+          NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${JSON.stringify(stopPreload)}`.trim(),
+        },
+      }));
+      let stopStderr = '';
+      stop.stderr.setEncoding('utf8');
+      stop.stderr.on('data', (d) => { stopStderr += d; });
+      const stopDone = new Promise((resolve) => stop.on('close', resolve));
+
+      assert.ok(await waitFor(() => readIfPresent(paused) !== null, { timeout: 30_000 }),
+        'the stop must pause after capturing its empty opening owner snapshot');
+      writeFileSync(join(workDir, 'allow-bind'), 'bind', 'utf8');
+
+      const startStatus = await startDone;
+      assert.notEqual(startStatus, 0,
+        'the in-progress start must honor the active stop instead of completing');
+      assert.match(startStderr, /cancelled by a --stop/);
+      assert.ok(await waitFor(() => !alive(grandchild), { timeout: 30_000 }),
+        'the admitted descendant must be gone before stop finalizes');
+
+      writeFileSync(releaseStop, 'release', 'utf8');
+      const stopStatus = await stopDone;
+      assert.equal(stopStatus, 0, `the serialized stop should complete: ${stopStderr}`);
+      const dir = stateDir(runtime, port);
+      assert.ok(readIfPresent(join(dir, 'stopped-at')) !== null,
+        'success publishes the tombstone only after the overtaken start withdrew');
+      assert.equal(readIfPresent(join(dir, 'stop-claim')), null,
+        'the admission claim is released after finalization');
     });
 });
 

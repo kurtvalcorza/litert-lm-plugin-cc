@@ -250,6 +250,57 @@ const ownsStartClaim = (port, spawnedAt) => {
   return claim !== null && claim.spawnedAt === spawnedAt && claim.pid === process.pid;
 };
 
+/** A direct `--stop` admission claim. Starts wait on it; they never signal its pid. */
+function readStopClaim(port) {
+  try {
+    const claim = JSON.parse(readState(port, 'stop-claim', 'null'));
+    if (typeof claim?.id !== 'string' || !claim.id
+        || !Number.isFinite(claim.startedAt) || !Number.isInteger(claim.pid)) return null;
+    return claim;
+  } catch {
+    return null;
+  }
+}
+
+function liveStopClaim(port) {
+  const claim = readStopClaim(port);
+  if (claim === null) return null;
+  const writtenAt = stateWrittenAt(port, 'stop-claim');
+  if (writtenAt !== null && writtenAt < BOOT_TIME_MS) return null;
+  // A direct stop is bounded well below five minutes. This also prevents a reused pid
+  // from turning a crashed claim into a permanent admission lock.
+  if (Date.now() - claim.startedAt > 5 * 60 * 1000) return null;
+  return pidAlive(claim.pid) ? claim : null;
+}
+
+const ownsStopClaim = (port, claim) => readStopClaim(port)?.id === claim.id;
+
+async function acquireStopClaim(port) {
+  const deadline = Date.now() + 5 * 60 * 1000;
+  for (;;) {
+    if (liveStopClaim(port) === null) {
+      const claim = { id: randomUUID(), startedAt: Date.now(), pid: process.pid };
+      try {
+        mkdirSync(stateDir(port), { recursive: true });
+        writeFileSync(statePath(port, 'stop-claim'), JSON.stringify(claim), 'utf8');
+      } catch (err) {
+        throw new Error(`could not establish stop admission claim.\n  (underlying error: ${err.message})`);
+      }
+      // Two stops can observe no owner together. Last writer wins; only that writer
+      // may proceed, while the loser loops and waits for the winner to finish.
+      if (ownsStopClaim(port, claim)) return claim;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error('another --stop invocation is still running after 5 minutes; retry later.');
+    }
+    await sleep(250);
+  }
+}
+
+function releaseStopClaim(port, claim) {
+  if (ownsStopClaim(port, claim)) clearState(port, 'stop-claim');
+}
+
 /**
  * Record a process we just spawned, with the token that re-identifies it.
  *
@@ -411,7 +462,6 @@ function reconcileState(port, serverUp) {
 
   if (watchdogGone) clearState(port, 'watchdog.pid');
   if (serverGone) clearState(port, 'server.pid');
-
   // Owner-liveness only — see pruneInFlight for why reachability must not decide.
   pruneInFlight(port);
 
@@ -496,10 +546,11 @@ async function probe(opts, timeoutMs = 2000) {
  * server (FR-025; runtime-state.md "Signals before acting").
  */
 async function awaitNotStopping(opts) {
-  if (readState(opts.port, 'stopping') === null) return false;
+  if (readState(opts.port, 'stopping') === null && liveStopClaim(opts.port) === null) return false;
   process.stderr.write('[litertlm] server is shutting down; waiting for it to exit...\n');
 
-  // Wait on the WATCHDOG, not on a stopwatch.
+  // Wait on the shutdown owner, not on a stopwatch. That owner is either the
+  // watchdog (`stopping`) or a direct command (`stop-claim`).
   //
   // This used to give up after a flat 20s, which is shorter than a shutdown can
   // legitimately take: the watchdog escalates for 30 rounds and re-establishes
@@ -513,8 +564,11 @@ async function awaitNotStopping(opts) {
   // handshake nobody owns at all.
   for (let i = 0; i < 600; i++) {                                   // 5 minutes
     await sleep(500);
-    if (readState(opts.port, 'stopping') === null) return true;
-    if (staleRecord(opts.port, 'watchdog.pid')) break;              // its author is gone
+    const manualStop = liveStopClaim(opts.port);
+    const watchdogStop = readState(opts.port, 'stopping') !== null;
+    if (manualStop === null && !watchdogStop) return true;
+    if (manualStop !== null) continue;                               // direct stop still owns it
+    if (staleRecord(opts.port, 'watchdog.pid')) break;               // watchdog author is gone
   }
 
   // The handshake is released, because nobody is left to release it. `server.pid` is
@@ -829,7 +883,9 @@ async function cancelStartedServer(opts, generation, child, spawnedAt) {
 /** Cancel this start immediately when a concurrent `--stop` has overtaken it. */
 async function cancelIfStopped(opts, generation, child, spawnedAt) {
   const stoppedAt = Number.parseInt(readState(opts.port, 'stopped-at', ''), 10);
-  if (!Number.isFinite(stoppedAt) || stoppedAt < spawnedAt) return;
+  const stopClaim = liveStopClaim(opts.port);
+  const overtakenByActiveStop = stopClaim !== null && stopClaim.startedAt >= spawnedAt;
+  if ((!Number.isFinite(stoppedAt) || stoppedAt < spawnedAt) && !overtakenByActiveStop) return;
 
   const clean = await cancelStartedServer(opts, generation, child, spawnedAt);
   throw new Error(clean
@@ -1115,7 +1171,7 @@ const stillAlive = (targets) => resolveTargets(targets);
  * State is cleared either way. "We could not identify anything to stop" and "there
  * is stale state here" are different facts, and the second is safe to act on alone.
  */
-async function stopProcesses(opts, endpointAnswered = false) {
+async function stopProcesses(opts, endpointAnswered = false, stopClaim = null) {
   const port = opts.port;
 
   const PID_FILES = ['watchdog.pid', 'server.pid'];
@@ -1325,6 +1381,72 @@ async function stopProcesses(opts, endpointAnswered = false) {
     unknown = [...new Set([...unknown, ...watchdogState.unknown])];
   }
 
+  // FINAL ADMISSION BARRIER. The opening socket snapshot cannot authorise the final
+  // verdict: a start that was still pre-bind then can become ready while this stop is
+  // spending seconds on identity and escalation. `stop-claim` prevents starts begun
+  // after us from entering, and an older in-progress start sees it in
+  // `cancelIfStopped`. Wait for that generation to withdraw, then re-discover the
+  // endpoint before clearing shared state or publishing the success tombstone.
+  if (stopClaim !== null) {
+    const startDrainDeadline = Date.now() + opts.startupTimeoutMs + 10_000;
+    while (Date.now() < startDrainDeadline) {
+      const starting = liveStartClaim(port);
+      if (starting === null) break;
+      await sleep(400);
+    }
+
+    const starting = liveStartClaim(port);
+    // Probe before walking the process table. If a server binds between the two,
+    // the later owner walk sees it; the opposite order leaves a final bind gap.
+    const finalEndpointAnswered = Boolean(await probe(opts, 1000));
+    const fresh = classifyPortOwners(opts);
+    const lateRecord = pidRecord(port, 'server.pid');
+    const liveLateRecord = lateRecord !== null
+      && !recordIsStale(lateRecord, stateWrittenAt(port, 'server.pid'));
+    const lateBlindPort = fresh.discoveryFailed
+      && (finalEndpointAnswered || starting !== null || liveLateRecord);
+    const lostClaim = !ownsStopClaim(port, stopClaim);
+    const lateUnknown = [...fresh.unidentified];
+    if (starting !== null) lateUnknown.push(starting.pid);
+    const lateSurvivors = fresh.ours.map((owner) => owner.pid);
+    if (liveLateRecord && !lateSurvivors.includes(lateRecord.pid)) {
+      lateSurvivors.push(lateRecord.pid);
+    }
+
+    if (lostClaim) {
+      return {
+        signalled,
+        strangers: [...new Set([...strangers, ...fresh.strangers])],
+        surviving: remaining,
+        unknown,
+        legacy: [], heldPort: fresh.ours.length > 0,
+        down: false, blindPort: false,
+      };
+    }
+
+    if (lateSurvivors.length || lateUnknown.length || lateBlindPort) {
+      const finalSurvivors = new Set([...remaining, ...unknown,
+        ...lateSurvivors, ...lateUnknown]);
+      const finalTargets = [...targets, ...fresh.ours,
+        ...(liveLateRecord ? [lateRecord] : [])]
+        .filter((target, index, all) => target?.token
+          && all.findIndex((seen) => seen?.pid === target.pid) === index);
+      const stillHere = finalTargets.filter((target) => finalSurvivors.has(target.pid));
+      if (stillHere.length) {
+        writeState(port, 'survivors', stillHere
+          .map((target) => `${target.pid} ${target.token}`).join('\n'));
+      }
+      return {
+        signalled,
+        strangers: [...new Set([...strangers, ...fresh.strangers])],
+        surviving: [...new Set([...remaining, ...lateSurvivors])],
+        unknown: [...new Set([...unknown, ...lateUnknown])],
+        legacy: [], heldPort: fresh.ours.length > 0,
+        down: false, blindPort: lateBlindPort,
+      };
+    }
+  }
+
   clearInFlight(port);
   for (const f of ['in-flight', 'last-activity', 'stopping', 'loaded-model',
     'stopped-idle']) clearState(port, f);
@@ -1395,7 +1517,8 @@ async function stopProcesses(opts, endpointAnswered = false) {
   // running, and the pending watchdog we just invalidated was the thing that would
   // have gone on supervising it. A stop that did not stop anything must not disband
   // the supervision it could not replace.
-  if (remaining.length === 0 && unknown.length === 0) {
+  if (remaining.length === 0 && unknown.length === 0
+      && (stopClaim === null || ownsStopClaim(port, stopClaim))) {
     writeState(port, 'stopped-at', Date.now());
   }
 
@@ -1540,9 +1663,16 @@ async function main() {
   if (opts.action === 'stop') {
     // The probe reports; it does not authorise. Whether anything gets signalled is
     // decided inside stopProcesses, from process identity.
-    const wasUp = await probe(opts);
-    const { signalled, strangers, surviving, unknown, legacy, heldPort, down, blindPort } =
-      await stopProcesses(opts, Boolean(wasUp));
+    const stopClaim = await acquireStopClaim(opts.port);
+    let wasUp;
+    let result;
+    try {
+      wasUp = await probe(opts);
+      result = await stopProcesses(opts, Boolean(wasUp), stopClaim);
+    } finally {
+      releaseStopClaim(opts.port, stopClaim);
+    }
+    const { signalled, strangers, surviving, unknown, legacy, heldPort, down, blindPort } = result;
 
     const noteStrangers = () => {
       if (!strangers.length) return;

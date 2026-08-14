@@ -22,6 +22,7 @@ different ports never share state.
 | `stopped-at` | epoch ms | client, at the end of a SUCCESSFUL `--stop` | watchdog and client, before publishing |
 | `survivors` | `<pid> <start-token>` per line | client and watchdog, when a stop fails | client, on the next stop |
 | `starting` | `<spawned-at-ms> <client-pid>` | client, before spawning a server | a cancelling start, as its generation |
+| `stop-claim` | JSON `{id, startedAt, pid}` | direct `--stop` client | starting and stopping clients |
 | `loaded-model` | model id | client, after a successful request | client |
 
 **Why files, not one document**: single-fact files make every read and write atomic enough
@@ -371,6 +372,15 @@ watchdog could go on supervising a server that command had torn down. Reading th
 overtaking stop costs a start that has to be retried and says so, or a watchdog the next client
 replaces.
 
+**A direct stop owns an admission window, not only a final timestamp.** Before its opening
+reachability or owner snapshot, `--stop` publishes `stop-claim`. A new start waits for that claim
+to disappear, while an already-running start treats a claim at least as new as its own generation
+as cancellation. The stop waits for the overtaken `starting` claim to withdraw and repeats socket
+owner discovery before clearing shared state or publishing `stopped-at`. This closes the interval
+where a start could pass its post-probe tombstone check, become ready during the stop's identity
+work, and return successfully just before the stop wrote its final tombstone. Concurrent stops
+serialize by claim ownership; only the current claim writer may finalize or release it.
+
 **Existence is `kill(pid, 0)`, and `EPERM` means alive.** That call has two distinct failures.
 `ESRCH` is "no such process"; `EPERM` is "it exists and you may not touch it". Flattening them
 reports a running process as dead, which lets every downstream decision conclude a target
@@ -385,6 +395,7 @@ A missing file means:
 | `in-flight` | 0 |
 | `last-activity` | **now** — never "long ago" |
 | `stopping` | not stopping |
+| `stop-claim` | no direct stop is finalising |
 | `server.pid` | unknown; discover or ignore |
 | a pid file with no token | present but unprovable — reclaimable, never signallable |
 
