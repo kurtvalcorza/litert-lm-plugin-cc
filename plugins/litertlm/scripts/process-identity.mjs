@@ -1270,6 +1270,11 @@ export function signallablePid(record, writtenAtMs) {
  */
 export function identifyPortOwners(port, isOurs, host = null, scan = scanPort) {
   const first = scan(port, host);
+  // Each socket walk is an independent observation. A transient identity-query
+  // failure is cached as null so every use inside one walk agrees, but carrying that
+  // miss into the watchdog's next poll would make a live listener unidentified for
+  // the rest of this process's lifetime.
+  forgetIdentities(first.pids);
   identities(first.pids);
   const second = scan(port, host);
   const after = new Set(second.pids);
@@ -1371,4 +1376,9 @@ export const _queries = { runAsync };
 /** Test seam: forget everything looked up so far. */
 export function _resetIdentityCache() {
   cache.clear();
+}
+
+/** Test seam: stage a transient cached answer before an independent owner walk. */
+export function _setCachedIdentity(pid, value) {
+  cache.set(pid, value);
 }
