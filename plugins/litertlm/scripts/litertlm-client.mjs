@@ -123,6 +123,62 @@ function writeStateAtomic(port, name, value) {
 }
 
 /**
+ * Claim a single-slot state file atomically, reclaiming only a provably-abandoned one.
+ *
+ * `wx` gives outright ownership when the slot is empty. When it is taken, reclamation of
+ * a stale claim goes through a RENAME, not a delete-by-name — the same shape the watchdog
+ * uses for its own slot in `claimWatchdogSlot`. `renameSync` is atomic and consumes the
+ * name, so of two reclaimers exactly one moves the stale file aside and the other gets
+ * ENOENT and stands down. A `clearState`-by-name would let both delete it, and a claim
+ * one of them published in the window between the liveness check and the delete would be
+ * clobbered — reintroducing the very double-claim this slot exists to prevent. If the
+ * bytes moved aside are not the ones we judged stale, a live claim was published in the
+ * gap; it is put back and this reclaim withdraws rather than overwrite it.
+ *
+ * `isLive()` reports whether the current occupant is a live claim we must not disturb.
+ * Returns `'won'` (we own the slot now), `'occupied'` (a live claim holds it — wait or
+ * adopt), or `'retry'` (another reclaimer is mid-flight; re-observe). Propagates a
+ * non-EEXIST create failure so the caller can choose how to degrade.
+ */
+function claimStateSlot(port, name, record, isLive) {
+  try {
+    mkdirSync(stateDir(port), { recursive: true });
+    writeFileSync(statePath(port, name), record, { encoding: 'utf8', flag: 'wx' });
+    return 'won';
+  } catch (err) {
+    if (err?.code !== 'EEXIST') throw err;
+  }
+
+  const raw = String(readState(port, name, '')).trim();
+  if (isLive()) return 'occupied';                     // a live claim owns the slot
+
+  const aside = statePath(port, `${name}.reclaim.${process.pid}`);
+  try {
+    renameSync(statePath(port, name), aside);          // atomic: one reclaimer wins
+  } catch {
+    return 'retry';                                    // another reclaimer moved it first
+  }
+  try {
+    if (readFileSync(aside, 'utf8').trim() !== raw) {
+      // The bytes changed between the liveness read and the rename: a claim was published
+      // in the gap and is not the stale record we judged. Put it back and withdraw.
+      try {
+        writeFileSync(statePath(port, name), readFileSync(aside, 'utf8'),
+          { encoding: 'utf8', flag: 'wx' });
+      } catch { /* the name was retaken by a newer claim; leave it in place */ }
+      return 'occupied';
+    }
+    // The name is free and we hold only the stale bytes; take the slot.
+    writeFileSync(statePath(port, name), record, { encoding: 'utf8', flag: 'wx' });
+    return 'won';
+  } catch {
+    return 'retry';                                    // the name was retaken before we wrote
+  } finally {
+    try { rmSync(aside, { force: true }); } catch { /* ignore */ }
+  }
+}
+
+/**
  * In-flight tracking by marker file, not by counter.
  *
  * A single `in-flight` integer requires read-modify-write, which two concurrent
@@ -291,29 +347,29 @@ const ownsStartClaim = (port, spawnedAt) => {
  * `recordSpawnedPid` rejects its generation. `wx` closes that: the loser gets EEXIST and
  * is sent back to adopt the winner instead of launching.
  *
- * A merely stale claim — its pid dead, so `liveStartClaim` returns null — is cleared and
- * the create retried, so an abandoned start can never lock the port out. The generation
- * boundary the rest of the start relies on is unchanged: exactly one live claim exists at
- * a time, and `ownsStartClaim` still identifies its owner by `spawnedAt` and pid.
+ * A merely stale claim — its pid dead, so `liveStartClaim` returns null — is reclaimed
+ * through `claimStateSlot`'s rename-then-verify path, so an abandoned start can never lock
+ * the port out AND two stale-reclaimers can never both delete the name and clobber a live
+ * claim one of them just published. The generation boundary the rest of the start relies
+ * on is unchanged: exactly one live claim exists at a time, and `ownsStartClaim` still
+ * identifies its owner by `spawnedAt` and pid.
  */
 function acquireStartClaim(port, spawnedAt) {
   const record = `${spawnedAt} ${process.pid}`;
   for (let attempt = 0; attempt < 64; attempt += 1) {
+    let outcome;
     try {
-      mkdirSync(stateDir(port), { recursive: true });
-      writeFileSync(statePath(port, 'starting'), record, { encoding: 'utf8', flag: 'wx' });
+      outcome = claimStateSlot(port, 'starting', record, () => liveStartClaim(port) !== null);
+    } catch {
+      // The exclusive create failed for a reason unrelated to contention (a full or
+      // read-only filesystem). Fall back to the previous best-effort write rather than
+      // refuse to start; state is an optimisation, and a lone start still needs to run.
+      writeState(port, 'starting', record);
       return true;
-    } catch (err) {
-      if (err?.code !== 'EEXIST') {
-        // The exclusive create failed for a reason unrelated to contention (a full or
-        // read-only filesystem). Fall back to the previous best-effort write rather than
-        // refuse to start; state is an optimisation, and a lone start still needs to run.
-        writeState(port, 'starting', record);
-        return true;
-      }
-      if (liveStartClaim(port) !== null) return false;   // a live start owns the port
-      clearState(port, 'starting');                      // stale; reclaim and retry
     }
+    if (outcome === 'won') return true;
+    if (outcome === 'occupied') return false;            // a live start owns the port
+    // 'retry': another reclaimer is mid-flight; loop and re-observe.
   }
   return false;   // could not win the slot after repeated stale reclaims; adopt instead
 }
@@ -353,27 +409,21 @@ async function acquireStopClaim(port) {
     // then wrote could both pass `ownsStopClaim`: A writes and verifies before B
     // overwrites, then B writes and verifies too, and both run `stopProcesses`
     // concurrently — the first losing its claim during finalization and reporting a
-    // spurious failure after it had already signalled. `wx` fails if the file exists,
-    // so of two racers exactly one creates it and proceeds; the loser falls through to
-    // the liveness test below.
+    // spurious failure after it had already signalled. `claimStateSlot` gives the slot
+    // to exactly one racer and reclaims a stale claim by rename, never by a delete that
+    // two reclaimers could both perform.
     const claim = { id: randomUUID(), startedAt: Date.now(), pid: process.pid };
+    let outcome;
     try {
-      mkdirSync(stateDir(port), { recursive: true });
-      writeFileSync(statePath(port, 'stop-claim'), JSON.stringify(claim),
-        { encoding: 'utf8', flag: 'wx' });
-      return claim;
+      outcome = claimStateSlot(port, 'stop-claim', JSON.stringify(claim),
+        () => liveStopClaim(port) !== null);
     } catch (err) {
-      if (err?.code !== 'EEXIST') {
-        throw new Error(`could not establish stop admission claim.\n  (underlying error: ${err.message})`);
-      }
+      throw new Error(`could not establish stop admission claim.\n  (underlying error: ${err.message})`);
     }
-    // The slot is taken. A stale claim — dead pid, pre-boot, or expired — is not a
-    // live owner, so clear it and let the next pass reclaim it; a live one belongs to
-    // another `--stop`, so wait and look again. Two racers reclaiming the same stale
-    // file both clear it, one then wins the `wx` create and the other reads its live
-    // claim and waits, so this converges.
-    if (liveStopClaim(port) === null) clearState(port, 'stop-claim');
-    await sleep(250);
+    if (outcome === 'won') return claim;
+    // 'occupied' — another live `--stop` holds admission, so wait and look again;
+    // 'retry' — a reclaimer is mid-flight, re-observe promptly.
+    if (outcome === 'occupied') await sleep(250);
   }
 }
 

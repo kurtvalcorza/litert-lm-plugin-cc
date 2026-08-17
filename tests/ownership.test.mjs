@@ -22,8 +22,8 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import {
-  chmodSync, copyFileSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync,
-  utimesSync, writeFileSync,
+  chmodSync, copyFileSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync,
+  statSync, utimesSync, writeFileSync,
 } from 'node:fs';
 import { after, describe, test } from 'node:test';
 import { tmpdir } from 'node:os';
@@ -121,6 +121,7 @@ const PORT = {
   stopStartFinalization: reservePort(19541),
   startRecordHandoff: reservePort(19551),
   watchdogDisable: reservePort(19561),
+  staleStartClaim: reservePort(19571),
 };
 
 const spawned = [];
@@ -1384,6 +1385,49 @@ describe('recording a process we spawned', () => {
       try { process.kill(leaked, 'SIGKILL'); } catch { /* already gone */ }
       assert.ok(await waitFor(() => !alive(leaked)),
         'the detached fixture must not outlive the test');
+    });
+
+  // The stale-`starting` reclaim must actually let a cold start THROUGH — and clean up
+  // after itself. A crashed start leaves a `starting` claim naming a dead pid; with no
+  // `server.pid` beside it there is no leftover to refuse, so the only thing between this
+  // cold start and the port is the abandoned claim. It has to be reclaimed via the
+  // rename-then-verify path (never a delete-by-name two racers could both perform), the
+  // start has to come up, and no `.reclaim` aside file may be left behind.
+  test('a cold start reclaims a stale starting claim and comes up',
+    { timeout: 90_000 }, async (t) => {
+      const port = PORT.staleStartClaim;
+      const runtime = runtimeDir();
+      const dir = stateDir(runtime, port);
+      const binDir = join(runtime, 'stale-claim-bin');
+      const workDir = join(runtime, 'stale-claim-work');
+      installFakeLitertLm(binDir, workDir, port);
+
+      // A claim naming a pid the OS is not running, written this boot: stale by liveness,
+      // and `reconcileState` leaves `starting` alone, so it survives to `acquireStartClaim`.
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'starting'), `${Date.now()} 999999`, 'utf8');
+
+      const sep = process.platform === 'win32' ? ';' : ':';
+      const r = spawnSync(process.execPath, [CLIENT, '--list', '--port', String(port)], {
+        encoding: 'utf8', windowsHide: true, cwd: workDir,
+        env: {
+          ...process.env,
+          LITERT_LM_PLUGIN_RUNTIME: runtime,
+          PATH: `${binDir}${sep}${process.env.PATH ?? ''}`,
+          Path: `${binDir}${sep}${process.env.Path ?? ''}`,
+        },
+      });
+
+      const grandchild = Number.parseInt(readIfPresent(join(workDir, 'grandchild.pid')) ?? '', 10);
+      t.after(() => {
+        if (alive(grandchild)) try { process.kill(grandchild, 'SIGKILL'); } catch { /* gone */ }
+      });
+
+      assert.equal(r.status, 0,
+        `reclaiming a dead starting claim must let the start proceed: ${r.stderr}`);
+      assert.deepEqual(
+        readdirSync(dir).filter((f) => f.startsWith('starting.reclaim.')), [],
+        'the rename-reclaim must leave no aside file behind');
     });
 });
 
