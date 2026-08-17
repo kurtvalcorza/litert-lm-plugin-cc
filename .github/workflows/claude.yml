@@ -12,11 +12,35 @@ on:
 
 jobs:
   claude:
+    # AUTHORIZATION. claude-code-action already refuses any actor without write
+    # access to this repository (its docs/security.md: "The action can only be
+    # triggered by users with write access," and Apps/bots are blocked), so the
+    # association allowlist below is defence in depth, not the only gate. It earns
+    # its place for two reasons: it fails an unauthorized @claude BEFORE a runner
+    # starts rather than a minute into the action, and it puts the trust boundary
+    # here in the workflow where it is reviewable, not buried in the action.
+    #
+    # Each clause checks the association of the author of THAT event - the
+    # commenter for a comment, the reviewer for a review, the opener for an issue.
+    # Do NOT hoist this into a single author_association lookup: on an
+    # issue_comment event both github.event.issue and github.event.comment exist,
+    # and reading the ISSUE's association would wave through an outsider
+    # commenting @claude on the owner's own issue. OWNER/MEMBER/COLLABORATOR are
+    # the write-bearing associations; CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR and NONE
+    # are not, and are excluded on purpose.
     if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      (github.event_name == 'issue_comment' &&
+        contains(github.event.comment.body, '@claude') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request_review_comment' &&
+        contains(github.event.comment.body, '@claude') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request_review' &&
+        contains(github.event.review.body, '@claude') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.review.author_association)) ||
+      (github.event_name == 'issues' &&
+        (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.issue.author_association))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -26,13 +50,13 @@ jobs:
       actions: read # Required for Claude to read CI results on PRs
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 1
 
       - name: Run Claude Code
         id: claude
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c # v1.0.193
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
