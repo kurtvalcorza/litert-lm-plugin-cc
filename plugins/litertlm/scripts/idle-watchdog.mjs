@@ -13,16 +13,28 @@
  * Started detached by litertlm-client.mjs; never invoked by a user directly.
  */
 
-import { spawnSync } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 // The marker rule lives in one file so this and the client cannot drift apart.
-import { pidAlive, reapMarkers } from './marker-state.mjs';
+import { reapMarkers } from './marker-state.mjs';
+
+// So does the ownership rule. This file used to be the weaker of the two readers:
+// it accepted a recorded `server.pid` on bare liveness, with none of the checks the
+// client applied, so the supervisor could SIGTERM a bystander the client would have
+// refused to touch. One home, one rule, no weaker copy.
+import {
+  formatPidRecord, identifyPortOwners, looksLikeLitertLmServe, parsePidRecord,
+  resolveTargets, signallablePid, startToken,
+} from './process-identity.mjs';
 
 const POLL_INTERVAL_MS = 5000;
+const HANDOFF_CLAIM_TIMEOUT_MS = 15_000;
+const HANDOFF_POLL_MS = 250;
 
 /**
  * Backstop for a leaked in-flight counter (T056). A client that crashes between
@@ -40,12 +52,17 @@ const HARD_CEILING_FLOOR_MS = 30 * 60 * 1000;
 const UNREACHABLE_TOLERANCE = 24;
 
 function parseArgs(argv) {
-  const opts = { port: 9379, idleTimeout: 900, host: '127.0.0.1' };
+  // `spawnedAt` defaults to now: started by hand, nothing can have stopped us before
+  // we existed. The client passes its own value so the comparison covers the whole
+  // window between the spawn and this process getting far enough to read state.
+  const opts = { port: 9379, idleTimeout: 900, host: '127.0.0.1', spawnedAt: Date.now() };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--port') opts.port = Number(argv[++i]);
     else if (argv[i] === '--idle-timeout') opts.idleTimeout = Number(argv[++i]);
     else if (argv[i] === '--host') opts.host = argv[++i];
+    else if (argv[i] === '--spawned-at') opts.spawnedAt = Number(argv[++i]);
   }
+  if (!Number.isFinite(opts.spawnedAt)) opts.spawnedAt = Date.now();
   return opts;
 }
 
@@ -74,6 +91,112 @@ function clearState(name) {
   try { rmSync(statePath(name), { force: true }); } catch { /* ignore */ }
 }
 
+/** When a state file was last written, or null if it is not there. */
+function stateWrittenAt(name) {
+  try { return statSync(statePath(name)).mtimeMs; } catch { return null; }
+}
+
+/**
+ * Take the supervisor slot for this port, or report that someone else holds it.
+ *
+ * `wx` makes the create atomic, so of two watchdogs racing exactly one wins and the
+ * loser stands down rather than overwriting. A merely stale file — a dead pid, or
+ * one written before this boot — is not a claim, and is removed so an abandoned
+ * record cannot lock the port out of supervision forever.
+ *
+ * Reclaiming a stale record is a RENAME, not a re-read followed by an unlink. Those
+ * are two path operations, and two watchdogs could both read the same stale bytes,
+ * both conclude they may delete, and the second one delete the record the first had
+ * just published. `rename` is atomic and consumes the name: exactly one reclaimer
+ * moves the file aside, the other gets ENOENT and stands down. If the bytes we moved
+ * turn out not to be the ones we judged — someone published in the gap — we put them
+ * back with the same exclusive create and withdraw.
+ *
+ * Only a watchdog writes this file, and only before it begins supervising — never
+ * after deciding to stand down. That is what keeps "whoever wrote last is alive"
+ * true, and it is why the client no longer publishes this record on our behalf.
+ */
+/** Has a `--stop` landed since we were spawned? */
+function invalidatedByStop() {
+  // `>=`, not `>`. Both stamps are `Date.now()`, so a stop landing in the same
+  // millisecond as our spawn is ambiguous — and strict ordering resolved it by
+  // ignoring the stop, leaving this process supervising a server that command had
+  // already torn down. Standing down in the ambiguous case costs a watchdog the next
+  // client will replace; the other reading costs the supervision itself.
+  const stoppedAt = Number.parseInt(readState('stopped-at', ''), 10);
+  return Number.isFinite(stoppedAt) && stoppedAt >= opts.spawnedAt;
+}
+
+function publish(record) {
+  // Checked here, immediately before the write, and not only once at start-up.
+  // Everything between those two points is slow — establishing our own identity costs
+  // a process lookup, seconds on Windows — and a `--stop` landing inside it cannot
+  // see us, because we are in no pid file yet. Publishing afterwards would install a
+  // supervisor for a server that stop had already torn down.
+  if (invalidatedByStop()) throw new Error('stopped while claiming');
+  mkdirSync(stateDir(opts.port), { recursive: true });
+  writeFileSync(statePath('watchdog.pid'), record, { encoding: 'utf8', flag: 'wx' });
+}
+
+function claimWatchdogSlot() {
+  const record = formatPidRecord(process.pid);       // one lookup, not one per attempt
+
+  // A record with no token is one nobody can ever act on. `formatPidRecord` falls
+  // back to a bare pid when the identity lookup fails, and `signallablePid` refuses
+  // exactly that — so publishing it would install a supervisor that a later `--stop`
+  // is structurally unable to signal, and the slot would stay occupied by something
+  // unkillable until the pid died on its own. Better to claim nothing: the next
+  // client sees no supervisor and spawns one whose lookup may well succeed.
+  if (parsePidRecord(record)?.token == null) return false;
+  try {
+    publish(record);
+    return true;
+  } catch { /* someone holds the name; it may be stale */ }
+
+  // Reclaim when the incumbent cannot be PROVEN, not merely when it looks dead.
+  //
+  // `recordIsStale` is the cheap hygiene test, and it says "not stale" for a live pid
+  // written after boot — including one that was reused, whose token no longer
+  // matches. `main()` has already paid for the authority-grade answer by this point
+  // and knows the slot is unowned; falling back to the weaker test here threw that
+  // away and stood the new supervisor down in favour of a process that is not a
+  // watchdog at all. Off the interactive path, so the lookup costs nothing extra.
+  const raw = readState('watchdog.pid', '');
+  if (signallablePid(parsePidRecord(raw), stateWrittenAt('watchdog.pid')) !== null) return false;
+
+  const aside = statePath(`watchdog.pid.reclaim.${process.pid}`);
+  try {
+    renameSync(statePath('watchdog.pid'), aside);    // atomic: only one of us wins
+  } catch {
+    return false;                                    // another reclaimer took it
+  }
+
+  try {
+    // What we moved must be what we judged. If it changed, a live watchdog published
+    // in the gap and we are holding its record — hand it back rather than replace it.
+    if (readFileSync(aside, 'utf8').trim() !== raw) {
+      try { publish(readFileSync(aside, 'utf8')); } catch { /* slot already retaken */ }
+      return false;
+    }
+    publish(record);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    try { rmSync(aside, { force: true }); } catch { /* ignore */ }
+  }
+}
+
+/**
+ * The pid recorded under `name`, but only if it is provably still that process.
+ *
+ * Authority-grade at both call sites, and affordable at both: this process is
+ * detached and long-lived, so a lookup at start-up and another when it decides to
+ * terminate something are not on anyone's interactive path.
+ */
+const ownedPid = (name) =>
+  signallablePid(parsePidRecord(readState(name, '')), stateWrittenAt(name));
+
 /**
  * Count live in-flight requests, reaping stale markers on the way.
  *
@@ -97,35 +220,6 @@ async function serverReachable() {
 }
 
 /**
- * Find whatever process is listening on the port (mirrors litertlm-client.mjs).
- *
- * litert-lm is a two-stage launcher: the pid we recorded is often not the process
- * holding the socket, so the recorded pid alone is not enough to stop it.
- */
-function pidsOnPort(port) {
-  const run = (cmd, args) => {
-    try {
-      return spawnSync(cmd, args, { encoding: 'utf8', windowsHide: true }).stdout ?? '';
-    } catch {
-      return '';
-    }
-  };
-
-  const out = process.platform === 'win32'
-    ? run('powershell.exe', ['-NoProfile', '-Command',
-      `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue `
-      + '| Select-Object -ExpandProperty OwningProcess'])
-    : run('lsof', ['-ti', `tcp:${port}`, '-sTCP:LISTEN']);
-
-  const pids = new Set();
-  for (const line of out.split(/\r?\n/)) {
-    const n = Number.parseInt(line.trim(), 10);
-    if (Number.isInteger(n) && n > 0) pids.add(n);
-  }
-  return [...pids];
-}
-
-/**
  * Stop the server this watchdog supervises — and only that one.
  *
  * An earlier version ran `Get-Process litert-lm | Stop-Process -Force` (and `pkill -f
@@ -136,15 +230,67 @@ function pidsOnPort(port) {
  * the GPU backend an abrupt teardown of an unrelated process is not free — repeated
  * re-init is what has been observed to hang the display driver (bugcheck 0x116).
  *
- * Only this port's socket owners, plus the pid we recorded ourselves, are targets.
+ * Narrowing to the port was necessary but not sufficient: the port is a location,
+ * not an identity, and an unrelated OpenAI-compatible server sitting on it was still
+ * a target. Every pid is now proven before it is signalled — socket owners by their
+ * command line, the recorded pid by the start token written when it was spawned.
+ * Anything unprovable is left running.
  */
-function terminateServer() {
-  const targets = new Set(pidsOnPort(opts.port));
-  const recorded = Number.parseInt(readState('server.pid', ''), 10);
-  if (pidAlive(recorded)) targets.add(recorded);
-  for (const pid of targets) {
+function ourTargets() {
+  // Same helper the client uses, so the port is re-asked AFTER identification and a
+  // pid reissued mid-lookup to a litert-lm on another port cannot be adopted as
+  // ours. A listener we could not describe lands in `unidentified` rather than being
+  // filed as a stranger, because "the lookup failed" is not "definitely not mine".
+  //
+  // Scoped to `opts.host` too — the same address this watchdog probes for liveness.
+  // A litert-lm bound to another interface on this port is a different server, and
+  // supervising the socket we talk to means asking about that socket, not the number.
+  const { ours: targets, unidentified, discoveryFailed } =
+    identifyPortOwners(opts.port, looksLikeLitertLmServe, opts.host);
+  const recorded = ownedPid('server.pid');
+  if (recorded !== null && !targets.some((t) => t.pid === recorded)) {
+    targets.push({ pid: recorded, token: startToken(recorded) });
+  }
+  return { targets, unidentified, discoveryFailed };
+}
+
+/**
+ * Signal exactly this set. It takes the snapshot rather than deriving its own, so
+ * the initial SIGTERM and every escalation act on ONE ownership decision. Deriving
+ * it here as well left a window between the two lookups in which a new
+ * `litert-lm serve` could take the port and receive a signal meant for its
+ * predecessor — and on Windows each lookup starts PowerShell, so that window was
+ * not small.
+ */
+function terminateServer(targets) {
+  // Re-prove immediately before signalling, not from the snapshot. `ourTargets`
+  // identifies the socket owner and may then spend a second lookup resolving
+  // `server.pid` — seconds, on Windows — and a target that exits in that gap has its
+  // number reissued. The client path was given this treatment; this one was not, so
+  // the rule had two homes and only one of them was right. Again.
+  for (const pid of stillOurs(targets).alive) {
     try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
   }
+}
+
+/**
+ * Of `targets`, those the OS says are STILL the same process, asked afresh.
+ *
+ * The cache is dropped first: it was filled before we signalled, so it would still
+ * be describing processes that have since exited and would confirm a replacement
+ * that inherited the pid. See the scope note on the cache in process-identity.mjs.
+ *
+ * Deliberately not intersected with the port. Requiring a target to still be
+ * LISTENING made "closed its socket" mean "exited" — and a server that closes the
+ * listener on SIGTERM and then hangs in teardown, still holding accelerator memory,
+ * is exactly the case where this watchdog has to keep pressing rather than write
+ * `stopped-idle` and walk away.
+ */
+function stillOurs(targets) {
+  const { alive, unknown } = resolveTargets(targets);
+  // `unknown` never gets signalled — we cannot prove it is ours — but it also cannot
+  // count as gone, so it is folded in wherever the answer decides "are we finished".
+  return { alive, unknown, outstanding: [...alive, ...unknown] };
 }
 
 function cleanupAndExit(code = 0) {
@@ -152,10 +298,154 @@ function cleanupAndExit(code = 0) {
   // concludes the shutdown is over and immediately asks whether a watchdog is live;
   // if `watchdog.pid` still named this (exiting) process it would decline to start
   // one, and the server it goes on to launch would never be supervised.
-  const mine = Number.parseInt(readState('watchdog.pid', ''), 10);
-  if (mine === process.pid) clearState('watchdog.pid');
+  const mine = parsePidRecord(readState('watchdog.pid', ''));
+  if (mine?.pid === process.pid) clearState('watchdog.pid');
   clearState('stopping');
   process.exit(code);
+}
+
+/**
+ * Relinquish supervision of an old survivor and start the successor requested by
+ * the client that owns the proven replacement server.
+ *
+ * The request is matched by complete identity against either `server.pid` or a
+ * currently proven listener, so an adopted manual server is covered without making
+ * a bare pid authoritative. The slot is released before spawning, but creation is
+ * not success: this process waits for a live successor claim, and reclaims its own
+ * exact record for another attempt if the child fails before publishing one.
+ */
+function requestedReplacement(request, chased, host) {
+  if (request?.discoveryPending === true) {
+    // Only a request written after survivor mode began may ask the incumbent to keep
+    // that mode alive. Otherwise a stale tokenless request could pin an unrelated old
+    // watchdog indefinitely.
+    const survivorsAt = stateWrittenAt('survivors');
+    if (!Number.isFinite(request.requestedAt) || survivorsAt === null
+        || request.requestedAt < survivorsAt || request.server !== null) {
+      return { status: 'none', replacement: null };
+    }
+
+    const discovered = identifyPortOwners(opts.port, looksLikeLitertLmServe, host);
+    if (discovered.discoveryFailed || discovered.unidentified.length) {
+      return { status: 'pending', replacement: null };
+    }
+    const replacement = discovered.ours.find((rec) => rec.token
+      && !chased.some((old) => old.pid === rec.pid && old.token === rec.token));
+    return { status: replacement ? 'ready' : 'none', replacement: replacement ?? null };
+  }
+
+  const wanted = parsePidRecord(request?.server);
+  if (wanted?.token == null) return { status: 'none', replacement: null };
+  const isChased = chased.some((rec) => rec.pid === wanted.pid && rec.token === wanted.token);
+  if (isChased) return { status: 'none', replacement: null };
+
+  const candidates = [];
+  const recorded = parsePidRecord(readState('server.pid', ''));
+  if (recorded?.token) candidates.push(recorded);
+  const discovered = identifyPortOwners(opts.port, looksLikeLitertLmServe, host);
+  if (!discovered.discoveryFailed && !discovered.unidentified.length) {
+    candidates.push(...discovered.ours.filter((rec) => rec.token));
+  }
+  const replacement = candidates.find((rec) => rec.pid === wanted.pid && rec.token === wanted.token);
+  return { status: replacement ? 'ready' : 'none', replacement: replacement ?? null };
+}
+
+async function successorClaimed(childPid) {
+  const deadline = Date.now() + HANDOFF_CLAIM_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const record = parsePidRecord(readState('watchdog.pid', ''));
+    if (record?.pid !== process.pid
+        && signallablePid(record, stateWrittenAt('watchdog.pid')) !== null) {
+      return record.pid === childPid;
+    }
+    await sleep(HANDOFF_POLL_MS);
+  }
+  return false;
+}
+
+function restoreIncumbent(record) {
+  try {
+    publish(record);
+    return 'self';
+  } catch { /* a claimant may have published while the successor was starting */ }
+
+  const owner = ownedPid('watchdog.pid');
+  if (owner !== null && owner !== process.pid) return 'successor';
+
+  // An unprovable claimant must not strand this incumbent outside the slot. Reuse
+  // the authority-grade reclaim path; our own identity is already cached from the
+  // initial claim, so this does not depend on a fresh lookup succeeding.
+  if (claimWatchdogSlot()) return 'self';
+  const reclaimedBy = ownedPid('watchdog.pid');
+  return reclaimedBy !== null && reclaimedBy !== process.pid ? 'successor' : 'failed';
+}
+
+async function handoffReplacement(chased) {
+  let request = null;
+  try { request = JSON.parse(readState('watchdog-request', 'null')); } catch { return 'none'; }
+  if (!Number.isFinite(request?.idleTimeout) || request.idleTimeout < 0
+      || typeof request.host !== 'string' || !request.host) return 'none';
+  const selection = requestedReplacement(request, chased, request.host);
+  if (selection.status === 'pending') return 'retry';
+  const replacement = selection.replacement;
+  if (replacement === null) return 'none';
+
+  const mineRaw = readState('watchdog.pid', '');
+  const mine = parsePidRecord(mineRaw);
+  if (mine?.pid !== process.pid || mine.token == null) return 'retry';
+  clearState('watchdog.pid');
+  clearState('stopping');
+
+  if (request.idleTimeout === 0) {
+    clearState('watchdog-request');
+    return 'complete';
+  }
+
+  let child = null;
+  try {
+    child = spawn(process.execPath,
+      [process.argv[1], '--port', String(opts.port),
+        '--idle-timeout', String(request.idleTimeout), '--host', request.host,
+        '--spawned-at', String(request.requestedAt ?? Date.now())],
+      { detached: true, stdio: 'ignore', windowsHide: true,
+        env: { ...process.env, LITERT_LM_PLUGIN_INSTANCE: randomUUID() } });
+    child.unref();
+  } catch { /* restore below */ }
+
+  if (child !== null && await successorClaimed(child.pid)) {
+    clearState('watchdog-request');
+    return 'complete';
+  }
+
+  // Process creation is not a handoff. If the child failed before publishing a
+  // live identity, take the slot back and retry on the next survivor poll.
+  for (;;) {
+    const restored = restoreIncumbent(mineRaw);
+    if (restored === 'self') return 'retry';
+    if (restored === 'successor') {
+      clearState('watchdog-request');
+      return 'complete';
+    }
+    if (invalidatedByStop()) return 'complete';
+    await sleep(HANDOFF_POLL_MS);
+  }
+}
+
+/**
+ * A warm client asked to disable idle shutdown on the server we are supervising.
+ *
+ * `--idle-timeout 0` on an already-warm server makes the client write a disabled
+ * `watchdog-request` and return WITHOUT spawning a replacement — it sees our live
+ * `watchdog.pid` and trusts the incumbent to relinquish. Only the survivor-handoff path
+ * used to read that file, so on an otherwise-healthy server the disable was ignored and
+ * we could still idle-stop it, contradicting the explicit flag. A request written before
+ * we began supervising (`requestedAt <= opts.spawnedAt`) is not ours to act on.
+ */
+function retirementRequested() {
+  let request = null;
+  try { request = JSON.parse(readState('watchdog-request', 'null')); } catch { return false; }
+  return request?.idleTimeout === 0
+    && Number.isFinite(request.requestedAt) && request.requestedAt > opts.spawnedAt;
 }
 
 async function main() {
@@ -164,10 +454,39 @@ async function main() {
   }
 
   // Single-supervisor rule (T055): never compete with a live watchdog on this port.
-  const existing = Number.parseInt(readState('watchdog.pid', ''), 10);
-  if (pidAlive(existing) && existing !== process.pid) process.exit(0);
+  // Proven identity, not bare liveness — a reused pid here used to make a fresh
+  // watchdog stand down in favour of a supervisor that does not exist, and the
+  // server it was meant to supervise would then hold accelerator memory until
+  // someone ran --stop by hand.
+  const existing = ownedPid('watchdog.pid');
+  if (existing !== null && existing !== process.pid) process.exit(0);
 
-  writeState('watchdog.pid', process.pid);
+  // A stop that happened after we were spawned invalidates us before we start.
+  //
+  // We are spawned detached, and publishing our pid costs an identity lookup —
+  // seconds on Windows. A `--stop` landing inside that window cannot see us: we are
+  // in no pid file yet, so it cannot include us in its target set, and we would then
+  // publish a supervisor record over the state it had just cleared.
+  //
+  // The test is a timestamp, NOT a reachability probe. Asking whether the server
+  // answers would reintroduce the confusion this whole file is built to avoid — a
+  // model switch makes it legitimately unreachable for tens of seconds, which is why
+  // UNREACHABLE_TOLERANCE exists, and a watchdog that stood down for that would leave
+  // the server it was spawned for unsupervised. `stopped-at` is durable and needs no
+  // clearing: an older stop is simply earlier than the next watchdog's spawn.
+  if (invalidatedByStop()) process.exit(0);
+  if (!claimWatchdogSlot()) process.exit(0);         // someone beat us to it
+
+  // And once more after publishing, because the claim itself is not instantaneous.
+  // A stop that landed while we were writing has already cleared the state it meant
+  // to clear, so withdraw rather than stand as supervisor over nothing.
+  if (invalidatedByStop()) cleanupAndExit(0);
+
+  // Targets from a shutdown that did not finish. Held across polls because they are
+  // the one case where "unreachable" must not mean "gone": we know they are alive
+  // precisely because we failed to kill them, and a survivor that closed its listener
+  // will fail every probe from here on.
+  let pendingSurvivors = [];
 
   const idleMs = opts.idleTimeout * 1000;
   const ceilingMs = Math.max(idleMs * HARD_CEILING_MULTIPLIER, HARD_CEILING_FLOOR_MS);
@@ -177,8 +496,143 @@ async function main() {
     await sleep(POLL_INTERVAL_MS);
 
     // Another watchdog took over — stand down rather than double-terminate.
-    const owner = Number.parseInt(readState('watchdog.pid', ''), 10);
-    if (owner !== process.pid) process.exit(0);
+    const owner = parsePidRecord(readState('watchdog.pid', ''));
+    if (owner?.pid !== process.pid) process.exit(0);
+
+    // A stop can also land AFTER we published, and the two checks at start-up cannot
+    // see it. The tombstone is written last, at the very end of a successful `--stop`,
+    // so a watchdog that published anywhere inside that command passed both of its
+    // checks against a `stopped-at` that did not exist yet. It then supervised a
+    // server the stop had already torn down — and, worse, stayed the registered
+    // supervisor, so the next client saw a live `watchdog.pid`, declined to spawn one,
+    // and its server was adopted by this process under the previous invocation's
+    // idle-timeout. The predicate is the same one used at start-up and needs no
+    // clearing: a watchdog spawned after the stop has a later `spawnedAt` and is
+    // untouched by it.
+    if (invalidatedByStop()) cleanupAndExit(0);
+
+    // Honour a policy change published by a warm client. A disable request means "keep
+    // this server alive"; stand down so nothing idle-stops it, leaving the server up.
+    // Guarded to the non-survivor path — a shutdown already in progress consumes the
+    // request through `handoffReplacement`, which handles the disable case itself.
+    if (!pendingSurvivors.length && retirementRequested()) {
+      clearState('watchdog-request');
+      cleanupAndExit(0);
+    }
+
+    // AN UNFINISHED SHUTDOWN OUTRANKS THE REACHABILITY GATE BELOW.
+    //
+    // Retrying by falling through was wrong in a way that undid the fix it was part
+    // of: the survivor has closed its listener, so every probe from here fails, and
+    // after UNREACHABLE_TOLERANCE the gate below concludes the engine died, clears
+    // `server.pid`, and exits successfully — destroying the identity of a process we
+    // KNOW is alive, because we just failed to kill it, and abandoning the
+    // supervision in the same breath. "Unreachable means gone" is a reasonable
+    // default and a catastrophic one here.
+    //
+    // So the survivors are chased directly, on their identities rather than on the
+    // socket, until they are provably gone.
+    if (pendingSurvivors.length) {
+      // A RETRY IS STILL AN IDLE SHUTDOWN, and FR-024 does not lapse because the
+      // first attempt failed. `stopping` was released when it did, so a client may
+      // legitimately have connected to the surviving server and taken a marker since
+      // — and this branch reaches SIGKILL directly. Killing mid-generation because an
+      // earlier attempt was unlucky is exactly the guarantee the marker files exist
+      // to provide, so the same check the normal path makes is made here.
+      // CLAIM THE HANDSHAKE BEFORE COUNTING, and hold it through the signal.
+      // Counting first was a check with nothing behind it: the earlier failure
+      // cleared `stopping`, so a client could take a marker between the count and the
+      // kill and have its request truncated anyway — and the identity lookup sitting
+      // between them makes that window seconds wide on Windows. `stopping` is what
+      // stops a new client entering at all, which is the only thing that makes the
+      // count mean something by the time it is acted on.
+      writeState('stopping', Date.now());
+      // THE SAME RULE AS THE NORMAL IDLE PATH, not a second one written alongside it.
+      //
+      // Two attempts at this branch each got half of it. Yielding to live work
+      // without re-applying the configured delay turned a 900-second timeout into the
+      // poll interval; then re-applying the delay while REFRESHING `last-activity` on
+      // every poll broke the other half — `idleFor` could never grow, so the hard
+      // ceiling never fired, and a leaked marker whose owner pid had been reused
+      // pinned the survivor and its accelerator memory indefinitely. That ceiling
+      // exists for exactly that case (T056), and this branch had quietly opted out of
+      // it.
+      //
+      // The activity stamp belongs to the client, which writes it around each
+      // request; a supervisor refreshing it is a supervisor manufacturing the evidence
+      // it then reads. So the timestamp is left alone and the normal path's own test
+      // is applied verbatim.
+      const busy = countInFlight();
+      const since = Number.parseInt(readState('last-activity', String(Date.now())), 10)
+        || Date.now();
+      const idleFor = Date.now() - since;
+
+      if ((busy > 0 && idleFor < ceilingMs) || idleFor < idleMs) {
+        clearState('stopping');        // let live work through, or wait out the delay
+        continue;
+      }
+
+      const left = stillOurs(pendingSurvivors);
+      if (!left.outstanding.length) {
+        const chased = pendingSurvivors;
+        // A REPLACEMENT START MAY OWN THIS PORT BY NOW, and its state is not ours to
+        // tidy. `stopping` was released when the shutdown failed, so a client could
+        // prove the old records stale, start server B, and publish B's `server.pid` —
+        // while declining to spawn a supervisor, because this watchdog still holds the
+        // slot. Clearing unconditionally here deleted B's identity and then exited,
+        // leaving B running with neither a record nor a watchdog.
+        // THE WHOLE IDENTITY, not the number. If the survivor's pid was reused by
+        // replacement server B, a numeric comparison finds it in `chased` and clears
+        // B's record anyway — the same pid-reuse mistake this file is built around,
+        // arriving through the guard meant to prevent a neighbouring one.
+        const rec = parsePidRecord(readState('server.pid', ''));
+        const isOurs = rec !== null
+          && chased.some((t) => t.pid === rec.pid && t.token === rec.token);
+        const handoff = await handoffReplacement(chased);
+        if (handoff === 'complete') cleanupAndExit(0);
+        if (handoff === 'retry') {
+          // The successor did not prove that it owns the slot. The incumbent has
+          // reclaimed it, so keep the old survivor identities as the retry-state
+          // trigger even though they are now gone; next poll re-validates the fresh
+          // request and tries the handoff again without applying the old policy to B.
+          clearState('stopping');
+          continue;
+        }
+
+        pendingSurvivors = [];
+        clearState('survivors');
+        if (rec !== null && !isOurs) {
+          // B's, not ours — and supervising it is not ours to do either.
+          //
+          // Carrying on looked like the careful option and smuggled in a policy this
+          // process has no right to apply: the idle timeout is per START, and B chose
+          // its own. `--idle-timeout 0` disables shutdown entirely, which is why B
+          // spawned no watchdog of its own — so continuing here would idle-stop a
+          // server the user explicitly said never to stop, using a superseded
+          // invocation's settings.
+          //
+          // B's client has already made its only watchdog-start attempt. It left a
+          // durable request before declining to compete with this live supervisor,
+          // so hand the slot to a successor under B's policy instead of assuming a
+          // future request will repair the gap. If the request is absent, stale, or
+          // does not name B's complete identity, stand down without guessing.
+          cleanupAndExit(0);
+        }
+
+        clearState('server.pid');
+        clearState('loaded-model');
+        writeState('stopped-idle', Date.now());     // it did stop, just not first time
+        cleanupAndExit(0);
+      }
+      for (const pid of left.alive) {
+        try { process.kill(pid, process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL'); }
+        catch { /* ignore */ }
+      }
+      // Released between rounds so clients are not blocked for the whole retry
+      // schedule; the next round re-claims it before it counts again.
+      clearState('stopping');
+      continue;
+    }
 
     // A model switch tears the engine down and re-initialises it, so the server is
     // legitimately unreachable for tens of seconds *while a request is in flight*.
@@ -197,31 +651,133 @@ async function main() {
     }
     missedProbes = 0;
 
-    const inFlight = countInFlight();
     const lastActivity = Number.parseInt(readState('last-activity', String(Date.now())), 10)
       || Date.now();
     const idleFor = Date.now() - lastActivity;
 
     if (idleFor < idleMs) continue;
 
-    // FR-024: a request in flight is never interrupted, however long it runs —
-    // unless activity has been silent past the hard ceiling, which means the
-    // counter leaked rather than work being genuinely in progress (T056).
-    if (inFlight > 0 && idleFor < ceilingMs) continue;
+    // Nothing here is provably ours. That happens when the server on this port was
+    // adopted and cannot be identified as a litert-lm — another OpenAI-compatible
+    // process, say. Stand down without touching it, and WITHOUT the shutdown
+    // bookkeeping: clearing state and writing `stopped-idle` would record that we
+    // released accelerator memory we never held, and the next client would be told a
+    // server had been idle-stopped when it is still running and still unsupervised.
+    const { targets, unidentified, discoveryFailed } = ourTargets();
+
+    // The socket query could not RUN. Ordered ahead of the stand-down below because
+    // that branch reads an empty target set as "nothing here is ours" — and a query
+    // that never ran produces exactly that set. This point is only reached once the
+    // server has answered a probe, so something IS on the port; standing down on a
+    // failed lookup would abandon a live server on the strength of a question we
+    // never managed to ask. Wait and ask again.
+    if (discoveryFailed) continue;
+
+    // Nothing provable AND nothing unprovable: genuinely not ours, stand down clean.
+    if (!targets.length && !unidentified.length) cleanupAndExit(0);
+
+    // ANY unidentified listener defers the whole attempt, not just the case where
+    // nothing else was found. Proceeding with a partial picture meant signalling the
+    // proven targets, folding the unidentified one into the failure verdict, and then
+    // exiting — which clears `watchdog.pid` and leaves that listener alive with no
+    // supervisor at all. The previous guard only covered an empty target set, so the
+    // mixed case walked straight past it. Waiting one poll costs a cycle; leaving
+    // costs the thing this process exists for.
+    if (unidentified.length) continue;
 
     // Signal before acting, so a client cannot connect to a dying server (FR-025).
+    // Claim the handshake BEFORE counting. A marker published before this write is
+    // included below; one published after it is withdrawn by the client when that
+    // client re-reads `stopping`. The ownership walk above may take seconds, but it
+    // no longer sits between an unprotected count and the signal.
     writeState('stopping', Date.now());
-    terminateServer();
 
+    const confirmedInFlight = countInFlight();
+    const confirmedActivity = Number.parseInt(
+      readState('last-activity', String(Date.now())), 10) || Date.now();
+    const confirmedIdleFor = Date.now() - confirmedActivity;
+
+    // FR-024: a request in flight is never interrupted, however long it runs —
+    // unless activity has been silent past the hard ceiling, which means the
+    // marker leaked rather than work being genuinely in progress (T056).
+    if (confirmedIdleFor < idleMs
+        || (confirmedInFlight > 0 && confirmedIdleFor < ceilingMs)) {
+      clearState('stopping');
+      continue;
+    }
+
+    terminateServer(targets);
+
+    // Wait on OUR targets, not on the endpoint: something else may hold or take the
+    // port, and its answering says nothing about whether our server is gone.
     for (let i = 0; i < 30; i++) {
       await sleep(500);
-      if (!(await serverReachable())) break;
-      // Still answering: escalate on whatever still holds the socket. SIGTERM can be
-      // ignored, and a server left alive here holds accelerator memory indefinitely.
-      for (const pid of pidsOnPort(opts.port)) {
+      const surviving = stillOurs(targets);
+      if (!surviving.outstanding.length) break;
+      // Still running: escalate, but only on owners proven above AND re-proven now —
+      // a process that inherited the pid we just killed must not inherit the SIGKILL
+      // along with it, which a numeric check would wave straight through.
+      for (const pid of surviving.alive) {
         try { process.kill(pid, process.platform === 'win32' ? 'SIGTERM' : 'SIGKILL'); }
         catch { /* ignore */ }
       }
+    }
+
+    // The verdict, taken after the last signal rather than before it. The loop
+    // refreshes at the top, so a target that dies in response to the final iteration
+    // would still be listed when it ends.
+    await sleep(200);
+    const left = stillOurs(targets);
+    left.outstanding = [...new Set([...left.outstanding, ...unidentified])];
+    if (left.outstanding.length) {
+      // Escalation did not finish the job — a process wedged in uninterruptible I/O,
+      // one the OS refused to signal, or one we could not identify at all. Publish
+      // NOTHING: `stopped-idle` tells the next client that accelerator memory was
+      // released, and clearing `server.pid` destroys the identity a later attempt
+      // would need to find a target that is still alive but no longer listening.
+      //
+      // Persist that identity if nothing already records it. The survivor is often
+      // the listener grandchild discovered from the port, which no pid file names —
+      // the client learned to write it, and a watchdog that only exits leaves the
+      // next attempt with nothing to find. The rule has to be symmetric or the
+      // recovery path depends on which component happened to fail.
+      // Only into a slot nothing is already using. If the recorded launcher is itself
+      // among the survivors, `server.pid` is already carrying an identity worth
+      // keeping, and replacing it with the listener's would trade one survivor for
+      // another rather than preserve both. The client makes the same choice; there is
+      // one slot, so the second survivor is left to the next attempt's discovery.
+      const recorded = parsePidRecord(readState('server.pid', ''))?.pid ?? null;
+      const recordedSurvived = recorded !== null && left.outstanding.includes(recorded);
+      const orphan = targets.find((t) => left.outstanding.includes(t.pid)
+        && t.pid !== recorded && t.token);
+      if (orphan !== undefined && !recordedSurvived) {
+        writeState('server.pid', `${orphan.pid} ${orphan.token}`);
+      }
+
+      // And every survivor into the same list the client keeps, not just the one the
+      // single `server.pid` slot could hold. Writing only that slot meant a second
+      // survivor — a launcher and a listener both refusing to die — was recorded
+      // nowhere at all, and the next `--stop` could rediscover only one of them.
+      const outstanding = targets.filter((t) => left.outstanding.includes(t.pid) && t.token);
+      if (outstanding.length) {
+        writeState('survivors', outstanding.map((t) => `${t.pid} ${t.token}`).join('\n'));
+      }
+
+      // KEEP SUPERVISING. This used to stand down, on the reasoning that the next
+      // client would reconcile and start a fresh supervisor — but this is the IDLE
+      // path, and nothing guarantees a next client. A server that refused the signal,
+      // or that hit a transient identity failure, would then sit resident with its
+      // accelerator memory held and no watchdog at all, which is the exact outcome
+      // this process exists to prevent. Relinquishing the slot is only safe when
+      // someone is known to be coming.
+      //
+      // The handshake is released so clients are not blocked by a shutdown that did
+      // not complete, and the loop retries: one poll interval plus a full escalation
+      // is roughly twenty seconds between attempts, which is a retry rather than a
+      // spin.
+      clearState('stopping');
+      pendingSurvivors = targets.filter((t) => left.outstanding.includes(t.pid) && t.token);
+      continue;
     }
 
     clearState('server.pid');

@@ -275,6 +275,25 @@ not a document to retrofit;
 [`quickstart.md`](specs/001-local-gemma-plugin/quickstart.md) contains runnable verification
 scenarios for every claim above.
 
+### Tests
+
+```bash
+node --test "tests/*.test.mjs"
+```
+
+No dependencies and no test framework — `node:test` is standard library, like everything else
+here. The suite spawns real processes, binds real sockets and sends real signals, because the
+defects it guards against lived in the gap between what the code believed about a pid and what
+the operating system knew; a mock would have agreed with the bug. It uses spare ports and a
+scratch state directory, so it is safe to run while a server is up on the default port.
+
+Finding who owns a socket needs `lsof` or `ss` outside Windows. Minimal Linux images often ship
+neither, and the plugin cannot identify a port's owner without one. When the endpoint answers or
+relevant runtime state remains, `--stop` therefore fails closed without signalling or clearing
+anything; install `lsof` or `iproute2` (`ss`) and retry. Only a silent port with no relevant state
+can be cleared without owner discovery. Socket-owner tests skip on hosts where the required utility
+is absent rather than reporting a code failure for a missing system prerequisite.
+
 ## Licence
 
 [Apache-2.0](LICENSE). See [NOTICE](NOTICE) for upstream attribution.

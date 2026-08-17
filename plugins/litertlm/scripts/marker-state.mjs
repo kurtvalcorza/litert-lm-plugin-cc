@@ -20,7 +20,7 @@
  * Node standard library only (constitution, Principle III).
  */
 
-import { readdirSync, rmSync } from 'node:fs';
+import { readdirSync, readFileSync, rmSync } from 'node:fs';
 import { uptime } from 'node:os';
 import { join } from 'node:path';
 
@@ -39,9 +39,51 @@ import { join } from 'node:path';
  */
 export const BOOT_TIME_MS = Date.now() - uptime() * 1000;
 
+/**
+ * Does this pid exist? Not: may we signal it.
+ *
+ * `kill(pid, 0)` performs the permission check without delivering anything, and it
+ * has two distinct failures that this used to flatten into one:
+ *
+ *   ESRCH — no such process. Dead.
+ *   EPERM — the process EXISTS; we are not allowed to touch it.
+ *
+ * Treating EPERM as dead is how a process that is plainly running gets classified as
+ * gone: everything downstream then concludes a target exited, clears its state and
+ * reports success. Verified on this host — pid 4, the Windows System process,
+ * answers EPERM and was reported dead.
+ *
+ * Existence and permission are different questions, and only the first one is being
+ * asked here. Whether we may signal something is settled by identity, not by this.
+ */
 export function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; } catch { return false; }
+  try {
+    process.kill(pid, 0);
+  } catch (err) {
+    if (err.code !== 'EPERM') return false;
+  }
+  return !isZombie(pid);
+}
+
+/**
+ * Has this pid exited but not yet been reaped? Linux only; false elsewhere.
+ *
+ * Folded into `pidAlive` rather than bolted onto individual callers, because a
+ * zombie is dead by every meaning this codebase has for the word: it holds no
+ * memory, owns no socket, and answers no request. Checking it in only some places
+ * is how a terminated watchdog kept its `watchdog.pid` forever under a container
+ * PID 1 that does not reap — the shutdown path knew it was gone, the hygiene path
+ * did not, and no replacement supervisor was ever started.
+ */
+export function isZombie(pid) {
+  if (process.platform !== 'linux') return false;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[0] === 'Z';
+  } catch {
+    return false;
+  }
 }
 
 /**

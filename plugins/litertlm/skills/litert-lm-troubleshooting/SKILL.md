@@ -332,10 +332,51 @@ transparently. To reclaim immediately:
 node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-client.mjs" --stop
 ```
 
-If memory is still held afterwards, something else owns the port — `--stop` verifies the port
-actually closed and will say so rather than reporting false success.
+`--stop` verifies that the processes it identified as this plugin's actually exited, and names
+any that did not. It does **not** verify the port closed: a server can drop its socket and stay
+alive in teardown, still holding memory, so port silence would be the wrong thing to check. If
+it reports success and memory is still held, the holder is not one of this plugin's processes.
+
+`--stop` signals only processes it can prove are this plugin's: one it recorded whose identity
+still matches, or a listener on the port whose command line is a `litert-lm serve`. If it prints
+`is listening on port … and was left running`, the port belongs to something else — another
+model server, or a previous server started under a different name. That message is the answer,
+not a failure: stop that process yourself, or run on a different `--port`.
+
+The same rule now applies to a `server.pid` left over from a crash. A pid whose owner has exited
+can be handed to an unrelated process, so a recorded pid alone no longer authorises anything.
+If `--stop` says nothing was running while a server clearly is, check that the listener really
+is `litert-lm` — `Get-NetTCPConnection -LocalPort 9379 -State Listen` on Windows, `lsof -i :9379`
+elsewhere.
+
+Check the **local address** in that output as well, not just the port. Ownership is scoped to
+the address this plugin talks to (`127.0.0.1` unless you changed it), because two servers can
+hold one port on different interfaces at once. A `litert-lm serve --host 0.0.0.0` started by
+hand is covered — a wildcard bind does answer loopback — but one bound to a specific LAN address
+is a different server and is deliberately left alone.
 
 `--idle-timeout 0` disables automatic shutdown entirely.
+
+### "another invocation is already starting the server"
+
+Two calls arrived while the server was cold. Starting takes tens of seconds, so the second one
+waits for the first rather than launching a competing server; the message is progress, not an
+error, and the request proceeds normally once the socket answers.
+
+If it instead reports that a start **has not become reachable** within the startup timeout, the
+first start is wedged rather than slow. Nothing has been changed, so retrying is safe. Run
+`--stop` only if retrying keeps landing on the same message: during a healthy start that is the
+one command that will break it.
+
+### "pid … is left over from a shutdown that did not finish"
+
+One of this plugin's processes is still alive but no longer listening — usually a server that
+closed its socket and hung in teardown while still holding accelerator memory. Starting a second
+server beside it would lose track of the first, so the start refuses and names the pid.
+
+Run `--stop`, which can find it by the recorded identity even though it is off the port, then
+retry. This is distinct from the message above: that one means a start is *in progress*, this
+one means a shutdown *ended badly*.
 
 ---
 

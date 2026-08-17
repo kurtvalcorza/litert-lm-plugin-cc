@@ -1,0 +1,53 @@
+name: Tests
+
+# The ownership tests spawn real processes, bind real sockets and send real
+# signals, and the defects they guard against are platform-specific by nature: a
+# pid is a different kind of object on each OS, and identity is read from a
+# different place on each one (Win32_Process, /proc, ps). Four of the defects
+# found reviewing this suite's own subject were POSIX-only, and every one of them
+# was invisible to a green Windows run — so the matrix is the test, not a bonus.
+#
+# Nothing here needs litert-lm, a GPU or the network: the fake launcher the tests
+# use is a copy of node.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Never stop the other legs early. A macOS-only failure is the single most
+      # useful signal this workflow can produce, and cancelling the run that
+      # proves the others still pass would throw away the comparison.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Record what identity will actually be read from
+        shell: bash
+        run: |
+          echo "os      : $(uname -a 2>/dev/null || ver)"
+          echo "node    : $(node --version)"
+          for t in lsof ss ps; do
+            printf '%-5s -> %s\n' "$t" "$(command -v "$t" || echo MISSING)"
+          done
+          # macOS has no /proc, so `ps -o lstart=` is the only identity source
+          # there — this line is how a reader tells which path the run exercised.
+          echo "/proc   : $([ -d /proc ] && echo present || echo ABSENT)"
+
+      - run: node --test "tests/*.test.mjs"

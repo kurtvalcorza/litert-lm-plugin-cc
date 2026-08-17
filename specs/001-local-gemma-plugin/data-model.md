@@ -126,16 +126,28 @@ that concurrent readers and writers never need a lock.
 | File | Contents | Written by | Read by |
 |---|---|---|---|
 | `last-activity` | epoch milliseconds | client, before and after each request | watchdog |
-| `in-flight` | integer counter | client, incremented before / decremented after | watchdog |
+| `in-flight.d/<pid>-<ts>` | marker file per request | client, one per request | watchdog |
 | `stopping` | presence is the signal | watchdog, before terminating | client |
-| `server.pid` | process id | client, on successful start | watchdog |
+| `server.pid` | `<pid> <start-token>` | client, on successful start | client, watchdog |
+| `watchdog.pid` | `<pid> <start-token>` | **watchdog only** | client, watchdog |
 
 **Validation rules**:
-- A missing file means the zero value (`in-flight` absent → 0; `last-activity` absent → treat
-  as now, so a fresh server is never immediately reaped).
-- A stale `server.pid` naming a dead process MUST be ignored and overwritten, not trusted.
-- `in-flight` MUST be decremented in a `finally`-equivalent path, or a crashed client pins the
-  server alive forever. A bounded ceiling on activity age is the backstop.
+- A missing file means the zero value (`last-activity` absent → treat as now, so a fresh server
+  is never immediately reaped).
+- A `*.pid` record MUST NOT be trusted to authorise a signal on the strength of the pid alone.
+  The pid must be live, the file must post-date the current boot, AND the process's OS-reported
+  creation time must still match the recorded token. A record carrying no token — every record
+  written before this rule existed — is readable but **never signallable**.
+- Marker files make in-flight tracking atomic; a counter cannot be, because two clients can
+  interleave a read-modify-write and lose an update. A marker whose owning process is gone is
+  stale by definition, so crash recovery needs no timeout. A bounded ceiling on activity age
+  remains as the backstop for a leaked marker.
+
+*(The full protocol, including why ownership is split into a cheap "may I delete this?" test and
+an expensive "may I signal this?" test, is in
+[`contracts/runtime-state.md`](contracts/runtime-state.md). That contract is authoritative; this
+table exists to keep the data model from contradicting it — an earlier revision still described
+`server.pid` as a bare process id, which is precisely the record `signallablePid()` now refuses.)*
 
 ---
 
