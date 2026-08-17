@@ -120,6 +120,7 @@ const PORT = {
   watchdogStartupClaim: reservePort(19531),
   stopStartFinalization: reservePort(19541),
   startRecordHandoff: reservePort(19551),
+  watchdogDisable: reservePort(19561),
 };
 
 const spawned = [];
@@ -855,6 +856,43 @@ describe('the idle watchdog', () => {
         'a superseded supervisor must stand down, not supervise a torn-down server');
       assert.equal(readIfPresent(join(dir, 'watchdog.pid')), null,
         'and release the slot, so the next client is free to start a fresh one');
+    });
+
+  // A warm `--idle-timeout 0` disables idle shutdown even on a server that already has
+  // a supervisor. The client publishes a disabled `watchdog-request` and spawns nothing
+  // — it sees the live `watchdog.pid` and trusts the incumbent to relinquish. The normal
+  // supervision loop used to read that file only on the survivor-handoff path, so the
+  // disable was ignored and the incumbent could still idle-stop the server under its old
+  // nonzero timeout, contradicting the explicit flag.
+  test('honours a warm idle-timeout disable and stands down without stopping the server',
+    { timeout: 60_000 }, async () => {
+      const port = PORT.watchdogDisable;
+      const runtime = runtimeDir();
+      const dir = stateDir(runtime, port);
+      const spawnedAt = Date.now();
+
+      const watchdog = reap(spawn(process.execPath,
+        [WATCHDOG, '--port', String(port), '--idle-timeout', '900',
+          '--spawned-at', String(spawnedAt)],
+        { stdio: 'ignore', windowsHide: true,
+          env: { ...process.env, LITERT_LM_PLUGIN_RUNTIME: runtime } }));
+
+      assert.ok(await waitFor(() => recordedPid(dir) === watchdog.pid),
+        'the watchdog should hold the slot before the disable request arrives');
+
+      // The disabling client stamps its request after the incumbent began supervising;
+      // a request from before that must not retire it, which is why `requestedAt` leads.
+      writeFileSync(join(dir, 'watchdog-request'), JSON.stringify({
+        server: null, discoveryPending: false, host: '127.0.0.1',
+        idleTimeout: 0, requestedAt: spawnedAt + 1000,
+      }), 'utf8');
+
+      assert.ok(await waitFor(() => watchdog.exitCode !== null, { timeout: 40_000 }),
+        'the incumbent must relinquish when idle shutdown is disabled');
+      assert.equal(readIfPresent(join(dir, 'watchdog.pid')), null,
+        'and release the slot, leaving the server running rather than idle-stopping it');
+      assert.equal(readIfPresent(join(dir, 'stopped-idle')), null,
+        'standing down for a disable is not an idle stop and must not report one');
     });
 
   test('claims the stopping handshake before counting in-flight work',

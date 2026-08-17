@@ -17,7 +17,7 @@
 
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -92,6 +92,34 @@ function writeState(port, name, value) {
 
 function clearState(port, name) {
   try { rmSync(statePath(port, name), { force: true }); } catch { /* ignore */ }
+}
+
+/**
+ * Write a state file atomically, so a concurrent reader never sees a torn document.
+ *
+ * `writeState` truncates in place, which leaves a window where a reader opens an empty
+ * or partial file. That is harmless for the single-token records — a half-written pid
+ * fails `parsePidRecord` and is treated as absent — but not for `watchdog-request`,
+ * whose reader (`handoffReplacement`) takes a JSON parse failure as "no request" and
+ * exits, stranding a replacement server unsupervised. Writing to a temp file and
+ * renaming it into place makes every read see either the old bytes or the new ones,
+ * never a mix. The watchdog already leans on `renameSync` being atomic for its own
+ * slot claim; this is the same guarantee applied to the request it publishes.
+ */
+function writeStateAtomic(port, name, value) {
+  try {
+    mkdirSync(stateDir(port), { recursive: true });
+    const tmp = statePath(port, `${name}.tmp.${process.pid}.${randomUUID()}`);
+    writeFileSync(tmp, String(value), 'utf8');
+    try {
+      renameSync(tmp, statePath(port, name));
+    } catch (err) {
+      try { rmSync(tmp, { force: true }); } catch { /* leave no orphan temp behind */ }
+      throw err;
+    }
+  } catch {
+    // Best-effort, like writeState: state is an optimisation, never a reason to fail.
+  }
 }
 
 /**
@@ -250,6 +278,46 @@ const ownsStartClaim = (port, spawnedAt) => {
   return claim !== null && claim.spawnedAt === spawnedAt && claim.pid === process.pid;
 };
 
+/**
+ * Take the `starting` slot for THIS generation, atomically. Returns true if we now own
+ * it, false if a live foreign start already holds the port.
+ *
+ * EXCLUSIVE CREATE, not last-writer-wins. `awaitConcurrentStart` is what stops a second
+ * server being spawned beside a start already in progress, but it reads the claim well
+ * before this point — through the leftover checks and a PowerShell-slow `resolveLitertLm`
+ * — so two cold invocations can both see no claim and, with a plain overwrite here, both
+ * go on to spawn their own detached `litert-lm serve`. Both engines then initialise, both
+ * clients accept whichever wins the port, and the losing child is left unrecorded because
+ * `recordSpawnedPid` rejects its generation. `wx` closes that: the loser gets EEXIST and
+ * is sent back to adopt the winner instead of launching.
+ *
+ * A merely stale claim — its pid dead, so `liveStartClaim` returns null — is cleared and
+ * the create retried, so an abandoned start can never lock the port out. The generation
+ * boundary the rest of the start relies on is unchanged: exactly one live claim exists at
+ * a time, and `ownsStartClaim` still identifies its owner by `spawnedAt` and pid.
+ */
+function acquireStartClaim(port, spawnedAt) {
+  const record = `${spawnedAt} ${process.pid}`;
+  for (let attempt = 0; attempt < 64; attempt += 1) {
+    try {
+      mkdirSync(stateDir(port), { recursive: true });
+      writeFileSync(statePath(port, 'starting'), record, { encoding: 'utf8', flag: 'wx' });
+      return true;
+    } catch (err) {
+      if (err?.code !== 'EEXIST') {
+        // The exclusive create failed for a reason unrelated to contention (a full or
+        // read-only filesystem). Fall back to the previous best-effort write rather than
+        // refuse to start; state is an optimisation, and a lone start still needs to run.
+        writeState(port, 'starting', record);
+        return true;
+      }
+      if (liveStartClaim(port) !== null) return false;   // a live start owns the port
+      clearState(port, 'starting');                      // stale; reclaim and retry
+    }
+  }
+  return false;   // could not win the slot after repeated stale reclaims; adopt instead
+}
+
 /** A direct `--stop` admission claim. Starts wait on it; they never signal its pid. */
 function readStopClaim(port) {
   try {
@@ -278,21 +346,33 @@ const ownsStopClaim = (port, claim) => readStopClaim(port)?.id === claim.id;
 async function acquireStopClaim(port) {
   const deadline = Date.now() + 5 * 60 * 1000;
   for (;;) {
-    if (liveStopClaim(port) === null) {
-      const claim = { id: randomUUID(), startedAt: Date.now(), pid: process.pid };
-      try {
-        mkdirSync(stateDir(port), { recursive: true });
-        writeFileSync(statePath(port, 'stop-claim'), JSON.stringify(claim), 'utf8');
-      } catch (err) {
-        throw new Error(`could not establish stop admission claim.\n  (underlying error: ${err.message})`);
-      }
-      // Two stops can observe no owner together. Last writer wins; only that writer
-      // may proceed, while the loser loops and waits for the winner to finish.
-      if (ownsStopClaim(port, claim)) return claim;
-    }
     if (Date.now() >= deadline) {
       throw new Error('another --stop invocation is still running after 5 minutes; retry later.');
     }
+    // EXCLUSIVE CREATE, not write-then-read. Two stops that both saw no live owner and
+    // then wrote could both pass `ownsStopClaim`: A writes and verifies before B
+    // overwrites, then B writes and verifies too, and both run `stopProcesses`
+    // concurrently — the first losing its claim during finalization and reporting a
+    // spurious failure after it had already signalled. `wx` fails if the file exists,
+    // so of two racers exactly one creates it and proceeds; the loser falls through to
+    // the liveness test below.
+    const claim = { id: randomUUID(), startedAt: Date.now(), pid: process.pid };
+    try {
+      mkdirSync(stateDir(port), { recursive: true });
+      writeFileSync(statePath(port, 'stop-claim'), JSON.stringify(claim),
+        { encoding: 'utf8', flag: 'wx' });
+      return claim;
+    } catch (err) {
+      if (err?.code !== 'EEXIST') {
+        throw new Error(`could not establish stop admission claim.\n  (underlying error: ${err.message})`);
+      }
+    }
+    // The slot is taken. A stale claim — dead pid, pre-boot, or expired — is not a
+    // live owner, so clear it and let the next pass reclaim it; a live one belongs to
+    // another `--stop`, so wait and look again. Two racers reclaiming the same stale
+    // file both clear it, one then wins the `wx` create and the other reads its live
+    // claim and waits, so this converges.
+    if (liveStopClaim(port) === null) clearState(port, 'stop-claim');
     await sleep(250);
   }
 }
@@ -656,7 +736,13 @@ async function startWatchdog(opts) {
     idleTimeout: opts.idleTimeout,
     requestedAt: Date.now(),
   };
-  writeState(opts.port, 'watchdog-request', JSON.stringify(request));
+  // Atomic: an incumbent watchdog finishing survivor cleanup reads this file, and a
+  // truncating write can hand it an empty or partial document. `handoffReplacement`
+  // treats that parse failure as "no request" and exits, while this client — seeing the
+  // incumbent still hold `watchdog.pid` — has already declined to spawn its own. The
+  // replacement server would then run unsupervised. A temp-file-plus-rename write makes
+  // the reader see the old request or the new one, never a torn one.
+  writeStateAtomic(opts.port, 'watchdog-request', JSON.stringify(request));
   if (opts.idleTimeout === 0) return;
   // Liveness, not file existence: a stale pid must never suppress the watchdog.
   //
@@ -1026,11 +1112,25 @@ async function ensureServer(opts) {
   let child;
   const spawnedAt = Date.now();
   // Claim the port for THIS start. `cancelStartedServer` uses it as the generation
-  // boundary: a later start overwrites the claim, and an earlier one that is
-  // cancelling then knows to stop reaching for listeners it can no longer attribute
-  // to itself. Overwritten rather than exclusively created — the newest start is the
-  // one that owns the port, and an abandoned claim must not lock the port out.
-  writeState(opts.port, 'starting', `${spawnedAt} ${process.pid}`);
+  // boundary: an earlier start that is cancelling reads the claim to know it no longer
+  // owns the listeners it once spawned. Acquired with an exclusive create so two cold
+  // invocations that both passed `awaitConcurrentStart` cannot both spawn a server —
+  // the loser adopts the winner rather than launching a second engine beside it. An
+  // abandoned claim does not lock the port out: `acquireStartClaim` reclaims a stale one.
+  if (!acquireStartClaim(opts.port, spawnedAt)) {
+    // Another invocation won the port in the gap between the wait above and here. Take
+    // its server instead of starting a second one; if it has not come up yet, wait it
+    // out the same way `awaitConcurrentStart` does.
+    const raced = (await probe(opts)) || (await awaitConcurrentStart(opts));
+    if (raced) {
+      await startWatchdog(opts);
+      return { models: raced, started: false };
+    }
+    throw new Error(
+      `another invocation won the start on ${baseUrl(opts)} but it did not become\n`
+      + `  reachable within ${opts.startupTimeoutMs / 1000}s. Nothing was started here;\n`
+      + '  retry in a moment.');
+  }
   try {
     child = spawn(exe, ['serve', '--host', opts.host, '--port', String(opts.port)],
       { detached: true, stdio: 'ignore', windowsHide: true,

@@ -431,6 +431,23 @@ async function handoffReplacement(chased) {
   }
 }
 
+/**
+ * A warm client asked to disable idle shutdown on the server we are supervising.
+ *
+ * `--idle-timeout 0` on an already-warm server makes the client write a disabled
+ * `watchdog-request` and return WITHOUT spawning a replacement — it sees our live
+ * `watchdog.pid` and trusts the incumbent to relinquish. Only the survivor-handoff path
+ * used to read that file, so on an otherwise-healthy server the disable was ignored and
+ * we could still idle-stop it, contradicting the explicit flag. A request written before
+ * we began supervising (`requestedAt <= opts.spawnedAt`) is not ours to act on.
+ */
+function retirementRequested() {
+  let request = null;
+  try { request = JSON.parse(readState('watchdog-request', 'null')); } catch { return false; }
+  return request?.idleTimeout === 0
+    && Number.isFinite(request.requestedAt) && request.requestedAt > opts.spawnedAt;
+}
+
 async function main() {
   if (!Number.isFinite(opts.idleTimeout) || opts.idleTimeout <= 0) {
     process.exit(0);                                  // disabled; nothing to supervise
@@ -493,6 +510,15 @@ async function main() {
     // clearing: a watchdog spawned after the stop has a later `spawnedAt` and is
     // untouched by it.
     if (invalidatedByStop()) cleanupAndExit(0);
+
+    // Honour a policy change published by a warm client. A disable request means "keep
+    // this server alive"; stand down so nothing idle-stops it, leaving the server up.
+    // Guarded to the non-survivor path — a shutdown already in progress consumes the
+    // request through `handoffReplacement`, which handles the disable case itself.
+    if (!pendingSurvivors.length && retirementRequested()) {
+      clearState('watchdog-request');
+      cleanupAndExit(0);
+    }
 
     // AN UNFINISHED SHUTDOWN OUTRANKS THE REACHABILITY GATE BELOW.
     //
