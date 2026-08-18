@@ -123,6 +123,10 @@ export function reapMarkers(dir) {
 
   let live = 0;
   for (const name of entries) {
+    // Only `<pid>-<epochMs>` files are ours. A stray file (an editor temp, a
+    // committed .gitkeep) is neither a live marker to count nor debris to delete —
+    // markerIsStale() would otherwise judge it stale (NaN pid) and rmSync it.
+    if (!/^\d+-\d+$/.test(name)) continue;
     if (markerIsStale(name)) {
       try { rmSync(join(dir, name), { force: true }); } catch { /* ignore */ }
     } else {
