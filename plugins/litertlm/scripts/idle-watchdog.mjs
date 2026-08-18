@@ -410,6 +410,13 @@ async function handoffReplacement(chased) {
       { detached: true, stdio: 'ignore', windowsHide: true,
         env: { ...process.env, LITERT_LM_PLUGIN_INSTANCE: randomUUID() } });
     child.unref();
+    // A fork that fails asynchronously (EAGAIN/EMFILE/ENOMEM under memory pressure)
+    // emits 'error' on a later tick; with no listener Node rethrows it as an uncaught
+    // exception and the watchdog dies AFTER it has already cleared watchdog.pid,
+    // leaving the server unsupervised. Swallow it here — successorClaimed() below
+    // fails when the child never published an identity, and the restore loop reclaims
+    // the slot. Mirrors the error handler on process-identity.mjs's spawn.
+    child.on('error', () => {});
   } catch { /* restore below */ }
 
   if (child !== null && await successorClaimed(child.pid)) {
