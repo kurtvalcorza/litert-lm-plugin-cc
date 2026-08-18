@@ -384,6 +384,13 @@ export const addressServes = (listenAddress, host) =>
  * quietly do nothing.
  */
 function listenersOnPort(port) {
+  // Defence in depth: this is an exported code path (pidsOnPort / identifyPortOwners)
+  // and `port` is interpolated into a PowerShell / lsof / ss command below. The CLI
+  // validates it, but an importer might not. Coerce to a bounded integer and use that
+  // from here on, so a value like "9379; <command>" can never reach a shell.
+  const p = Number(port);
+  if (!Number.isInteger(p) || p < 1 || p > 65535) return { ok: false, listeners: [] };
+  port = p;
   if (process.platform === 'win32') {
     // THE EXIT CODE IS MADE MEANINGFUL HERE RATHER THAN INTERPRETED.
     //
