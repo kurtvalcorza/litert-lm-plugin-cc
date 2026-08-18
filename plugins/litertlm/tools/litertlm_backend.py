@@ -171,6 +171,17 @@ def read_header(path):
             raise SystemExit(f"{path}: not a .litertlm file (bad magic)")
         f.seek(CORE.HEADER_END_LOCATION_BYTE_OFFSET)
         header_end = struct.unpack("<Q", f.read(8))[0]
+        # header_end comes straight from the file, so a corrupt or hostile container
+        # can set it to anything. Left unbounded, header_end < HEADER_BEGIN makes the
+        # read below negative and f.read(-n) slurps the entire multi-GB file into
+        # memory. Bound it to the file before trusting it.
+        file_size = os.fstat(f.fileno()).st_size
+        if not (CORE.HEADER_BEGIN_BYTE_OFFSET <= header_end <= file_size):
+            raise SystemExit(
+                f"{path}: header_end={header_end} is outside "
+                f"[{CORE.HEADER_BEGIN_BYTE_OFFSET}, {file_size}]; "
+                "refusing to read a corrupt header."
+            )
         f.seek(CORE.HEADER_BEGIN_BYTE_OFFSET)
         data = f.read(header_end - CORE.HEADER_BEGIN_BYTE_OFFSET)
     return header_end, data
@@ -493,6 +504,14 @@ def cmd_patch(args):
         raise SystemExit("ABORT: no main section found to patch.")
     if not fits:
         raise SystemExit("ABORT: patched header would overrun the first block.")
+    if header_end > CORE.BLOCK_SIZE:
+        # _write_header_backup saves only the first block, but the scrub below zeroes
+        # bytes up to header_end. If the original header spilled past one block,
+        # scrubbing would corrupt payload the single-block backup cannot restore.
+        raise SystemExit(
+            f"ABORT: header_end={header_end} exceeds one {CORE.BLOCK_SIZE}-byte block; "
+            "patching could zero payload beyond the single-block backup. Refusing."
+        )
     if all(status in NO_WRITE_NEEDED for status, _ in changed):
         # Either already correct, or a type whose constraint the resolver ignores.
         # Both mean the same thing to the caller: do not write.
