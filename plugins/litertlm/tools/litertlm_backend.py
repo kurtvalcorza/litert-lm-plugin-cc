@@ -172,15 +172,25 @@ def read_header(path):
         f.seek(CORE.HEADER_END_LOCATION_BYTE_OFFSET)
         header_end = struct.unpack("<Q", f.read(8))[0]
         # header_end comes straight from the file, so a corrupt or hostile container
-        # can set it to anything. Left unbounded, header_end < HEADER_BEGIN makes the
-        # read below negative and f.read(-n) slurps the entire multi-GB file into
-        # memory. Bound it to the file before trusting it.
+        # can set it to anything. It must be bounded before the read below, on both
+        # sides, and the upper bound is BLOCK_SIZE — NOT file_size:
+        #   * header_end < HEADER_BEGIN            -> f.read(negative) reads the whole
+        #     file into memory.
+        #   * header_end large, <= file_size       -> a crafted/sparse multi-GB file
+        #     with header_end == file_size still slurps gigabytes (file_size alone is
+        #     not a real bound on a sparse file).
+        #   * header_end > BLOCK_SIZE              -> the patch scrub would later zero
+        #     payload past the single-block backup (unrecoverable corruption).
+        # The format keeps the header inside the first block, so a valid header_end is
+        # always <= BLOCK_SIZE; capping here makes the read at most one block and
+        # closes all three at once.
         file_size = os.fstat(f.fileno()).st_size
-        if not (CORE.HEADER_BEGIN_BYTE_OFFSET <= header_end <= file_size):
+        limit = min(file_size, CORE.BLOCK_SIZE)
+        if not (CORE.HEADER_BEGIN_BYTE_OFFSET <= header_end <= limit):
             raise SystemExit(
                 f"{path}: header_end={header_end} is outside "
-                f"[{CORE.HEADER_BEGIN_BYTE_OFFSET}, {file_size}]; "
-                "refusing to read a corrupt header."
+                f"[{CORE.HEADER_BEGIN_BYTE_OFFSET}, {limit}]; "
+                "refusing to read a corrupt or oversized header."
             )
         f.seek(CORE.HEADER_BEGIN_BYTE_OFFSET)
         data = f.read(header_end - CORE.HEADER_BEGIN_BYTE_OFFSET)
@@ -505,9 +515,11 @@ def cmd_patch(args):
     if not fits:
         raise SystemExit("ABORT: patched header would overrun the first block.")
     if header_end > CORE.BLOCK_SIZE:
-        # _write_header_backup saves only the first block, but the scrub below zeroes
-        # bytes up to header_end. If the original header spilled past one block,
-        # scrubbing would corrupt payload the single-block backup cannot restore.
+        # Backstop: read_header() already rejects header_end > BLOCK_SIZE, so this is
+        # unreachable today. Kept so the WRITE path stays safe on its own if that
+        # read-side bound is ever loosened — _write_header_backup saves only the first
+        # block, but the scrub below zeroes bytes up to header_end, so a header past
+        # one block would corrupt payload the single-block backup cannot restore.
         raise SystemExit(
             f"ABORT: header_end={header_end} exceeds one {CORE.BLOCK_SIZE}-byte block; "
             "patching could zero payload beyond the single-block backup. Refusing."
