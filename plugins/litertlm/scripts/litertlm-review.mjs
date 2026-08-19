@@ -53,7 +53,19 @@ const EXIT = {
   USAGE: 2,         // called wrong
   NOTHING: 3,       // valid range, empty diff — nothing was reviewed
   OVERSIZE: 4,      // refused: more input than the model can be trusted to have read
+  INCOMPLETE: 5,    // a pass ran but did NOT cover the whole in-scope diff — see below
 };
+
+// The exit code is a COVERAGE signal, never a findings verdict. This launcher drives a
+// small on-device model that "has no way to check itself" (see FOOTER), so it cannot
+// honestly say a diff is clean — that is the reader's job, and 0 never claims it. What
+// the launcher DOES know is whether it reviewed the whole in-scope diff: a request sent
+// oversized under --allow-oversize was not fully read, and a model that answered with a
+// tool call reviewed nothing at all. Both used to exit 0 and so were indistinguishable
+// from a completed pass to anything keying on the code. They now exit INCOMPLETE, so an
+// automated caller cannot mistake a partial or no-op run for a full one. It still must
+// never treat 0 as "clean" — 0 means only that a full pass ran and its advisory output
+// is on stdout for a human to screen.
 
 const DEFAULTS = {
   // MEASURED, not guessed — see the conditions below, because this figure does not
@@ -463,14 +475,20 @@ Passed to the client:
   --port <n>          Server port
   -h, --help          This message
 
-Exit codes:
-  0 ran to completion   1 environment failure   2 usage error
+Exit codes (a COVERAGE signal, never a findings verdict):
+  0 full pass ran      1 environment failure   2 usage error
   3 nothing to review (empty diff)              4 refused as oversized
+  5 ran but did NOT cover the whole diff (oversized send, or a model tool call)
 
-  0 means this script finished what it was asked to do — which for --dry-run and
-  --help is to print and stop, without ever calling the model. Where a pass did run,
-  0 still never means the diff was reviewed; screen it. Under --allow-oversize it
-  does not even mean the whole diff was read.
+  This launcher is NOT a pass/fail gate. The model cannot check itself, so no exit
+  code says the diff is clean — 0 means only that a full pass ran and its advisory
+  output is on stdout for a human (or a real reviewer) to screen. Do not wire an
+  automated gate to treat 0 as approval.
+
+  0 also covers --dry-run and --help, which print and stop without calling the model.
+  5 is the honest half of --allow-oversize and of a model that answers with a tool
+  call: a pass happened, but not over all of it — so a caller keying on the code
+  cannot mistake a partial or no-op run for a completed one.
 
 The model runs on this machine. Nothing in your diff leaves it.
 Readiness:  node litertlm-client.mjs --check
@@ -656,7 +674,8 @@ function main() {
       + '  budget was spent before the first word (reasoning-variant models do this).');
   }
 
-  if (answer.startsWith('[') && /"function"|"name"\s*:/.test(answer)) {
+  const toolCallInsteadOfReview = answer.startsWith('[') && /"function"|"name"\s*:/.test(answer);
+  if (toolCallInsteadOfReview) {
     // The client surfaces tool calls and executes nothing (FR-034). Say what happened
     // rather than letting a JSON blob read as findings.
     out.write('The model emitted a tool call rather than a reply. Nothing was executed:\n\n');
@@ -666,6 +685,13 @@ function main() {
   out.write(`${RULE}\n`);
   if (oversize) out.write(`${OVERSIZE_STAMP(sent, opts.maxBytes)}\n\n`);
   out.write(`${FOOTER}\n`);
+
+  // Report coverage through the exit code — see EXIT above. A tool call means nothing was
+  // reviewed; an oversized send means not all of it was read. Either way the run did not
+  // cover the whole in-scope diff, so it must not exit 0 and read as a completed pass.
+  // Set `process.exitCode` rather than calling `process.exit`, so the report just written
+  // to stdout is flushed before the process ends (a hard exit truncates it on Windows).
+  if (toolCallInsteadOfReview || oversize) process.exitCode = EXIT.INCOMPLETE;
 }
 
 try {
