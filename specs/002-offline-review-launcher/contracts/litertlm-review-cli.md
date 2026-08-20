@@ -37,18 +37,25 @@ Default range when none is given: the uncommitted working tree (`git diff HEAD`)
 
 ## Exit codes
 
+The code is a **coverage** signal, never a findings verdict. The launcher drives a small
+on-device model that cannot check itself, so no code says the diff is clean — 0 means only that a
+full pass ran, and screening its output stays the caller's job. Do not wire an automated gate to
+treat 0 as approval.
+
 | Code | Meaning |
 |---|---|
-| 0 | Ran to completion. A pass ran **unless** the invocation was `--dry-run` or `--help`, which print and stop without ever calling the model. Where a pass did run, 0 still never means the diff was reviewed. |
+| 0 | A full pass ran **unless** the invocation was `--dry-run` or `--help`, which print and stop without ever calling the model. Where a pass did run, 0 still never means the diff was reviewed — only that the whole in-scope diff was covered. |
 | 1 | Environment failure — git missing, not a repository, no commits, client absent, model call failed |
 | 2 | Usage error — unknown flag, empty value for a range-selecting option, unresolvable base, base sharing no history with `HEAD` |
 | 3 | Nothing to review — the range resolved and its diff is empty |
 | 4 | Refused as oversized |
+| 5 | A pass ran but did **not** cover the whole in-scope diff — the request was sent oversized under `--allow-oversize` (not all of it was read), or the model answered with a tool call and reviewed nothing |
 
-3 and 4 exist as distinct codes because both are *successful* runs that produced no review, and
-a caller that cannot tell them from 0 will report a clean pass. `/litertlm:review` branches on
-them explicitly — which it can do safely because it never passes `--dry-run` or `--help`, so in
-that workflow 0 does always mean a pass ran.
+3, 4, and 5 exist as distinct codes because each is a run that produced no usable review — empty,
+refused, or incomplete — and a caller that cannot tell them from 0 will report a clean pass.
+`/litertlm:review` branches on them explicitly. It never passes `--dry-run` or `--help`, so 0 in
+that workflow does always mean a pass ran — but even there 0 means "a full pass ran," not "the diff
+is clean," and 5 marks a pass that ran without covering everything.
 
 ## Output
 
