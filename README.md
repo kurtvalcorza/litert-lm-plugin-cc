@@ -34,7 +34,9 @@ steady state — a first call after idle is slower because it pays engine initia
 `/litertlm:setup` finds affected models and offers the fix for your runtime:
 
 - **LiteRT-LM 0.15.0 or later**: a per-model override in `~/.litert-lm/config.json`, which takes
-  precedence over the file's metadata. The model stays exactly as published.
+  precedence over the file's metadata. The model stays exactly as published. Models that omit
+  `backend_constraint` accept any backend; a model that declares one only loads on the backends
+  it lists, and `resolve` marks an override outside that list `REFUSED`.
 - **0.14 and earlier**: there is no override, so the repair rewrites **only the 16 KB metadata
   header**. The multi-gigabyte payload is never touched, which is verifiable, and the change
   reverses byte for byte. It is still available on newer runtimes behind `--legacy-header-edit`.

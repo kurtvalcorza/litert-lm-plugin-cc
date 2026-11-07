@@ -137,12 +137,32 @@ class Effective(Base):
                            "models": {"plain": {"backend": "gpu"}}})
         self.assertRegex(self.row("plain"), r"plain\s+gpu\s.*\(model\)")
 
-    def test_conflicting_header_and_override_reports_the_override(self):
+    def test_override_outside_the_declared_list_is_reported_as_refused(self):
+        # Measured on 0.19.1: "Model requires one of [npu] but Main backend is CPU".
         self.model("declared", constraint="gpu")
         self.write_config({"models": {"declared": {"backend": "cpu"}}})
         row = self.row("declared")
-        self.assertRegex(row, r"declared\s+cpu\s+embedded=gpu\s+override=cpu \(model\)")
+        self.assertRegex(row, r"declared\s+REFUSED\s+embedded=gpu\s+override=cpu \(model\)")
+        self.assertIn("allows only gpu", row)
+        self.assertNotIn("serves on CPU", row)
+
+    def test_a_default_backend_is_held_to_the_same_list(self):
+        self.model("declared", constraint="gpu")
+        self.write_config({"default": {"backend": "cpu"}})
+        self.assertRegex(self.row("declared"), r"declared\s+REFUSED\s.*\(default\)")
+
+    def test_override_inside_the_declared_list_applies(self):
+        # Measured on 0.19.1 with npu,cpu: the first value is a default, not a limit.
+        self.model("listed", constraint="gpu,cpu")
+        self.write_config({"models": {"listed": {"backend": "cpu"}}})
+        row = self.row("listed")
+        self.assertRegex(row, r"listed\s+cpu\s+embedded=gpu\s+override=cpu \(model\)")
         self.assertIn("serves on CPU", row)
+
+    def test_the_list_tolerates_spacing_and_case(self):
+        self.model("spaced", constraint="GPU, cpu")
+        self.write_config({"models": {"spaced": {"backend": "cpu"}}})
+        self.assertRegex(self.row("spaced"), r"spaced\s+cpu\s")
 
     def test_a_key_for_another_model_is_not_an_override(self):
         self.model("plain")
@@ -221,6 +241,38 @@ class Configure(Base):
         self.run_configure(clear=True)
         self.assertEqual(self.config(), {})
 
+    def test_refuses_a_backend_the_file_does_not_allow(self):
+        path = self.model("declared", constraint="gpu")
+        before = _first_block(path)
+        with self.assertRaises(SystemExit) as caught:
+            self.run_configure("declared", backend="cpu")
+        message = str(caught.exception)
+        self.assertIn("allows only gpu", message)
+        self.assertIn("--legacy-header-edit", message)
+        self.assertFalse(os.path.exists(os.path.join(self.base, "config.json")))
+        self.assertEqual(_first_block(path), before)
+
+    def test_accepts_any_listed_backend(self):
+        self.model("listed", constraint="gpu,cpu")
+        self.run_configure("listed", backend="cpu")
+        self.assertEqual(self.config()["models"]["listed"]["backend"], "cpu")
+
+    def test_a_model_with_no_constraint_takes_any_backend(self):
+        self.model("plain")
+        self.run_configure("plain", backend="gpu")
+        self.assertEqual(self.config()["models"]["plain"]["backend"], "gpu")
+
+    def test_tokens_alone_are_not_held_to_the_list(self):
+        self.model("declared", constraint="gpu")
+        self.run_configure("declared", tokens=4096)
+        self.assertEqual(self.config()["models"]["declared"]["max_num_tokens"], 4096)
+
+    def test_clear_still_works_on_a_refused_override(self):
+        self.model("declared", constraint="gpu")
+        self.write_config({"models": {"declared": {"backend": "cpu"}}})
+        self.run_configure("declared", clear=True)
+        self.assertRegex(self.row("declared"), r"declared\s+gpu\s+embedded=gpu\s+override=none")
+
     def test_refuses_an_unknown_model(self):
         with self.assertRaises(SystemExit) as caught:
             self.run_configure(model_id="nope", backend="gpu")
@@ -268,6 +320,23 @@ class HeaderEditGate(Base):
         self.assertIn("configure plain --backend gpu", str(caught.exception))
         self.assertEqual(_first_block(path), before)
         self.assertEqual(os.listdir(os.path.dirname(path)), ["model.litertlm"])
+
+    def test_patch_never_names_a_config_route_that_cannot_work(self):
+        path = self.model("declared", constraint="cpu")
+        before = _first_block(path)
+        with self.assertRaises(SystemExit) as caught:
+            lb.cmd_patch(SimpleNamespace(model=path, backend="gpu", yes=True,
+                                         legacy_header_edit=False))
+        message = str(caught.exception)
+        self.assertNotIn("configure declared", message)
+        self.assertIn("--legacy-header-edit", message)
+        self.assertEqual(_first_block(path), before)
+
+    def test_check_says_when_config_cannot_reach_the_backend(self):
+        path = self.model("declared", constraint="cpu")
+        output = _capture(lb.cmd_check, SimpleNamespace(model=path, backend="gpu"))
+        self.assertIn("config cannot select gpu", output)
+        self.assertNotIn("`configure` fixes", output)
 
     def test_the_flag_still_allows_it(self):
         path = self.model("plain")

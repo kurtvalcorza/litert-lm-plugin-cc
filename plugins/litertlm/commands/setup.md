@@ -100,6 +100,10 @@ effective one decides. A model with `embedded=cpu` and `override=gpu (model)` is
 GPU, and needs nothing. If it says the config is invalid, relay that and stop: the runtime refuses
 an invalid config, so fix that first.
 
+A row marked `REFUSED` will fail to load. The file declares a `backend_constraint` and the config
+asks for a backend outside it; config chooses only among what the file allows. Clear the override
+with `configure <model-id> --clear --yes`, or set a backend the row lists.
+
 A model whose effective backend is `cpu` **will serve on CPU**, roughly 4–5× slower, silently.
 `litert-lm serve` has no `--backend` flag. Measured on an RTX 5070 Ti Laptop GPU: the same prompt
 took **13.0 s on CPU versus 3.0 s on GPU**, a 4.33× difference, with nothing reporting a problem.
@@ -115,7 +119,10 @@ python "${CLAUDE_PLUGIN_ROOT}/tools/litertlm_backend.py" configure <model-id> --
 ```
 
 It undoes with `configure <model-id> --clear --yes`. Stop the server afterwards so the next
-request loads the model with the new backend: `/litertlm:stop`.
+request loads the model with the new backend: `/litertlm:stop`. `configure` refuses a backend the
+file does not allow, and writes nothing. That is rare: the models this step exists for declare no
+constraint at all. Relay the message; widening what a file allows is a header edit, for a user who
+asks for it by name.
 
 **0.14 and earlier** (`resolve` said the model file decides): the header edit is the only fix. Do
 not offer it on a newer runtime; `patch` refuses there unless `--legacy-header-edit` is passed, and

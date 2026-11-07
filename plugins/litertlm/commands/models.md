@@ -17,7 +17,8 @@ no warning.
 
 Present them together: id, size, effective backend. Flag anything effectively on `cpu` that the
 user probably wants on the accelerator. Do not flag `embedded=cpu` on its own: with a `gpu` override
-that model is correctly on the GPU.
+that model is correctly on the GPU. Flag every `REFUSED` row: that model will fail to load, because
+its override is outside the backends the file allows.
 
 To inspect one model's full metadata:
 

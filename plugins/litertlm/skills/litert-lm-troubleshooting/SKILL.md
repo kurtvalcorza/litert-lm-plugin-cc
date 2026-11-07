@@ -239,7 +239,9 @@ python "${CLAUDE_PLUGIN_ROOT}/tools/litertlm_backend.py" resolve
 ```
 
 Anything whose first column is `cpu` is affected; `embedded=cpu` alone is not, because a config
-override wins. Fix via `/litertlm:setup` step 4. On 0.15.0 and later that is one override, with the
+override wins. A first column of `REFUSED` is a load failure, not a slow model: the config asks for
+a backend the file's `backend_constraint` excludes, and the engine answers `Main backend constraint
+mismatch`. Clear that override with `configure <model-id> --clear --yes`. Fix via `/litertlm:setup` step 4. On 0.15.0 and later that is one override, with the
 model file left alone:
 
 ```bash

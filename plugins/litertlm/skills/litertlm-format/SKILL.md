@@ -75,6 +75,13 @@ Step 3 is the whole problem. Absence is not neutral; it means CPU. `litert-lm se
 `--backend` flag, so on 0.14 nothing downstream can override it. From 0.15.0 `~/.litert-lm/config.json`
 sits above all three steps: per-model `backend`, then `default.backend`, then this resolver.
 
+That order picks a backend; it does not lift the file's limit. `backend_constraint` is a
+comma-separated list the engine enforces after config is applied, so the resolver's "first value"
+is only the default among the allowed ones. Measured on 0.19.1 with a real model, CPU only: no key
+accepts config freely; `npu,cpu` with config `cpu` loads and answers; `npu` with config `cpu` fails
+with `Main backend constraint mismatch. Model requires one of [npu] but Main backend is CPU`. Any
+other pairing is read from that message, not measured.
+
 **Never patch an artisan model.** Step 1 short-circuits, so `backend_constraint` is never
 consulted for them — a write would be a no-op that merely looked like a fix, and they cannot
 fall into the CPU trap in the first place. Such a file may still *carry* a value (observed:
@@ -130,4 +137,5 @@ before and after is the proof that the rewrite was contained.
 `~/.litert-lm/config.json` carries per-model `backend` and `max_num_tokens`, and `serve` reads both
 when it loads a model, so editing a model file is unnecessary there. `litertlm_backend.py configure`
 writes that override, and `patch` refuses without `--legacy-header-edit`. Everything above still
-describes the file; it no longer describes the decision.
+describes the file, and `backend_constraint` still limits the decision. A header edit remains the
+only way to change what a file allows; `configure` refuses a backend outside it.

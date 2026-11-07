@@ -412,12 +412,33 @@ def configured_backend(cfg, model_id):
     return value, "model" if entry is not None and entry.backend is not None else "default"
 
 
+def allowed_backends(path):
+    """What the engine will accept for this file, or None if it sets no limit.
+
+    Config chooses the backend, but only among these. `backend_constraint` is a list the
+    engine enforces when it creates the session, after config has been applied: a file
+    declaring `npu` with `backend: cpu` in config fails to load ("Main backend constraint
+    mismatch. Model requires one of [npu] but Main backend is CPU"), while `npu,cpu` with
+    the same config loads and answers. Both measured on 0.19.1. A file with no key has no
+    limit, which is why config is the right repair for the models this tool exists for.
+    """
+    try:
+        declared = [v for v in _main_constraint(read_header(path)[1]) if v]
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001 - a damaged header reaches the flatbuffer reader
+        raise SystemExit(f"ABORT: cannot read the header of {path}: {type(e).__name__}: {e}")             from None
+    if not declared:
+        return None
+    return [part.strip().lower() for part in declared[0].split(",") if part.strip()]
+
+
 def _resolve_row(model_id, path, cfg):
     """One model: what the file declares, what config says, and which of them wins."""
     try:
         # Bounds first. The resolver parses the header with upstream's reader, which
         # is not ours to vouch for against a hostile `header_end`.
-        read_header(path)
+        allowed = allowed_backends(path)
         embedded = M.model_default_backend(path)
     except SystemExit as e:
         return f"{model_id:<24} ERROR: {e}"
@@ -437,6 +458,9 @@ def _resolve_row(model_id, path, cfg):
 
     effective = configured or embedded
     override = f"{configured} ({source})" if configured else "none"
+    if allowed is not None and effective.lower() not in allowed:
+        return (f"{model_id:<24} {'REFUSED':<7} embedded={embedded}  override={override}"
+                f"  <-- will not load: the file allows only {','.join(allowed)}")
     flag = "  <-- serves on CPU" if effective == "cpu" else ""
     return f"{model_id:<24} {effective:<7} embedded={embedded}  override={override}{flag}"
 
@@ -479,6 +503,17 @@ def cmd_configure(args):
     model_file = os.path.join(cfg.get_cli_base_dir(), "models", args.model_id, "model.litertlm")
     if not os.path.isfile(model_file):
         raise SystemExit(f"No imported model named '{args.model_id}'. List them: litert-lm list")
+
+    if args.backend is not None:
+        allowed = allowed_backends(model_file)
+        if allowed is not None and args.backend not in allowed:
+            raise SystemExit(
+                f"ABORT: {args.model_id} allows only {','.join(allowed)}, so with "
+                f"backend {args.backend} it would fail to load.\n"
+                "  Config chooses among the backends the file allows. Nothing was written.\n"
+                "  Changing what the file allows is a header edit:\n"
+                f"    litertlm_backend.py patch {model_file} --backend {args.backend} "
+                "--legacy-header-edit")
 
     path = cfg.get_config_path()
     try:
@@ -594,11 +629,20 @@ def _validate(path, backend):
     return header_end, orig, new, changed, fits
 
 
+def _config_route_note(model, backend):
+    """Whether config can reach `backend` for this file, which decides the right repair."""
+    allowed = allowed_backends(model)
+    if allowed is not None and backend not in allowed:
+        return (f"note: this file allows only {','.join(allowed)}, so config cannot select "
+                f"{backend}; only a header edit changes that.")
+    return ("note: this runtime reads config.json, so `configure` fixes this without "
+            "editing the model.")
+
+
 def cmd_check(args):
     _refuse_pending_backup(args.model)
     if config_module() is not None:
-        print("note: this runtime reads config.json, so `configure` fixes this without "
-              "editing the model.")
+        print(_config_route_note(args.model, args.backend))
     _, _, _, changed, fits = _validate(args.model, args.backend)
 
     # A dry run that matched no section used to print "FITS" and exit 0, which reads
@@ -980,6 +1024,13 @@ def cmd_patch(args):
     _refuse_pending_backup(args.model)
     if config_module() is not None and not args.legacy_header_edit:
         model_id = os.path.basename(os.path.dirname(os.path.abspath(args.model)))
+        allowed = allowed_backends(args.model)
+        if allowed is not None and args.backend not in allowed:
+            raise SystemExit(
+                f"ABORT: this file allows only {','.join(allowed)}, so config cannot select "
+                f"{args.backend}. Nothing was written.\n"
+                "    To edit the header, which is the one way to change that, "
+                "pass --legacy-header-edit.")
         raise SystemExit(
             f"ABORT: litert-lm {runtime_version() or '(unknown)'} reads the backend from "
             "config.json, so the model file\n  does not need to change. Nothing was written.\n"
