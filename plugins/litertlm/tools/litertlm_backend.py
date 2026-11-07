@@ -164,7 +164,10 @@ def read_header(path):
         if f.read(8) != CORE.HEADER_MAGIC_BYTES:
             raise SystemExit(f"{path}: not a .litertlm file (bad magic)")
         f.seek(CORE.HEADER_END_LOCATION_BYTE_OFFSET)
-        header_end = struct.unpack("<Q", f.read(8))[0]
+        field = f.read(8)
+        if len(field) != 8:
+            raise SystemExit(f"{path}: truncated before its header_end field.")
+        header_end = struct.unpack("<Q", field)[0]
         # header_end comes straight from the file, so a corrupt or hostile container
         # can set it to anything. It must be bounded before the read below, on both
         # sides, and the upper bound is BLOCK_SIZE — NOT file_size:
@@ -239,6 +242,18 @@ def _layout(buf):
     """
     sections, system = summarize(buf)
     return (tuple(s[:3] for s in sections), system)
+
+
+def _identity(buf):
+    """What identifies a header across patches: all of it except what a patch rewrites.
+
+    `_layout` is what must survive a patch, but two releases can share a layout and differ
+    only in section items, such as a tokenizer. Comparing the items too keeps a block from
+    one of them out of the other. The payload stays uncovered: same header, different
+    weights cannot be told apart from one block.
+    """
+    sections, system = summarize(buf)
+    return (tuple((*s[:3], tuple(i for i in s[3] if i[0] != KEY)) for s in sections), system)
 
 
 def _main_constraint(buf):
@@ -600,6 +615,12 @@ def _save_original(model, block):
             raise SystemExit(
                 f"ABORT: something other than a regular file is at:\n  {path}\n"
                 "  This tool never creates that. Inspect it and remove it yourself.")
+        if not _same_file_as(path, block):
+            raise SystemExit(
+                f"ABORT: {path}\n  was not saved from this file, so `restore --original` could "
+                "not return to it, and\n  this file's own first block would be lost. Nothing "
+                "was written. If the model was\n  re-imported, that copy is stale: delete it "
+                "and retry.")
         return
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)),
                                prefix=os.path.basename(path) + ".")
@@ -638,6 +659,15 @@ def _read_saved_block(path):
     return block
 
 
+def _same_file_as(path, block):
+    """Is the saved copy at `path` a first block of the same file `block` came from?"""
+    try:
+        return (_identity(_block_header(_read_saved_block(path))[1])
+                == _identity(_block_header(block)[1]))
+    except (SystemExit, Exception):  # noqa: BLE001 - an unreadable copy is simply not a match
+        return False
+
+
 def _check_block_belongs(model, block, path, force):
     """Refuse a saved block that does not describe this file's payload.
 
@@ -661,12 +691,12 @@ def _check_block_belongs(model, block, path, force):
     # An unreadable header is the expected state after an interrupted patch, so it is
     # not evidence either way. Only a header that parses can contradict the copy.
     try:
-        current = _layout(read_header(model)[1])
+        current = _identity(read_header(model)[1])
     except (SystemExit, Exception):  # noqa: BLE001
         return
-    if current != saved:
+    if current != _identity(_block_header(block)[1]):
         raise SystemExit(
-            f"ABORT: {path}\n  does not match {model}: the section layout differs, so\n"
+            f"ABORT: {path}\n  does not match {model}: its header differs, so\n"
             "  it was saved from a different file. Nothing was written. If you are sure\n"
             "  it is right, re-run with --force.")
 
@@ -685,6 +715,14 @@ def _write_block(model, block):
     with open(model, "rb") as f:
         if f.read(CORE.BLOCK_SIZE) != block:
             raise OSError("the first block does not read back as written")
+
+
+def _same_bytes(path, block):
+    """After a finished restore: a saved copy that cannot be read is merely not this one."""
+    try:
+        return _read_saved_block(path) == block
+    except SystemExit:
+        return False
 
 
 def cmd_restore(args):
@@ -728,7 +766,7 @@ def cmd_restore(args):
     os.remove(backup)
     # The original has done its job once the file is the original again, whichever route
     # got it there. Leaving it would make the NEXT patch's "first seen" a lie.
-    if _is_regular(original) and _read_saved_block(original) == block:
+    if _is_regular(original) and _same_bytes(original, block):
         os.remove(original)
     _fsync_dir(path)
     print(f"header restored from {os.path.basename(path)}")
@@ -838,11 +876,9 @@ def cmd_patch(args):
     # Consent gate (FR-019). Another command driving this tool must assert that it
     # already obtained consent, in the same invocation, by passing --yes. Without a
     # terminal to prompt at and without --yes, refuse rather than write silently.
-    prior = "cpu" if args.backend != "cpu" else "gpu"
     if not _consent(
         f"\nAbout to rewrite the header of:\n  {args.model}\n"
         "Only the first 16 KB is written; the payload is not touched.\n"
-        f"Reversible with:  litertlm_backend.py patch <model> --backend {prior} --yes\n"
         "Byte-exact with:  litertlm_backend.py restore <model> --original --yes",
         args.yes,
     ):
@@ -883,7 +919,6 @@ def cmd_patch(args):
 
     print(f"header rewritten: end {header_end} -> {new_end}")
     print("verify:   litertlm_backend.py resolve")
-    print(f"reverse:  litertlm_backend.py patch {args.model} --backend {prior} --yes")
     print(f"exact:    litertlm_backend.py restore {args.model} --original --yes")
     print("payload:  unchanged — confirm with payload_checksum.py")
 
