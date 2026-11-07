@@ -3,7 +3,7 @@
 
 WHY THIS EXISTS
 ---------------
-`litert-lm serve` has no `--backend` flag (as of v0.14.0). It resolves the backend
+`litert-lm serve` has no `--backend` flag. Without configuration it takes the backend
 from the model file's own metadata, via `litert_lm_cli.model.model_default_backend()`:
 it looks for a `backend_constraint` key on the main section and, when the key is
 absent, falls back to a hardcoded "cpu".
@@ -13,10 +13,20 @@ it serves on CPU even on a machine with a perfectly capable GPU — roughly a 4-
 slowdown, silently. `gemma-4-12B-it.litertlm` declares `backend_constraint = gpu`
 and does not have the problem.
 
-The fix is to write the missing declaration into the model's own header.
+TWO FIXES, BY RUNTIME
+---------------------
+LiteRT-LM 0.15.0 added `~/.litert-lm/config.json`, and from then on the order is:
+per-model config, then the config's default, then the file's metadata. So on 0.15+ the
+answer is one line of config and the downloaded model stays as published:
 
-WHY IT IS CHEAP
----------------
+    litertlm_backend.py configure <model-id> --backend gpu
+
+On 0.14 and earlier the only fix is to write the missing declaration into the model's
+own header, which is what `patch` does. It stays available on newer runtimes behind
+--legacy-header-edit, because it is the wrong first tool there, not a broken one.
+
+WHY THE HEADER EDIT IS CHEAP
+----------------------------
 A .litertlm file is: 8-byte magic, version triple, a u64 at offset 24 holding
 header_end, a flatbuffer header starting at offset 32, then section payloads
 aligned to BLOCK_SIZE (16384). A typical header uses under 2 KB of that first
@@ -29,7 +39,9 @@ boundary.
 
 USAGE
 -----
-    litertlm_backend.py resolve [MODEL_DIR]        # what backend each model resolves to
+    litertlm_backend.py resolve [MODEL_DIR]        # the backend each model will really use
+    litertlm_backend.py configure <id> --backend gpu   # 0.15+: override in config.json
+    litertlm_backend.py configure <id> --clear         # undo that
     litertlm_backend.py show    <model.litertlm>   # dump section metadata
     litertlm_backend.py check   <model.litertlm>   # dry-run the patch, writes nothing
     litertlm_backend.py patch   <model.litertlm> [--backend gpu] [--yes]
@@ -80,8 +92,11 @@ from __future__ import annotations
 
 import argparse
 import glob
+import importlib.metadata
 import io
+import json
 import os
+import re
 import stat
 import struct
 import sys
@@ -367,25 +382,235 @@ def repack(buf, backend=None):
     return bytes(builder.Output()), changed
 
 
+# The first release whose `serve` reads a backend from config.json. Upstream's own schema
+# marks the `backend` key "Added in version 0.15.0".
+CONFIG_MIN_VERSION = (0, 15)
+
+
+def runtime_version():
+    """The installed litert-lm version, or None if its metadata cannot be found."""
+    try:
+        return importlib.metadata.version("litert-lm")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def config_module():
+    """Upstream's config module, where this runtime honours it. Otherwise None.
+
+    Upstream's module rather than a reader of our own, so the answer cannot drift from
+    what the runtime does: base directory, LITERT_LM_DIR, id spellings and validation
+    all come with it. An unknown version is judged by whether the module is there.
+    """
+    match = re.match(r"(\d+)\.(\d+)", runtime_version() or "")
+    if match and (int(match[1]), int(match[2])) < CONFIG_MIN_VERSION:
+        return None
+    try:
+        from litert_lm_cli import config as cfg  # noqa: PLC0415
+    except ImportError:
+        return None
+    return cfg if hasattr(cfg, "get_model_config") else None
+
+
+def configured_backend(cfg, model_id):
+    """(backend, 'model' or 'default') from config.json; (None, None) if it sets none.
+
+    Raises if the config is invalid, which is also what the runtime does when it loads
+    a model, so a caller must not read that as "no override".
+    """
+    app = cfg.load_config()
+    value = cfg.get_model_config(model_id).backend
+    if value is None:
+        return None, None
+    alt_id = model_id.replace("--", "/") if "--" in model_id else model_id.replace("/", "--")
+    entry = app.models.get(model_id) or app.models.get(alt_id)
+    return value, "model" if entry is not None and entry.backend is not None else "default"
+
+
+def allowed_backends(path):
+    """What the engine will accept for this file, or None if it sets no limit.
+
+    Config chooses the backend, but only among these. `backend_constraint` is a list the
+    engine enforces when it creates the session, after config has been applied: a file
+    declaring `npu` with `backend: cpu` in config fails to load ("Main backend constraint
+    mismatch. Model requires one of [npu] but Main backend is CPU"), while `npu,cpu` with
+    the same config loads and answers. Both measured on 0.19.1. A file with no key has no
+    limit, which is why config is the right repair for the models this tool exists for.
+
+    Only a single declared list was measured, so this answers narrowly: it returns a limit
+    only when every main section declares one, and then the union of them. A file with an
+    artisan section, or a main section with no key, might load on anything, and calling
+    such a model REFUSED would block one that works.
+    """
+    try:
+        sections = summarize(read_header(path)[1])[0]
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001 - a damaged header reaches the flatbuffer reader
+        raise SystemExit(f"ABORT: cannot read the header of {path}: {type(e).__name__}: {e}")             from None
+    mains = [{key: value for key, value, _ in s[3]} for s in sections]
+    mains = [m for m in mains if m.get("model_type") in (PREFILL_DECODE, ARTISAN_TEXT_DECODER)]
+    if (not mains or any(m["model_type"] == ARTISAN_TEXT_DECODER for m in mains)
+            or not all(m.get(KEY) for m in mains)):
+        return None
+    allowed = []
+    for main in mains:
+        for part in main[KEY].split(","):
+            if part.strip() and part.strip().lower() not in allowed:
+                allowed.append(part.strip().lower())
+    return allowed or None
+
+
+def _resolve_row(model_id, path, cfg):
+    """One model: what the file declares, what config says, and which of them wins."""
+    try:
+        # Bounds first. The resolver parses the header with upstream's reader, which
+        # is not ours to vouch for against a hostile `header_end`.
+        allowed = allowed_backends(path)
+        embedded = M.model_default_backend(path)
+    except SystemExit as e:
+        return f"{model_id:<24} ERROR: {e}"
+    except Exception as e:  # noqa: BLE001
+        return f"{model_id:<24} ERROR: {type(e).__name__}: {e}"
+
+    if cfg is None:
+        flag = "  <-- serves on CPU" if embedded == "cpu" else ""
+        return f"{model_id:<24} {embedded:<7} embedded={embedded}{flag}"
+
+    try:
+        configured, source = configured_backend(cfg, model_id)
+    except Exception:  # noqa: BLE001
+        # Reported once by the caller. Guessing from metadata here would present a value
+        # the runtime is not going to reach: it refuses an invalid config outright.
+        return f"{model_id:<24} {'unknown':<7} embedded={embedded}  override=(config invalid)"
+
+    effective = configured or embedded
+    override = f"{configured} ({source})" if configured else "none"
+    if allowed is not None and effective.lower() not in allowed:
+        return (f"{model_id:<24} {'REFUSED':<7} embedded={embedded}  override={override}"
+                f"  <-- will not load: the file allows only {','.join(allowed)}")
+    flag = "  <-- serves on CPU" if effective == "cpu" else ""
+    return f"{model_id:<24} {effective:<7} embedded={embedded}  override={override}{flag}"
+
+
 def cmd_resolve(args):
+    cfg = config_module()
+    version = runtime_version() or "unknown"
     root = args.models_dir or os.path.join(os.path.expanduser("~"), ".litert-lm", "models")
+    if cfg is not None and args.models_dir is None:
+        root = os.path.join(cfg.get_cli_base_dir(), "models")
     if not os.path.isdir(root):
         raise SystemExit(f"No such directory: {root}")
+
+    if cfg is None:
+        print(f"litert-lm {version}: no config override on this version; the model file decides.")
+    else:
+        print(f"litert-lm {version}: config overrides read from {cfg.get_config_path()}")
+        try:
+            cfg.load_config()
+        except Exception as e:  # noqa: BLE001
+            print(f"WARNING: that config is invalid and litert-lm will refuse it: {e}")
+
     for model_id in sorted(os.listdir(root)):
         path = os.path.join(root, model_id, "model.litertlm")
         if not os.path.exists(path):
             continue
+        print(_resolve_row(model_id, path, cfg))
+
+
+def cmd_configure(args):
+    """Set or clear a per-model override in config.json. The model file is not touched."""
+    cfg = config_module()
+    if cfg is None:
+        raise SystemExit(
+            f"litert-lm {runtime_version() or '(unknown)'} does not read a backend from "
+            "config.json.\n  That arrived in 0.15.0. Upgrade, or use `check` and `patch`.")
+    if not args.clear and args.backend is None and args.max_num_tokens is None:
+        raise SystemExit("Nothing to do: pass --backend, --max-num-tokens or --clear.")
+
+    # `litert-lm list` prints org/name for a directory called org--name, and either may be
+    # the key in config.json, so both spellings have to reach the same model.
+    model_file = os.path.join(cfg.get_cli_base_dir(), "models",
+                              args.model_id.replace("/", "--"), "model.litertlm")
+    if not os.path.isfile(model_file):
+        raise SystemExit(f"No imported model named '{args.model_id}'. List them: litert-lm list")
+
+    if args.backend is not None:
+        allowed = allowed_backends(model_file)
+        if allowed is not None and args.backend not in allowed:
+            raise SystemExit(
+                f"ABORT: {args.model_id} allows only {','.join(allowed)}, so with "
+                f"backend {args.backend} it would fail to load.\n"
+                "  Config chooses among the backends the file allows. Nothing was written.\n"
+                "  Changing what the file allows is a header edit:\n"
+                f"    litertlm_backend.py patch {model_file} --backend {args.backend} "
+                "--legacy-header-edit")
+
+    path = cfg.get_config_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read().strip()
+    except FileNotFoundError:
+        text = ""
+    try:
+        data = json.loads(text) if text else {}
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"ABORT: {path} is not valid JSON ({e}); it was left alone.") from None
+    if not isinstance(data, dict):
+        raise SystemExit(f"ABORT: {path} is not a JSON object; it was left alone.")
+
+    models = data.setdefault("models", {})
+    if not isinstance(models, dict):
+        raise SystemExit(f"ABORT: `models` in {path} is not an object; it was left alone.")
+    alternate = (args.model_id.replace("--", "/") if "--" in args.model_id
+                 else args.model_id.replace("/", "--"))
+    keys = [k for k in (args.model_id, alternate) if k in models] or [args.model_id]
+    if any(not isinstance(models.get(k, {}), dict) for k in keys):
+        raise SystemExit(f"ABORT: the entry for {args.model_id} in {path} is not an object; "
+                         "it was left alone.")
+    for key in keys:
+        entry = models.setdefault(key, {})
+        if args.clear:
+            entry.pop("backend", None)
+            entry.pop("max_num_tokens", None)
+        if args.backend is not None:
+            entry["backend"] = args.backend
+        if args.max_num_tokens is not None:
+            entry["max_num_tokens"] = args.max_num_tokens
+        if not entry:
+            del models[key]
+    if not models:
+        del data["models"]
+
+    if not _consent(
+        f"\nAbout to update {path}\n  {args.model_id}: {json.dumps(entry) if entry else '(removed)'}\n"
+        "The model file is not touched.",
+        args.yes,
+    ):
+        raise SystemExit("Declined; nothing was written.")
+
+    # Validated as the runtime will validate it, before it can replace anything.
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix="config.", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
         try:
-            # Bounds first. The resolver parses the header with upstream's reader, which
-            # is not ours to vouch for against a hostile `header_end`.
-            read_header(path)
-            backend = M.model_default_backend(path)
-        except SystemExit as e:
-            backend = f"ERROR: {e}"
+            cfg.load_config(tmp)
         except Exception as e:  # noqa: BLE001
-            backend = f"ERROR: {type(e).__name__}: {e}"
-        flag = "  <-- serves on CPU" if backend == "cpu" else ""
-        print(f"{model_id:<24} {backend}{flag}")
+            raise SystemExit(f"ABORT: the result would be invalid ({e}); {path} was left alone.") \
+                from None
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+    print(f"{path} updated; verify with: litertlm_backend.py resolve")
+    print("A running server keeps its current engine: litert-lm config is read when a model loads.")
 
 
 def cmd_show(args):
@@ -444,8 +669,20 @@ def _validate(path, backend):
     return header_end, orig, new, changed, fits
 
 
+def _config_route_note(model, backend):
+    """Whether config can reach `backend` for this file, which decides the right repair."""
+    allowed = allowed_backends(model)
+    if allowed is not None and backend not in allowed:
+        return (f"note: this file allows only {','.join(allowed)}, so config cannot select "
+                f"{backend}; only a header edit changes that.")
+    return ("note: this runtime reads config.json, so `configure` fixes this without "
+            "editing the model.")
+
+
 def cmd_check(args):
     _refuse_pending_backup(args.model)
+    if config_module() is not None:
+        print(_config_route_note(args.model, args.backend))
     _, _, _, changed, fits = _validate(args.model, args.backend)
 
     # A dry run that matched no section used to print "FITS" and exit 0, which reads
@@ -848,6 +1085,21 @@ def _verify_written(model, new, orig, backend):
 def cmd_patch(args):
     _require_regular_model(args.model)
     _refuse_pending_backup(args.model)
+    if config_module() is not None and not args.legacy_header_edit:
+        model_id = os.path.basename(os.path.dirname(os.path.abspath(args.model)))
+        allowed = allowed_backends(args.model)
+        if allowed is not None and args.backend not in allowed:
+            raise SystemExit(
+                f"ABORT: this file allows only {','.join(allowed)}, so config cannot select "
+                f"{args.backend}. Nothing was written.\n"
+                "    To edit the header, which is the one way to change that, "
+                "pass --legacy-header-edit.")
+        raise SystemExit(
+            f"ABORT: litert-lm {runtime_version() or '(unknown)'} reads the backend from "
+            "config.json, so the model file\n  does not need to change. Nothing was written.\n"
+            f"    Do this instead:  litertlm_backend.py configure {model_id} "
+            f"--backend {args.backend}\n"
+            "    To edit the header regardless, pass --legacy-header-edit.")
 
     header_end, orig, new, changed, fits = _validate(args.model, args.backend)
     if not changed:
@@ -948,10 +1200,27 @@ def main():
     p.add_argument("--backend", default="gpu", choices=["cpu", "gpu", "npu"],
                    help="backend to declare. Passing the previous value reverses an earlier "
                         "patch; reversal is a first-class operation, not a side effect.")
+    p.add_argument("--legacy-header-edit", action="store_true",
+                   help="edit the model file even though this runtime can be configured "
+                        "instead (0.15.0 and later)")
     p.add_argument("--yes", action="store_true",
                    help="confirm the write. Required when running non-interactively; a caller "
                         "passing this asserts the user consented in the same invocation.")
     p.set_defaults(func=cmd_patch)
+
+    p = sub.add_parser(
+        "configure",
+        help="set a per-model override in config.json (litert-lm 0.15.0 and later)",
+    )
+    p.add_argument("model_id")
+    p.add_argument("--backend", choices=["cpu", "gpu", "npu"])
+    p.add_argument("--max-num-tokens", type=int,
+                   help="context budget for this model. `serve` has no flag for it; this is "
+                        "the route to a model too large at the default.")
+    p.add_argument("--clear", action="store_true",
+                   help="remove this tool's keys for the model, restoring the file's own default")
+    p.add_argument("--yes", action="store_true", help="confirm the write, as for patch")
+    p.set_defaults(func=cmd_configure)
 
     p = sub.add_parser(
         "restore",

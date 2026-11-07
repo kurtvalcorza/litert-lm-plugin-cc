@@ -9,12 +9,16 @@ litert-lm list
 python "${CLAUDE_PLUGIN_ROOT}/tools/litertlm_backend.py" resolve
 ```
 
-The second command is the one that matters. `litert-lm list` shows size and date but **not**
-the backend, and the backend is decided by metadata inside each model file — a model marked
-`cpu` serves on CPU with no warning and no way to override it at run time.
+The second command is the one that matters. `litert-lm list` shows size and date but **not** the
+backend. Each row of `resolve` gives the **effective** backend first, then what the file declares
+(`embedded`) and any `override` from `~/.litert-lm/config.json`. On LiteRT-LM 0.15.0 and later the
+config wins; on 0.14 and earlier only the file counts, and a model marked `cpu` serves on CPU with
+no warning.
 
-Present them together: id, size, resolved backend. Flag anything on `cpu` that the user
-probably wants on the accelerator.
+Present them together: id, size, effective backend. Flag anything effectively on `cpu` that the
+user probably wants on the accelerator. Do not flag `embedded=cpu` on its own: with a `gpu` override
+that model is correctly on the GPU. Flag every `REFUSED` row: that model will fail to load, because
+its override is outside the backends the file allows.
 
 To inspect one model's full metadata:
 
@@ -23,11 +27,11 @@ python "${CLAUDE_PLUGIN_ROOT}/tools/litertlm_backend.py" show ~/.litert-lm/model
 ```
 
 The interesting section is `tf_lite_prefill_decode`. If it carries no `backend_constraint`
-key, that absence *is* the bug — the resolver falls back to `cpu`. Audio and vision adapter
+key, the resolver falls back to `cpu` unless config says otherwise. Audio and vision adapter
 sections carry their own `backend_constraint = cpu`, which is genuine and must not be touched.
 
-Anything resolving to `cpu` that you want on the accelerator → `/litertlm:setup` step 3 walks
-through the repair, which is dry-runnable, reversible, and leaves the payload untouched.
+Anything effectively on `cpu` that you want on the accelerator → `/litertlm:setup` step 4 offers
+the fix for the installed runtime: a config override on 0.15.0 and later, the header repair before.
 
 ## Things worth telling the user
 

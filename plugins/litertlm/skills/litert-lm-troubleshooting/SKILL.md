@@ -5,8 +5,10 @@ description: Failure catalogue for local LiteRT-LM inference — crashes, droppe
 
 # When local inference misbehaves
 
-Observed against **litert-lm 0.14.0**, RTX 5070 Ti Laptop GPU (12 GB), Windows 11 and WSL2.
-Symptoms first, since that is what you have when you arrive.
+Observed against **litert-lm 0.14.0**, RTX 5070 Ti Laptop GPU (12 GB), Windows 11 and WSL2, unless
+an entry says otherwise. 0.15.0 and later add `config.json`, which changes some answers below;
+measured limits have not been repeated on them. Symptoms first, since that is what you have when
+you arrive.
 
 ---
 
@@ -125,7 +127,8 @@ A **timeout** names itself instead, as *"The operation was aborted due to timeou
 Neither is a network problem.
 
 **Cause**: *usually* an over-long prompt. `serve` on **litert-lm 0.14.0** runs at a fixed
-`max_num_tokens=4096`, offers no flag to raise it and no way to ask what it is. Once a prompt
+`max_num_tokens=4096`, offers no flag to raise it and no way to ask what it is (0.15.0 and later
+read a per-model value from config; see below). Once a prompt
 exceeds it the server **breaks the HTTP response** rather than returning a clean error, so
 there is no status code to match on — which is why this arrives looking like a dead server
 rather than an over-long request.
@@ -213,11 +216,11 @@ that the model read the whole thing. A failure shows less still: the request may
 been sent at all, so it is not even evidence against that size. Do not raise `--max-bytes` on
 the strength of either. See `--allow-oversize` in `litertlm-review.mjs --help`.
 
-**When this is expected to stop being true**: watch `litert-lm`, not the driver. The
-unreleased **0.15.0** config at `~/.litert-lm/config.json` carries a per-model
-`max_num_tokens`. That the field exists is not yet evidence `serve` reads it — the workaround
-retires when `serve` can be told a token budget or reports the one it has, whichever arrives.
-When it does, **re-measure rather than assuming the number rose**.
+**On 0.15.0 and later**: `serve` reads `max_num_tokens` from config when it loads a model
+(`litertlm_backend.py configure <id> --max-num-tokens <n>`), per the v0.19.1 source. Nothing here
+has been measured on those versions, so the 6 KiB guard stands as a conservative default rather
+than a limit: **measure the model you serve, then pass `--max-bytes`**, rather than assuming a
+figure.
 
 ---
 
@@ -226,7 +229,8 @@ When it does, **re-measure rather than assuming the number rose**.
 **Symptom**: responses take ~13 s where ~3 s is expected. Nothing reports a problem.
 
 **Cause**: the model is serving on **CPU**. Its metadata omits `backend_constraint`, so the
-resolver falls back to CPU — and `serve` has no `--backend` flag to override it.
+resolver falls back to CPU, `serve` has no `--backend` flag, and nothing in `config.json` says
+otherwise.
 
 **Diagnose**:
 
@@ -234,8 +238,17 @@ resolver falls back to CPU — and `serve` has no `--backend` flag to override i
 python "${CLAUDE_PLUGIN_ROOT}/tools/litertlm_backend.py" resolve
 ```
 
-Anything reporting `cpu` is affected. Fix via `/litertlm:setup` step 3, or directly — dry run
-first, it writes nothing:
+Anything whose first column is `cpu` is affected; `embedded=cpu` alone is not, because a config
+override wins. A first column of `REFUSED` is a load failure, not a slow model: the config asks for
+a backend the file's `backend_constraint` excludes, and the engine answers `Main backend constraint
+mismatch`. Clear that override with `configure <model-id> --clear --yes`. Fix via `/litertlm:setup` step 4. On 0.15.0 and later that is one override, with the
+model file left alone:
+
+```bash
+python "${CLAUDE_PLUGIN_ROOT}/tools/litertlm_backend.py" configure <model-id> --backend gpu --yes
+```
+
+On 0.14 and earlier it is the header repair — dry run first, it writes nothing:
 
 ```bash
 python "${CLAUDE_PLUGIN_ROOT}/tools/litertlm_backend.py" check <model.litertlm>

@@ -1745,7 +1745,8 @@ async function chat(opts) {
       `lost the connection to the server mid-request (${err.message}).\n`
       + (sizeSuspect
         ? `  CHECK THE PROMPT SIZE FIRST — this request was ${kb(bytes)}. litert-lm 0.14.0 runs\n`
-          + '  at a fixed max_num_tokens and breaks the HTTP response rather than refusing\n'
+          + '  at a fixed max_num_tokens (later versions take one from config.json, and may\n'
+          + '  still be at their default) and breaks the HTTP response rather than refusing\n'
           + '  cleanly once a prompt exceeds it, so this is what an over-long prompt looks\n'
           + '  like. The ceiling is model-dependent; see litertlm-review.mjs DEFAULTS for\n'
           + '  measured figures. Send less and see if it clears.\n'
@@ -1761,9 +1762,10 @@ async function chat(opts) {
   if (!res.ok) {
     let hint = '';
     if (/mapped_region|embedding lookup/i.test(text)) {
-      hint = '\n  This model does not fit at its default context on this GPU. `serve` cannot cap'
-        + ' the KV cache, so it cannot be served here.\n  Use a smaller model, or run it outside'
-        + ' the plugin: litert-lm run <model> --max-num-tokens 1024';
+      hint = '\n  This model does not fit at its default context on this GPU. `serve` has no flag'
+        + ' to cap it.\n  On litert-lm 0.15.0 or later set max_num_tokens for this model in'
+        + ' config.json (litertlm_backend.py configure).\n  Otherwise use a smaller model, or run'
+        + ' it outside the plugin: litert-lm run <model> --max-num-tokens 1024';
     } else if (/not found|unknown model/i.test(text)) {
       hint = '\n  Check the model id: litert-lm list';
     }
