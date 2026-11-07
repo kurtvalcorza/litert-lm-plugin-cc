@@ -47,7 +47,7 @@ def _kv(key, value):
     return kv
 
 
-def _header(begin=16384, end=16384 + 4096, constraint=None):
+def _header(begin=16384, end=16384 + 4096, constraint=None, tokenizer=None):
     """A real header: one prefill/decode section plus system metadata."""
     sec = lb.SCHEMA.SectionObjectT()
     sec.beginOffset = begin
@@ -56,6 +56,8 @@ def _header(begin=16384, end=16384 + 4096, constraint=None):
     sec.items = [_kv("model_type", lb.PREFILL_DECODE)]
     if constraint is not None:
         sec.items.append(_kv(lb.KEY, constraint))
+    if tokenizer is not None:
+        sec.items.append(_kv("tokenizer", tokenizer))
     section_md = lb.SCHEMA.SectionMetadataT()
     section_md.objects = [sec]
     system_md = lb.SCHEMA.SystemMetadataT()
@@ -365,7 +367,7 @@ class MismatchedCopy(Case):
             f.write(block)
         with self.assertRaises(SystemExit) as caught:
             _restore(self.model)
-        self.assertIn("section layout differs", str(caught.exception))
+        self.assertIn("its header differs", str(caught.exception))
         self.assertEqual(_first_block(self.model), self.block)
 
     def test_force_overrides_the_layout_check_but_not_the_size_check(self):
@@ -386,6 +388,48 @@ class MismatchedCopy(Case):
                 f.write(self.block[:8].ljust(size, b"\0"))
             with self.assertRaises(SystemExit):
                 _restore(self.model)
+
+    def _patched_then_replaced(self, **kw):
+        """A patched model replaced in place by another, as a re-import to the same id does."""
+        _patch(self.model, "gpu")
+        return _container(self.model, **kw)
+
+    def test_patch_refuses_an_original_saved_from_another_file(self):
+        block = self._patched_then_replaced(end=30000)
+        with self.assertRaises(SystemExit) as caught:
+            _patch(self.model, "gpu")
+        self.assertIn("was not saved from this file", str(caught.exception))
+        self.assertEqual(_first_block(self.model), block, "its only first block must survive")
+        self.assertFalse(os.path.exists(self.model + ".hdrbak"), "no journal left behind")
+
+    def test_patch_refuses_an_original_that_is_not_a_header(self):
+        block = self.block
+        with open(self.original, "wb") as f:
+            f.write(b"not a header")
+        with self.assertRaises(SystemExit):
+            _patch(self.model, "gpu")
+        self.assertEqual(_first_block(self.model), block)
+
+    def test_a_block_differing_only_in_a_section_item_is_another_file(self):
+        block = self._patched_then_replaced(tokenizer="NEW")
+        with self.assertRaises(SystemExit) as caught:
+            _restore(self.model, original=True)
+        self.assertIn("its header differs", str(caught.exception))
+        self.assertEqual(_first_block(self.model), block)
+
+    def test_a_second_patch_of_the_same_file_keeps_its_original(self):
+        block = self.block
+        _patch(self.model, "gpu")
+        _patch(self.model, "npu")
+        _restore(self.model, original=True)
+        self.assertEqual(_first_block(self.model), block)
+
+    def test_a_truncated_file_is_a_clean_refusal(self):
+        with open(self.model, "wb") as f:
+            f.write(lb.CORE.HEADER_MAGIC_BYTES + b"\0" * 12)
+        with self.assertRaises(SystemExit) as caught:
+            lb.read_header(self.model)
+        self.assertIn("truncated", str(caught.exception))
 
     def test_stale_original_from_a_reimport_is_refused(self):
         with open(self.original, "wb") as f:
