@@ -96,9 +96,10 @@ const DEFAULTS = {
   // Lowering --max-tokens does not buy room (1200 -> 100 moved the ceiling ~256 B), so
   // treat max_num_tokens as a prompt budget with the reply on top, not a shared pool.
   //
-  // Obsolete when `serve` can be told a token budget, or reports the one it has. The
-  // unreleased 0.15.0 config (~/.litert-lm/config.json) carries a per-model
-  // max_num_tokens; once that ships, re-measure rather than assuming this number rose.
+  // A conservative default, not a runtime limit. litert-lm 0.15.0 and later read a
+  // per-model max_num_tokens from ~/.litert-lm/config.json, and `serve` still cannot
+  // report the budget it has, so this cannot adapt on its own. Nothing here has been
+  // measured on those versions: re-measure, then pass --max-bytes.
   maxBytes: 6 * 1024,
   maxTokens: 1200,
 };

@@ -18,9 +18,8 @@ It also fixes a trap that costs most users 4–5× performance without telling t
 ## The trap this exists to fix
 
 Several published `.litertlm` models omit a `backend_constraint` key in their metadata. When
-it is absent, LiteRT-LM's resolver falls back to **CPU** — and `litert-lm serve` has **no
-`--backend` flag**, so there is no way to override it at run time. The model serves on CPU,
-several times slower, and nothing reports a problem.
+it is absent, LiteRT-LM's resolver falls back to **CPU**, and `litert-lm serve` has **no
+`--backend` flag**. The model serves on CPU, several times slower, and nothing reports a problem.
 
 Measured here, same prompt, same model, warm server:
 
@@ -32,14 +31,18 @@ Measured here, same prompt, same model, warm server:
 *gemma4-e4b, RTX 5070 Ti Laptop GPU (12 GB), Windows 11, litert-lm 0.14.0. Warm server,
 steady state — a first call after idle is slower because it pays engine initialisation.*
 
-`/litertlm:setup` finds affected models and offers to repair them. The repair rewrites **only the
-16 KB metadata header**; the multi-gigabyte payload is never touched, which is verifiable, and
-the change is reversible.
+`/litertlm:setup` finds affected models and offers the fix for your runtime:
+
+- **LiteRT-LM 0.15.0 or later**: a per-model override in `~/.litert-lm/config.json`, which takes
+  precedence over the file's metadata. The model stays exactly as published.
+- **0.14 and earlier**: there is no override, so the repair rewrites **only the 16 KB metadata
+  header**. The multi-gigabyte payload is never touched, which is verifiable, and the change
+  reverses byte for byte. It is still available on newer runtimes behind `--legacy-header-edit`.
 
 ## Requirements
 
-- [Node.js](https://nodejs.org/) ≥ 18 and Python ≥ 3.9 — both standard-library only, no
-  install step, no dependency tree
+- [Node.js](https://nodejs.org/) ≥ 18 and Python ≥ 3.10 (LiteRT-LM's own CLI requires it) — both
+  standard-library only, no install step, no dependency tree
 - LiteRT-LM — `uv tool install litert-lm`, or plain `pip install litert-lm` if you do not
   already have [uv](https://docs.astral.sh/uv/)
   *(there is no Windows or Linux binary in GitHub Releases — PyPI is the channel)*

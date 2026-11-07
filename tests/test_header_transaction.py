@@ -95,7 +95,8 @@ def _payload_digest(path):
 
 def _patch(path, backend="gpu"):
     with contextlib.redirect_stdout(io.StringIO()):
-        lb.cmd_patch(SimpleNamespace(model=path, backend=backend, yes=True))
+        lb.cmd_patch(SimpleNamespace(model=path, backend=backend, yes=True,
+                                     legacy_header_edit=True))
 
 
 def _restore(path, original=False, force=False):

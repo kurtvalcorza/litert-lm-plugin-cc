@@ -71,8 +71,9 @@ Both names carry the `tf_lite_` prefix — take them verbatim from
 2. Otherwise, if that section carries `backend_constraint` → its first comma-separated value.
 3. Otherwise → **`cpu`**.
 
-Step 3 is the whole problem. Absence is not neutral; it means CPU. And `litert-lm serve` has no
-`--backend` flag, so nothing downstream can override it.
+Step 3 is the whole problem. Absence is not neutral; it means CPU. `litert-lm serve` has no
+`--backend` flag, so on 0.14 nothing downstream can override it. From 0.15.0 `~/.litert-lm/config.json`
+sits above all three steps: per-model `backend`, then `default.backend`, then this resolver.
 
 **Never patch an artisan model.** Step 1 short-circuits, so `backend_constraint` is never
 consulted for them — a write would be a no-op that merely looked like a fix, and they cannot
@@ -124,8 +125,9 @@ Guard with `hasattr` so it becomes a no-op when upstream fixes the casing.
 Verify afterwards by hashing the payload with the first `BLOCK_SIZE` bytes skipped. Identical
 before and after is the proof that the rewrite was contained.
 
-## Expected obsolescence
+## Obsolete on 0.15.0 and later
 
-The unreleased 0.15.0 config (`~/.litert-lm/config.json`) already carries per-model `backend`
-and `max_num_tokens` in its schema. When it ships, editing model files becomes unnecessary —
-and `max_num_tokens` would also fix the models that currently cannot be served at all.
+`~/.litert-lm/config.json` carries per-model `backend` and `max_num_tokens`, and `serve` reads both
+when it loads a model, so editing a model file is unnecessary there. `litertlm_backend.py configure`
+writes that override, and `patch` refuses without `--legacy-header-edit`. Everything above still
+describes the file; it no longer describes the decision.
