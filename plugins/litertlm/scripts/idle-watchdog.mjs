@@ -87,6 +87,21 @@ function writeState(name, value) {
   } catch { /* ignore */ }
 }
 
+/**
+ * Establish the `stopping` handshake, and report whether it really was established.
+ *
+ * A client admits itself by reading this file, so a shutdown that continues after a
+ * failed write has told nobody: a request can enter between the count and the signal
+ * and be killed mid-generation, which FR-024 and FR-025 both forbid. `writeState` is
+ * best-effort by design, so the result is read back. The stamp is compared rather than
+ * mere existence, because a file left by an earlier round proves nothing about this one.
+ */
+function claimStopping() {
+  const stamp = String(Date.now());
+  writeState('stopping', stamp);
+  return readState('stopping') === stamp;
+}
+
 function clearState(name) {
   try { rmSync(statePath(name), { force: true }); } catch { /* ignore */ }
 }
@@ -553,7 +568,7 @@ async function main() {
       // between them makes that window seconds wide on Windows. `stopping` is what
       // stops a new client entering at all, which is the only thing that makes the
       // count mean something by the time it is acted on.
-      writeState('stopping', Date.now());
+      if (!claimStopping()) continue;     // no handshake, no signal; ask again next poll
       // THE SAME RULE AS THE NORMAL IDLE PATH, not a second one written alongside it.
       //
       // Two attempts at this branch each got half of it. Yielding to live work
@@ -649,14 +664,26 @@ async function main() {
     if (!(await serverReachable())) {
       missedProbes += 1;
       if (missedProbes < UNREACHABLE_TOLERANCE) continue;
-      clearState('server.pid');
-      // The engine died with someone else's hand on it, so nothing is resident.
-      // Leaving `loaded-model` behind makes the next client warn about a model
-      // switch that is not happening.
-      clearState('loaded-model');
-      cleanupAndExit(0);        // deliberately does not touch in-flight
+
+      // Two minutes of silence is not death, and reading it as death leaked a daemon: a
+      // large model can take that long to load, and a server on an address we are not
+      // probing never answers at all. Either way the engine is still there holding
+      // accelerator memory, and walking away left it with no supervisor. So ask the OS,
+      // and leave only when there is positively nothing left of it. Anything else drops
+      // through to the idle test below, so a server that never answers is still stopped
+      // on the normal schedule, under the normal in-flight rules.
+      const { targets, unidentified, discoveryFailed } = ourTargets();
+      if (!targets.length && !unidentified.length && !discoveryFailed) {
+        clearState('server.pid');
+        // The engine died with someone else's hand on it, so nothing is resident.
+        // Leaving `loaded-model` behind makes the next client warn about a model
+        // switch that is not happening.
+        clearState('loaded-model');
+        cleanupAndExit(0);      // deliberately does not touch in-flight
+      }
+    } else {
+      missedProbes = 0;
     }
-    missedProbes = 0;
 
     const lastActivity = Number.parseInt(readState('last-activity', String(Date.now())), 10)
       || Date.now();
@@ -697,7 +724,10 @@ async function main() {
     // included below; one published after it is withdrawn by the client when that
     // client re-reads `stopping`. The ownership walk above may take seconds, but it
     // no longer sits between an unprotected count and the signal.
-    writeState('stopping', Date.now());
+    //
+    // No handshake, no signal. Staying up on a state directory that has gone bad costs
+    // accelerator memory until it recovers; going ahead could cost a user's request.
+    if (!claimStopping()) continue;
 
     const confirmedInFlight = countInFlight();
     const confirmedActivity = Number.parseInt(

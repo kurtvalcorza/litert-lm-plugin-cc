@@ -138,7 +138,7 @@ function writeStateAtomic(port, name, value) {
  * `isLive()` reports whether the current occupant is a live claim we must not disturb.
  * Returns `'won'` (we own the slot now), `'occupied'` (a live claim holds it — wait or
  * adopt), or `'retry'` (another reclaimer is mid-flight; re-observe). Propagates a
- * non-EEXIST create failure so the caller can choose how to degrade.
+ * non-EEXIST create failure: the caller must not treat that as having the slot.
  */
 function claimStateSlot(port, name, record, isLive) {
   try {
@@ -192,17 +192,25 @@ function claimStateSlot(port, name, record, isLive) {
  */
 const IN_FLIGHT_DIR = 'in-flight.d';
 
-async function acquireInFlight(port, opts = null) {
+async function acquireInFlight(port, opts) {
   const dir = join(stateDir(port), IN_FLIGHT_DIR);
 
+  // A marker that cannot be written is the same unprotected request as the one the
+  // comment below refuses to run, reached a shorter way. This used to return null as
+  // "best-effort tracking", and the caller went on to `chat()`: the watchdog then saw
+  // nothing in flight and was free to kill the server under a live request.
   const publish = () => {
     const marker = join(dir, `${process.pid}-${Date.now()}`);
     try {
       mkdirSync(dir, { recursive: true });
       writeFileSync(marker, '', 'utf8');
       return marker;
-    } catch {
-      return null;   // tracking is best-effort; never fail a request over it
+    } catch (err) {
+      throw new Error(
+        `could not record this request in ${dir} (${err.code ?? err.message}).\n`
+        + '  It was not started, because the idle watchdog counts these records to decide\n'
+        + '  whether the server is busy, and would be free to stop it mid-generation.\n'
+        + '  Make that directory writable, or point LITERT_LM_PLUGIN_RUNTIME somewhere that is.');
     }
   };
 
@@ -220,13 +228,11 @@ async function acquireInFlight(port, opts = null) {
   // cannot miss each other.
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const marker = publish();
-    if (marker === null) return null;
     if (readState(port, 'stopping') === null) return marker;
 
     // A shutdown owns the server right now. Stand aside rather than pin it open, wait
     // for the handshake to clear, and try again.
     releaseInFlight(marker);
-    if (opts === null) return null;
     await awaitNotStopping(opts);
   }
 
@@ -360,12 +366,18 @@ function acquireStartClaim(port, spawnedAt) {
     let outcome;
     try {
       outcome = claimStateSlot(port, 'starting', record, () => liveStartClaim(port) !== null);
-    } catch {
+    } catch (err) {
       // The exclusive create failed for a reason unrelated to contention (a full or
-      // read-only filesystem). Fall back to the previous best-effort write rather than
-      // refuse to start; state is an optimisation, and a lone start still needs to run.
-      writeState(port, 'starting', record);
-      return true;
+      // read-only filesystem). This fell back to a best-effort write and returned true,
+      // but that write swallows the same failure, so every concurrent client "won" and
+      // spawned an engine. Exclusive ownership is the one thing this function exists to
+      // establish, and repeated GPU initialisation is not a harmless race on this
+      // hardware, so no claim means no spawn.
+      throw new Error(
+        `could not claim the start of a server on port ${port} in ${stateDir(port)}\n`
+        + `  (${err.code ?? err.message}). Nothing was started, because without that claim\n`
+        + '  concurrent clients could each launch an engine. Make that directory writable,\n'
+        + '  or point LITERT_LM_PLUGIN_RUNTIME somewhere that is.');
     }
     if (outcome === 'won') return true;
     if (outcome === 'occupied') return false;            // a live start owns the port

@@ -269,6 +269,22 @@ does, the model must be re-imported — the payload is intact but nothing descri
 
 ---
 
+## "It was not started" / "Nothing was started"
+
+**Symptom**: a request or a cold start refuses with one of those messages and names a directory.
+
+**Cause**: the plugin could not write its coordination state there, usually a full or read-only
+disk, or a `LITERT_LM_PLUGIN_RUNTIME` pointing somewhere unwritable. It refuses on purpose: the
+idle watchdog counts those records to know whether a request is running, and the start claim is
+what keeps concurrent clients from each launching an engine. Going ahead without them is how a
+request gets killed mid-generation.
+
+**Fix**: make the named directory writable, or point `LITERT_LM_PLUGIN_RUNTIME` elsewhere. For the
+same reason the watchdog will not stop a server while it cannot write `stopping`, so a server can
+outlive its idle timeout until the directory recovers. That is the safe direction to fail in.
+
+---
+
 ## A model benchmarks fine but fails when actually used
 
 **Symptom**: `litert-lm benchmark` passes. `run` or `serve` fails with a memory-mapping error,

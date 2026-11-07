@@ -355,6 +355,11 @@ export function addressVerdict(listenAddress, host) {
   if (h === 'localhost') return 'serves';              // either family may be the one
   if (h.includes(':') ? a !== '0.0.0.0' : a === '0.0.0.0') return 'serves';
 
+  // The two cross-family cases are not alike. An IPv4 socket cannot accept IPv6 at all,
+  // so `0.0.0.0` against a v6 literal is settled, and calling it unprovable blocked
+  // idle-stop and `--stop` for ever on a listener that cannot be the one we talk to.
+  if (h.includes(':')) return 'foreign';
+
   // A CROSS-FAMILY WILDCARD IS UNPROVABLE, NOT ABSENT — and the difference is the
   // whole verdict. `::` serves v4 callers when IPV6_V6ONLY is off and does not when
   // it is on, and no platform query here reports which. Excluding it outright was the
