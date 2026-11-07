@@ -32,7 +32,8 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import {
-  _parsers, _queries, addressServes, commandLaunches, descendantsOf, formatPidRecord, identity,
+  _parsers, _queries, addressServes, addressVerdict, commandLaunches, descendantsOf, forgetIdentities, formatPidRecord,
+  identity,
   identifyPortOwners, isLitertLmServeCommand, parsePidRecord, pidsOnPort, processTable,
   portOwnerDiscoveryHelp, recordIsStale, signallablePid, startGeneration, startToken,
 } from '../plugins/litertlm/scripts/process-identity.mjs';
@@ -93,6 +94,13 @@ function reservePort(from) {
 // looked harmless and was not: the derived number was never probed, so it carried the
 // exact hazard the reservation exists to remove.
 const PORT = {
+  markerRefused: reservePort(19201),
+  claimRefused: reservePort(19211),
+  handshakeRefused: reservePort(19221),
+  silentLive: reservePort(19231),
+  silentIdle: reservePort(19241),
+  silentGone: reservePort(19251),
+  silentUnjudged: reservePort(19581),
   stranger: reservePort(19301),
   reuse: reservePort(19311),
   watchdogStranger: reservePort(19321),
@@ -125,7 +133,13 @@ const PORT = {
 };
 
 const spawned = [];
-const reap = (child) => { spawned.push(child); return child; };
+// Windows reissues pids, and this process memoises identities for its whole run, so a new
+// fixture could otherwise be given the token of a dead one, and read as a reused pid.
+const reap = (child) => {
+  spawned.push(child);
+  forgetIdentities([child.pid]);
+  return child;
+};
 after(() => {
   for (const c of spawned) { try { c.kill('SIGKILL'); } catch { /* already gone */ } }
 });
@@ -1429,6 +1443,37 @@ describe('recording a process we spawned', () => {
         readdirSync(dir).filter((f) => f.startsWith('starting.reclaim.')), [],
         'the rename-reclaim must leave no aside file behind');
     });
+
+  test('no server is spawned without the exclusive start claim',
+    { timeout: 60_000 }, async (t) => {
+      const port = PORT.claimRefused;
+      const runtime = runtimeDir();
+      const binDir = join(runtime, 'refused-bin');
+      const workDir = join(runtime, 'refused-work');
+      installFakeLitertLm(binDir, workDir, port);
+      // The whole runtime path is a file, so the state directory can never be created.
+      const blocked = join(runtime, 'not-a-directory');
+      writeFileSync(blocked, 'in the way', 'utf8');
+
+      const sep = process.platform === 'win32' ? ';' : ':';
+      const r = spawnSync(process.execPath, [CLIENT, '--list', '--port', String(port)], {
+        encoding: 'utf8', windowsHide: true, cwd: workDir,
+        env: {
+          ...process.env,
+          LITERT_LM_PLUGIN_RUNTIME: blocked,
+          PATH: `${binDir}${sep}${process.env.PATH ?? ''}`,
+          Path: `${binDir}${sep}${process.env.Path ?? ''}`,
+        },
+      });
+
+      const grandchild = Number.parseInt(readIfPresent(join(workDir, 'grandchild.pid')) ?? '', 10);
+      t.after(() => {
+        if (alive(grandchild)) try { process.kill(grandchild, 'SIGKILL'); } catch { /* gone */ }
+      });
+      assert.equal(r.status, 1, `expected a refusal: ${r.stdout}`);
+      assert.match(r.stderr, /Nothing was started/);
+      assert.ok(Number.isNaN(grandchild), 'the launcher must never have run');
+    });
 });
 
 describe('starting beside a leftover', () => {
@@ -2661,6 +2706,236 @@ describe('cancelling a start whose descendant has not bound yet', () => {
       assert.equal(readIfPresent(join(dir, 'stop-claim')), null,
         'the admission claim is released after finalization');
     });
+});
+
+describe('failing closed when coordination state cannot be written', () => {
+  /** Answers /v1/models and records every chat request, so "not sent" is observable. */
+  async function startCountingServer(port, log) {
+    const src = `
+      import { appendFileSync } from 'node:fs';
+      import { createServer } from 'node:http';
+      createServer((req, res) => {
+        if (req.method === 'POST') appendFileSync(${JSON.stringify(log)}, 'chat');
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', data: [{ id: 'fake' }],
+          choices: [{ message: { content: 'hi' } }] }));
+      }).listen(${port}, '127.0.0.1');
+      setInterval(() => {}, 1000);
+    `;
+    const child = reap(spawn(process.execPath, ['--input-type=module', '-e', src],
+      { stdio: 'ignore', windowsHide: true }));
+    await sleep(800);
+    return child;
+  }
+
+  const askArgs = (port) => ['--port', String(port), '--model', 'fake', '--idle-timeout', '0',
+    'hello'];
+
+  test('a request is not sent when its in-flight marker cannot be written',
+    { timeout: 60_000 }, async () => {
+      const port = PORT.markerRefused;
+      const runtime = runtimeDir();
+      const dir = stateDir(runtime, port);
+      const log = join(runtime, 'chats.log');
+      const server = await startCountingServer(port, log);
+      // A plain file where the marker directory goes: every create under it fails, on
+      // every platform, whoever is running the tests.
+      writeFileSync(join(dir, 'in-flight.d'), 'in the way', 'utf8');
+
+      const refused = runClient(askArgs(port), runtime);
+      assert.equal(refused.status, 1, `expected a refusal, got: ${refused.stdout}`);
+      assert.match(refused.stderr, /was not started/);
+      assert.equal(readIfPresent(log), null, 'an unprotected request must never be sent');
+
+      rmSync(join(dir, 'in-flight.d'));
+      const fine = runClient(askArgs(port), runtime);
+      assert.equal(fine.status, 0, `the same request works once it can be tracked: ${fine.stderr}`);
+      assert.equal(readIfPresent(log), 'chat');
+      try { server.kill('SIGKILL'); } catch { /* already gone */ }
+    });
+
+  test('the watchdog does not signal when it cannot establish the handshake',
+    { timeout: 90_000 }, async (t) => {
+      if (!(await canDiscoverPortOwners())) {
+        t.skip('no socket-owner discovery on this host (needs lsof or ss)');
+        return;
+      }
+      const port = PORT.handshakeRefused;
+      const runtime = runtimeDir();
+      const dir = stateDir(runtime, port);
+      const workDir = join(runtime, 'handshake');
+      mkdirSync(workDir, { recursive: true });
+      const server = await startFakeLitertLmServer(port, workDir);
+      const reached = join(workDir, 'write-attempted');
+      const preload = join(workDir, 'fail-stopping.cjs');
+      writeFileSync(preload, `
+        const fs = require('node:fs');
+        const realWrite = fs.writeFileSync.bind(fs);
+        fs.writeFileSync = (path, ...args) => {
+          if (String(path).endsWith('stopping')) {
+            realWrite(${JSON.stringify(reached)}, 'yes', 'utf8');
+            throw Object.assign(new Error('read-only'), { code: 'EROFS' });
+          }
+          return realWrite(path, ...args);
+        };
+      `, 'utf8');
+
+      writeFileSync(join(dir, 'server.pid'), formatPidRecord(server.pid), 'utf8');
+      writeFileSync(join(dir, 'last-activity'), String(Date.now() - 600_000), 'utf8');
+      const watchdog = reap(spawn(process.execPath,
+        [WATCHDOG, '--port', String(port), '--idle-timeout', '1'], {
+          stdio: 'ignore', windowsHide: true,
+          env: {
+            ...process.env,
+            LITERT_LM_PLUGIN_RUNTIME: runtime,
+            NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${JSON.stringify(preload)}`.trim(),
+          },
+        }));
+
+      assert.ok(await waitFor(() => readIfPresent(reached) !== null, { timeout: 40_000 }),
+        'the watchdog should reach the handshake and fail to write it');
+      await sleep(2500);
+      assert.ok(alive(server.pid), 'no handshake means no signal');
+      assert.equal(readIfPresent(join(dir, 'stopped-idle')), null,
+        'an unattempted shutdown must not be reported');
+      assert.ok(alive(watchdog.pid), 'it keeps supervising and tries again');
+
+      try { watchdog.kill('SIGKILL'); } catch { /* already gone */ }
+      try { server.kill('SIGKILL'); } catch { /* already gone */ }
+    });
+});
+
+describe('a server that stops answering', () => {
+  /** Polls in milliseconds rather than seconds, so the two-minute tolerance is testable. */
+  function fastClock(dir) {
+    const preload = join(dir, 'fast-clock.cjs');
+    writeFileSync(preload, `
+      const timers = require('node:timers/promises');
+      const real = timers.setTimeout;
+      timers.setTimeout = (ms, ...args) => real(Math.min(ms, 20), ...args);
+      require('node:module').syncBuiltinESMExports();
+    `, 'utf8');
+    return preload;
+  }
+
+  const supervise = (port, runtime, preload, idleTimeout) => reap(spawn(process.execPath,
+    [WATCHDOG, '--port', String(port), '--idle-timeout', String(idleTimeout)], {
+      stdio: 'ignore', windowsHide: true,
+      env: {
+        ...process.env,
+        LITERT_LM_PLUGIN_RUNTIME: runtime,
+        NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require=${JSON.stringify(preload)}`.trim(),
+      },
+    }));
+
+  test('stays with a live server past the tolerance', { timeout: 60_000 }, async (t) => {
+    if (!(await canDiscoverPortOwners())) {
+      t.skip('no socket-owner discovery on this host (needs lsof or ss)');
+      return;
+    }
+    const port = PORT.silentLive;
+    const runtime = runtimeDir();
+    const dir = stateDir(runtime, port);
+    const silent = await startBystander();
+    writeFileSync(join(dir, 'server.pid'), formatPidRecord(silent.pid), 'utf8');
+    writeFileSync(join(dir, 'last-activity'), String(Date.now()), 'utf8');
+    const watchdog = supervise(port, runtime, fastClock(runtime), 3600);
+
+    await sleep(6000);
+    assert.ok(alive(watchdog.pid), 'a process still alive is still supervised');
+    assert.equal(recordedServerPid(dir), silent.pid, 'its record survives the silence');
+    assert.ok(alive(silent.pid), 'and it is not idle yet, so it is left running');
+
+    try { watchdog.kill('SIGKILL'); } catch { /* already gone */ }
+    try { silent.kill('SIGKILL'); } catch { /* already gone */ }
+  });
+
+  test('stops a silent server once it has been idle', { timeout: 60_000 }, async (t) => {
+    if (!(await canDiscoverPortOwners())) {
+      t.skip('no socket-owner discovery on this host (needs lsof or ss)');
+      return;
+    }
+    const port = PORT.silentIdle;
+    const runtime = runtimeDir();
+    const dir = stateDir(runtime, port);
+    const silent = await startBystander();
+    writeFileSync(join(dir, 'server.pid'), formatPidRecord(silent.pid), 'utf8');
+    writeFileSync(join(dir, 'last-activity'), String(Date.now() - 600_000), 'utf8');
+    supervise(port, runtime, fastClock(runtime), 1);
+
+    assert.ok(await waitFor(() => !alive(silent.pid), { timeout: 30_000 }),
+      'silence must not exempt a server from the idle schedule');
+    assert.ok(await waitFor(() => readIfPresent(join(dir, 'stopped-idle')) !== null,
+      { timeout: 10_000 }), 'and the stop is reported');
+  });
+
+  test('a failed identity lookup is not a death', { timeout: 60_000 }, async (t) => {
+    if (!(await canDiscoverPortOwners())) {
+      t.skip('no socket-owner discovery on this host (needs lsof or ss)');
+      return;
+    }
+    const port = PORT.silentUnjudged;
+    const runtime = runtimeDir();
+    const dir = stateDir(runtime, port);
+    const silent = await startBystander();
+    const record = formatPidRecord(silent.pid);
+    writeFileSync(join(dir, 'server.pid'), record, 'utf8');
+    writeFileSync(join(dir, 'last-activity'), String(Date.now()), 'utf8');
+
+    // Every platform's way of describing this one process fails; it stays alive throughout.
+    const preload = fastClock(runtime);
+    writeFileSync(preload, `${readFileSync(preload, 'utf8')}
+      const cp = require('node:child_process');
+      const fs = require('node:fs');
+      const target = ${JSON.stringify(String(silent.pid))};
+      const realSpawn = cp.spawnSync;
+      cp.spawnSync = (cmd, args, options) => (String(args).includes(target)
+        ? { stdout: '', stderr: '', status: 1, signal: null }
+        : realSpawn(cmd, args, options));
+      const realRead = fs.readFileSync;
+      fs.readFileSync = (file, ...rest) => {
+        if (String(file).startsWith('/proc/' + target + '/')) {
+          throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+        }
+        return realRead(file, ...rest);
+      };
+      require('node:module').syncBuiltinESMExports();
+    `, 'utf8');
+    const watchdog = supervise(port, runtime, preload, 3600);
+
+    await sleep(6000);
+    assert.ok(alive(watchdog.pid), 'a lookup that failed proves nothing about the process');
+    assert.equal(readIfPresent(join(dir, 'server.pid')), record, 'its identity is kept');
+
+    try { watchdog.kill('SIGKILL'); } catch { /* already gone */ }
+    try { silent.kill('SIGKILL'); } catch { /* already gone */ }
+  });
+
+  test('stands down when nothing is left', { timeout: 60_000 }, async (t) => {
+    if (!(await canDiscoverPortOwners())) {
+      t.skip('no socket-owner discovery on this host (needs lsof or ss)');
+      return;
+    }
+    const port = PORT.silentGone;
+    const runtime = runtimeDir();
+    const dir = stateDir(runtime, port);
+    writeFileSync(join(dir, 'loaded-model'), 'fake', 'utf8');
+    const watchdog = supervise(port, runtime, fastClock(runtime), 3600);
+
+    assert.ok(await waitFor(() => !alive(watchdog.pid), { timeout: 30_000 }),
+      'the existing stand-down still happens when the OS confirms it is gone');
+    assert.equal(readIfPresent(join(dir, 'loaded-model')), null);
+  });
+});
+
+describe('a cross-family wildcard', () => {
+  test('a v4 wildcard is a definite non-match for a v6 literal', () => {
+    assert.equal(addressVerdict('0.0.0.0', '::1'), 'foreign');
+  });
+
+  test('a v6 wildcard against a v4 host stays unprovable', () => {
+    assert.equal(addressVerdict('::', '127.0.0.1'), 'unprovable');
+  });
 });
 
 describe('release metadata', () => {
