@@ -32,8 +32,9 @@ import { BOOT_TIME_MS, pidAlive, reapMarkers } from './marker-state.mjs';
 // choosing one.
 import {
   commandLaunches, forgetIdentities, formatPidRecord, identifyPortOwners, identities, identity,
-  looksLikeLitertLmServe, parsePidRecord, portOwnerDiscoveryHelp, recordIsStale, resolveTargets,
-  signallablePid, startGeneration, startToken,
+  looksLikeLitertLmServe, managedServeTest, parsePidRecord, portOwnerDiscoveryHelp, recordIsStale,
+  resolveTargets,
+  signallablePid, startedSince, startGeneration, startToken,
 } from './process-identity.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -51,6 +52,8 @@ const DEFAULTS = {
   model: process.env.LITERT_LM_PLUGIN_MODEL || 'gemma4-e4b',
   maxTokens: 800,
   idleTimeout: 900,          // seconds; 0 disables idle shutdown
+  // Off by default: reaching a server is not permission to end it. See managedServeTest.
+  manageExisting: /^(1|true)$/i.test(process.env.LITERT_LM_PLUGIN_MANAGE_EXISTING ?? ''),
   requestTimeoutMs: 15 * 60 * 1000,
   startupTimeoutMs: 90 * 1000,
 };
@@ -138,7 +141,7 @@ function writeStateAtomic(port, name, value) {
  * `isLive()` reports whether the current occupant is a live claim we must not disturb.
  * Returns `'won'` (we own the slot now), `'occupied'` (a live claim holds it — wait or
  * adopt), or `'retry'` (another reclaimer is mid-flight; re-observe). Propagates a
- * non-EEXIST create failure so the caller can choose how to degrade.
+ * non-EEXIST create failure: the caller must not treat that as having the slot.
  */
 function claimStateSlot(port, name, record, isLive) {
   try {
@@ -192,17 +195,25 @@ function claimStateSlot(port, name, record, isLive) {
  */
 const IN_FLIGHT_DIR = 'in-flight.d';
 
-async function acquireInFlight(port, opts = null) {
+async function acquireInFlight(port, opts) {
   const dir = join(stateDir(port), IN_FLIGHT_DIR);
 
+  // A marker that cannot be written is the same unprotected request as the one the
+  // comment below refuses to run, reached a shorter way. This used to return null as
+  // "best-effort tracking", and the caller went on to `chat()`: the watchdog then saw
+  // nothing in flight and was free to kill the server under a live request.
   const publish = () => {
     const marker = join(dir, `${process.pid}-${Date.now()}`);
     try {
       mkdirSync(dir, { recursive: true });
       writeFileSync(marker, '', 'utf8');
       return marker;
-    } catch {
-      return null;   // tracking is best-effort; never fail a request over it
+    } catch (err) {
+      throw new Error(
+        `could not record this request in ${dir} (${err.code ?? err.message}).\n`
+        + '  It was not started, because the idle watchdog counts these records to decide\n'
+        + '  whether the server is busy, and would be free to stop it mid-generation.\n'
+        + '  Make that directory writable, or point LITERT_LM_PLUGIN_RUNTIME somewhere that is.');
     }
   };
 
@@ -220,13 +231,11 @@ async function acquireInFlight(port, opts = null) {
   // cannot miss each other.
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const marker = publish();
-    if (marker === null) return null;
     if (readState(port, 'stopping') === null) return marker;
 
     // A shutdown owns the server right now. Stand aside rather than pin it open, wait
     // for the handshake to clear, and try again.
     releaseInFlight(marker);
-    if (opts === null) return null;
     await awaitNotStopping(opts);
   }
 
@@ -360,12 +369,18 @@ function acquireStartClaim(port, spawnedAt) {
     let outcome;
     try {
       outcome = claimStateSlot(port, 'starting', record, () => liveStartClaim(port) !== null);
-    } catch {
+    } catch (err) {
       // The exclusive create failed for a reason unrelated to contention (a full or
-      // read-only filesystem). Fall back to the previous best-effort write rather than
-      // refuse to start; state is an optimisation, and a lone start still needs to run.
-      writeState(port, 'starting', record);
-      return true;
+      // read-only filesystem). This fell back to a best-effort write and returned true,
+      // but that write swallows the same failure, so every concurrent client "won" and
+      // spawned an engine. Exclusive ownership is the one thing this function exists to
+      // establish, and repeated GPU initialisation is not a harmless race on this
+      // hardware, so no claim means no spawn.
+      throw new Error(
+        `could not claim the start of a server on port ${port} in ${stateDir(port)}\n`
+        + `  (${err.code ?? err.message}). Nothing was started, because without that claim\n`
+        + '  concurrent clients could each launch an engine. Make that directory writable,\n'
+        + '  or point LITERT_LM_PLUGIN_RUNTIME somewhere that is.');
     }
     if (outcome === 'won') return true;
     if (outcome === 'occupied') return false;            // a live start owns the port
@@ -659,6 +674,7 @@ function parseArgs(argv) {
       case '--wait-stdin': opts.waitStdin = true; break;
       case '--idle-timeout': opts.idleTimeout = needInt(a, argv[++i], 0); break;
       case '--json': opts.json = true; break;
+      case '--manage-existing': opts.manageExisting = true; break;
       case '--stop': opts.action = 'stop'; break;
       case '--check': opts.action = 'check'; break;
       case '--list': opts.action = 'list'; break;
@@ -738,6 +754,90 @@ async function awaitNotStopping(opts) {
   return true;
 }
 
+/** Every identity on this port that this plugin launched or was told to take over. */
+const managedRecords = (port) => ['managed', 'server.pid', 'survivors']
+  .map((name) => readState(port, name, ''));
+
+const isManaged = (port) => managedServeTest(managedRecords(port));
+
+/**
+ * Could anything managed still be running here? Hygiene-grade, because this sits on the
+ * warm `ask` path, where an identity walk costs most of a second. Wrong in the
+ * generous direction only: a reused pid starts a watchdog that then finds nothing it
+ * may stop and stands down, and that watchdog re-proves everything before signalling.
+ */
+const anyManagedAlive = (port) => managedRecords(port)
+  .flatMap((text) => String(text).split('\n'))
+  .some((line) => {
+    const rec = parsePidRecord(line);
+    return rec !== null && pidAlive(rec.pid);
+  });
+
+/**
+ * litert-lm listeners on the port that started at or after our spawn.
+ *
+ * The start time is the evidence. "The port answered nobody before the spawn" proves
+ * nothing, because a user's server that is loading binds the port and answers nobody
+ * for minutes, and our launcher then fails on the port and leaves theirs as the listener.
+ * The gap left is a user starting their own server after our spawn, within the clock
+ * slack or before our launcher binds: it wins the bind and is recorded as ours.
+ */
+const launchedOwners = (opts, spawnedAt) =>
+  identifyPortOwners(opts.port, looksLikeLitertLmServe, opts.host).ours
+    .filter((owner) => startedSince(owner.token, spawnedAt));
+
+/**
+ * Record every process of this start: the launcher, its stages and the listener.
+ *
+ * The listener is proven from the socket as well as from descent, because descent can
+ * miss it: a launcher that hands off and exits before the first table walk leaves the
+ * generation empty, and the plugin then disowned the server it had just started.
+ */
+async function recordManaged(opts, generation, spawnedAt) {
+  await generation.sample(true);
+  for (const owner of launchedOwners(opts, spawnedAt)) generation.adopt(owner);
+  writeState(opts.port, 'managed', generation.members()
+    .filter((m) => m.token).map((m) => `${m.pid} ${m.token}`).join('\n'));
+  clearState(opts.port, 'unmanaged-noted');
+}
+
+/** Say once that a server is being used but not looked after. */
+function noteUnmanaged(opts) {
+  if (readState(opts.port, 'unmanaged-noted') !== null) return;
+  writeState(opts.port, 'unmanaged-noted', Date.now());
+  process.stderr.write(
+    `[litertlm] using a server on port ${opts.port} that this plugin did not start. It will not\n`
+    + '  be idle-stopped or stopped by --stop, so its memory stays held until you stop it.\n'
+    + '  To hand a litert-lm server over to this plugin, pass --manage-existing.\n');
+}
+
+/**
+ * --manage-existing: take over the litert-lm server on this port, explicitly.
+ *
+ * Writing the record is the whole of it. The watchdog and `--stop` read the same
+ * record through the same test, so neither needs to know the flag exists.
+ */
+function adoptExisting(opts) {
+  const { ours, discoveryFailed } =
+    identifyPortOwners(opts.port, looksLikeLitertLmServe, opts.host);
+  if (discoveryFailed) {
+    // Not fatal: declining to take something over grants no authority, and a request
+    // should not fail because one lookup did. `--stop` reports a blind port by itself.
+    process.stderr.write(`[litertlm] could not determine what owns port ${opts.port}, so nothing `
+      + `was taken over.\n  ${portOwnerDiscoveryHelp()}\n`);
+    return;
+  }
+  const known = String(readState(opts.port, 'managed', '')).split('\n').filter(Boolean);
+  const added = ours.filter((o) => o.token).map((o) => `${o.pid} ${o.token}`)
+    .filter((record) => !known.includes(record));
+  if (!added.length) {
+    if (ours.length) clearState(opts.port, 'unmanaged-noted');
+    return;
+  }
+  writeState(opts.port, 'managed', [...known, ...added].join('\n'));
+  clearState(opts.port, 'unmanaged-noted');
+}
+
 /** Start the watchdog only when we started a server, and only if none supervises (T060). */
 function requestedServerIdentity(opts) {
   const recorded = readState(opts.port, 'server.pid', '') || null;
@@ -757,7 +857,7 @@ function requestedServerIdentity(opts) {
     .filter((rec) => rec?.token)
     .map((rec) => `${rec.pid} ${rec.token}`));
   const { ours, unidentified, discoveryFailed } =
-    identifyPortOwners(opts.port, looksLikeLitertLmServe, opts.host);
+    identifyPortOwners(opts.port, isManaged(opts.port), opts.host);
   if (discoveryFailed || unidentified.length) {
     // The old recorded identity belongs to the survivor being retired, not to the
     // replacement that answered this client. Publishing it as the desired server
@@ -821,6 +921,11 @@ async function startWatchdog(opts) {
   // replacement server would then run unsupervised. A temp-file-plus-rename write makes
   // the reader see the old request or the new one, never a torn one.
   writeStateAtomic(opts.port, 'watchdog-request', JSON.stringify(request));
+  // A watchdog exists to stop a server, so one that is not ours gets none.
+  if (!anyManagedAlive(opts.port)) {
+    noteUnmanaged(opts);
+    return;
+  }
   if (opts.idleTimeout === 0) return;
   // Liveness, not file existence: a stale pid must never suppress the watchdog.
   //
@@ -968,7 +1073,7 @@ async function cancelStartedServer(opts, generation, child, spawnedAt) {
       // a valid identity, and the loop below signals it: a cancelled start killing the
       // valid newer one, which is the exact failure the generation boundary exists to
       // prevent, re-entered through the staleness of its own check.
-      const owners = classifyPortOwners(opts).ours;
+      const owners = launchedOwners(opts, spawnedAt);
       if (ownsStartClaim(port, spawnedAt)) {
         for (const owner of owners) generation.adopt(owner);
       }
@@ -1100,7 +1205,8 @@ async function ensureServer(opts) {
 
   const existing = await probe(opts);
   if (existing) {
-    await startWatchdog(opts);        // adopt a server nothing is supervising
+    if (opts.manageExisting) adoptExisting(opts);
+    await startWatchdog(opts);        // ours, or told to be; otherwise it declines
     return { models: existing, started: false };
   }
 
@@ -1280,6 +1386,10 @@ async function ensureServer(opts) {
     await cancelIfStopped(opts, generation, child, spawnedAt);
 
     if (up) {
+      await recordManaged(opts, generation, spawnedAt);
+      // Again: that discovery walk takes seconds on Windows, and a stop landing inside it
+      // would otherwise see a server this start then goes on to return.
+      await cancelIfStopped(opts, generation, child, spawnedAt);
       releaseStartClaim(opts.port, spawnedAt);   // ours only — a newer start may own it
       await startWatchdog(opts);
       return { models: up, started: true };
@@ -1324,8 +1434,13 @@ async function ensureServer(opts) {
  * another local address on the same port passes the command-line test and is not
  * ours by any reading; the port number alone could not say so.
  */
-const classifyPortOwners = (opts) =>
-  identifyPortOwners(opts.port, looksLikeLitertLmServe, opts.host);
+const classifyPortOwners = (opts) => {
+  // `managed` is written once the server is up, so during a start the claim is the record.
+  const managed = isManaged(opts.port);
+  const claim = liveStartClaim(opts.port);
+  return identifyPortOwners(opts.port, (pid) => managed(pid) || (claim !== null
+    && looksLikeLitertLmServe(pid) && startedSince(startToken(pid), claim.spawnedAt)), opts.host);
+};
 
 /**
  * Of `targets`, those still running as themselves — and those we could not judge.
@@ -1342,7 +1457,8 @@ const stillAlive = (targets) => resolveTargets(targets);
  * Stop our server and watchdog — and nothing else.
  *
  * Every target is proven before it is signalled: recorded pids by the start token
- * written when we spawned them, socket owners by their command line. A process that
+ * written when we spawned them, socket owners by their command line AND a recorded
+ * identity, so a server the user started by hand is left alone. A process that
  * cannot be proven is left running and reported, never signalled on suspicion.
  *
  * State is cleared either way. "We could not identify anything to stop" and "there
@@ -1773,7 +1889,8 @@ async function chat(opts) {
       `lost the connection to the server mid-request (${err.message}).\n`
       + (sizeSuspect
         ? `  CHECK THE PROMPT SIZE FIRST — this request was ${kb(bytes)}. litert-lm 0.14.0 runs\n`
-          + '  at a fixed max_num_tokens and breaks the HTTP response rather than refusing\n'
+          + '  at a fixed max_num_tokens (later versions take one from config.json, and may\n'
+          + '  still be at their default) and breaks the HTTP response rather than refusing\n'
           + '  cleanly once a prompt exceeds it, so this is what an over-long prompt looks\n'
           + '  like. The ceiling is model-dependent; see litertlm-review.mjs DEFAULTS for\n'
           + '  measured figures. Send less and see if it clears.\n'
@@ -1789,9 +1906,10 @@ async function chat(opts) {
   if (!res.ok) {
     let hint = '';
     if (/mapped_region|embedding lookup/i.test(text)) {
-      hint = '\n  This model does not fit at its default context on this GPU. `serve` cannot cap'
-        + ' the KV cache, so it cannot be served here.\n  Use a smaller model, or run it outside'
-        + ' the plugin: litert-lm run <model> --max-num-tokens 1024';
+      hint = '\n  This model does not fit at its default context on this GPU. `serve` has no flag'
+        + ' to cap it.\n  On litert-lm 0.15.0 or later set max_num_tokens for this model in'
+        + ' config.json (litertlm_backend.py configure).\n  Otherwise use a smaller model, or run'
+        + ' it outside the plugin: litert-lm run <model> --max-num-tokens 1024';
     } else if (/not found|unknown model/i.test(text)) {
       hint = '\n  Check the model id: litert-lm list';
     }
@@ -1830,6 +1948,9 @@ Options:
   --system-file <p>   Read the --system text from a file, for the same reason as below.
   --prompt-file <p>   Read the prompt from a file. For text from anyone other than you:
                       it never passes through a shell.
+  --manage-existing   Take over a litert-lm server this plugin did not start, so that
+                      --stop and the idle watchdog may end it. Without this such a
+                      server is used but never stopped. Also: LITERT_LM_PLUGIN_MANAGE_EXISTING=1
   --idle-timeout <s>  Idle seconds before shutdown; 0 disables (default: ${DEFAULTS.idleTimeout})
   --json              Print the raw API response
   --check             Report readiness without starting anything
@@ -1902,6 +2023,7 @@ async function main() {
     let result;
     try {
       wasUp = await probe(opts);
+      if (opts.manageExisting) adoptExisting(opts);
       result = await stopProcesses(opts, Boolean(wasUp), stopClaim);
     } finally {
       releaseStopClaim(opts.port, stopClaim);
@@ -1909,12 +2031,21 @@ async function main() {
     const { signalled, strangers, surviving, unknown, legacy, heldPort, down, blindPort } = result;
 
     const noteStrangers = () => {
-      if (!strangers.length) return;
-      process.stderr.write(
-        `[litertlm] note: pid ${strangers.join(', ')} is listening on port ${opts.port}`
-        + `${wasUp ? ' and answers /v1/models' : ''}, but its command line is not a litert-lm\n`
-        + '  server, so it is not this plugin\'s and was left running.\n'
-        + '  If you meant to free the port, stop that process yourself, or use --port <n>.\n');
+      const litertLm = strangers.filter(looksLikeLitertLmServe);
+      const others = strangers.filter((pid) => !litertLm.includes(pid));
+      if (litertLm.length) {
+        process.stderr.write(
+          `[litertlm] note: pid ${litertLm.join(', ')} is a litert-lm server on port ${opts.port}\n`
+          + '  that this plugin did not start, so it was left running.\n'
+          + '  To stop it from here, repeat with --manage-existing.\n');
+      }
+      if (others.length) {
+        process.stderr.write(
+          `[litertlm] note: pid ${others.join(', ')} is listening on port ${opts.port}`
+          + `${wasUp ? ' and answers /v1/models' : ''}, but its command line is not a litert-lm\n`
+          + '  server, so it is not this plugin\'s and was left running.\n'
+          + '  If you meant to free the port, stop that process yourself, or use --port <n>.\n');
+      }
     };
 
     // Failure is tested FIRST, ahead of every success message.

@@ -28,8 +28,8 @@ import { reapMarkers } from './marker-state.mjs';
 // client applied, so the supervisor could SIGTERM a bystander the client would have
 // refused to touch. One home, one rule, no weaker copy.
 import {
-  formatPidRecord, identifyPortOwners, looksLikeLitertLmServe, parsePidRecord,
-  resolveTargets, signallablePid, startToken,
+  formatPidRecord, identifyPortOwners, managedServeTest, parsePidRecord,
+  recordIsStale, resolveTargets, signallablePid, startToken,
 } from './process-identity.mjs';
 
 const POLL_INTERVAL_MS = 5000;
@@ -90,6 +90,24 @@ function writeState(name, value) {
     mkdirSync(stateDir(opts.port), { recursive: true });
     writeFileSync(statePath(name), String(value), 'utf8');
   } catch { /* ignore */ }
+}
+
+/**
+ * Establish the `stopping` handshake, and report whether it really was established.
+ *
+ * A client admits itself by reading this file, so a shutdown that continues after a
+ * failed write has told nobody: a request can enter between the count and the signal
+ * and be killed mid-generation, which FR-024 and FR-025 both forbid. `writeState` is
+ * best-effort by design, so the result is read back. The stamp is compared rather than
+ * mere existence, because a file left by an earlier round proves nothing about this one.
+ */
+function claimStopping() {
+  const stamp = String(Date.now());
+  writeState('stopping', stamp);
+  if (readState('stopping') === stamp) return true;
+  // A failed write can leave a torn file, and clients read any `stopping` as a shutdown.
+  clearState('stopping');
+  return false;
 }
 
 function clearState(name) {
@@ -241,6 +259,9 @@ async function serverReachable() {
  * command line, the recorded pid by the start token written when it was spawned.
  * Anything unprovable is left running.
  */
+const isManaged = () => managedServeTest(
+  ['managed', 'server.pid', 'survivors'].map((name) => readState(name, '')));
+
 function ourTargets() {
   // Same helper the client uses, so the port is re-asked AFTER identification and a
   // pid reissued mid-lookup to a litert-lm on another port cannot be adopted as
@@ -251,10 +272,19 @@ function ourTargets() {
   // A litert-lm bound to another interface on this port is a different server, and
   // supervising the socket we talk to means asking about that socket, not the number.
   const { ours: targets, unidentified, discoveryFailed } =
-    identifyPortOwners(opts.port, looksLikeLitertLmServe, opts.host);
+    identifyPortOwners(opts.port, isManaged(), opts.host);
   const recorded = ownedPid('server.pid');
   if (recorded !== null && !targets.some((t) => t.pid === recorded)) {
     targets.push({ pid: recorded, token: startToken(recorded) });
+  }
+  if (recorded === null) {
+    // `ownedPid` is null for a record that is contradicted and also for one that could
+    // not be looked up, and only the first means gone. A failed lookup stays unjudged, or
+    // one transient error would end supervision and delete the only identity.
+    const record = parsePidRecord(readState('server.pid', ''));
+    if (record?.token && !recordIsStale(record, stateWrittenAt('server.pid'))) {
+      unidentified.push(...resolveTargets([record]).unknown);
+    }
   }
   return { targets, unidentified, discoveryFailed };
 }
@@ -314,8 +344,8 @@ function cleanupAndExit(code = 0) {
  * the client that owns the proven replacement server.
  *
  * The request is matched by complete identity against either `server.pid` or a
- * currently proven listener, so an adopted manual server is covered without making
- * a bare pid authoritative. The slot is released before spawning, but creation is
+ * currently proven listener, so a server handed over with --manage-existing is covered
+ * without making a bare pid authoritative. The slot is released before spawning, but creation is
  * not success: this process waits for a live successor claim, and reclaims its own
  * exact record for another attempt if the child fails before publishing one.
  */
@@ -330,7 +360,7 @@ function requestedReplacement(request, chased, host) {
       return { status: 'none', replacement: null };
     }
 
-    const discovered = identifyPortOwners(opts.port, looksLikeLitertLmServe, host);
+    const discovered = identifyPortOwners(opts.port, isManaged(), host);
     if (discovered.discoveryFailed || discovered.unidentified.length) {
       return { status: 'pending', replacement: null };
     }
@@ -347,7 +377,7 @@ function requestedReplacement(request, chased, host) {
   const candidates = [];
   const recorded = parsePidRecord(readState('server.pid', ''));
   if (recorded?.token) candidates.push(recorded);
-  const discovered = identifyPortOwners(opts.port, looksLikeLitertLmServe, host);
+  const discovered = identifyPortOwners(opts.port, isManaged(), host);
   if (!discovered.discoveryFailed && !discovered.unidentified.length) {
     candidates.push(...discovered.ours.filter((rec) => rec.token));
   }
@@ -558,7 +588,7 @@ async function main() {
       // between them makes that window seconds wide on Windows. `stopping` is what
       // stops a new client entering at all, which is the only thing that makes the
       // count mean something by the time it is acted on.
-      writeState('stopping', Date.now());
+      if (!claimStopping()) continue;     // no handshake, no signal; ask again next poll
       // THE SAME RULE AS THE NORMAL IDLE PATH, not a second one written alongside it.
       //
       // Two attempts at this branch each got half of it. Yielding to live work
@@ -654,14 +684,26 @@ async function main() {
     if (!(await serverReachable())) {
       missedProbes += 1;
       if (missedProbes < UNREACHABLE_TOLERANCE) continue;
-      clearState('server.pid');
-      // The engine died with someone else's hand on it, so nothing is resident.
-      // Leaving `loaded-model` behind makes the next client warn about a model
-      // switch that is not happening.
-      clearState('loaded-model');
-      cleanupAndExit(0);        // deliberately does not touch in-flight
+
+      // Two minutes of silence is not death, and reading it as death leaked a daemon: a
+      // large model can take that long to load, and a server on an address we are not
+      // probing never answers at all. Either way the engine is still there holding
+      // accelerator memory, and walking away left it with no supervisor. So ask the OS,
+      // and leave only when there is positively nothing left of it. Anything else drops
+      // through to the idle test below, so a server that never answers is still stopped
+      // on the normal schedule, under the normal in-flight rules.
+      const { targets, unidentified, discoveryFailed } = ourTargets();
+      if (!targets.length && !unidentified.length && !discoveryFailed) {
+        clearState('server.pid');
+        // The engine died with someone else's hand on it, so nothing is resident.
+        // Leaving `loaded-model` behind makes the next client warn about a model
+        // switch that is not happening.
+        clearState('loaded-model');
+        cleanupAndExit(0);      // deliberately does not touch in-flight
+      }
+    } else {
+      missedProbes = 0;
     }
-    missedProbes = 0;
 
     const lastActivity = Number.parseInt(readState('last-activity', String(Date.now())), 10)
       || Date.now();
@@ -702,7 +744,10 @@ async function main() {
     // included below; one published after it is withdrawn by the client when that
     // client re-reads `stopping`. The ownership walk above may take seconds, but it
     // no longer sits between an unprotected count and the signal.
-    writeState('stopping', Date.now());
+    //
+    // No handshake, no signal. Staying up on a state directory that has gone bad costs
+    // accelerator memory until it recovers; going ahead could cost a user's request.
+    if (!claimStopping()) continue;
 
     const confirmedInFlight = countInFlight();
     const confirmedActivity = Number.parseInt(

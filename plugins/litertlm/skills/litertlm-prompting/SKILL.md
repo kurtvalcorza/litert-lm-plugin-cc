@@ -88,9 +88,10 @@ serving `qwen3-4b-instruct`, it breaks the HTTP response rather than answering �
 sees a transport error, not a short reply. Other runtimes truncate silently instead and answer
 from what fit, which is worse because nothing marks the reply as partial. Assume either.
 
-The ceiling is lower than the model card suggests: `serve` runs at a fixed
+The ceiling is lower than the model card suggests: on 0.14.0 `serve` runs at a fixed
 `max_num_tokens=4096` regardless of the model's native context, which came to roughly
-6.5–8 KiB of diff text depending on how it tokenises. Narrow a large diff to one file. Excerpt
+6.5–8 KiB of diff text depending on how it tokenises. 0.15.0 and later can set that budget per
+model in config, so the figure is a measured default, not a universal limit. Narrow a large diff to one file. Excerpt
 the relevant function rather than pasting the module. If the input feels big, it is.
 
 ### 8. Set `--max-tokens` to what you actually want

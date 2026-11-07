@@ -13,6 +13,8 @@ different ports never share state.
 | File | Format | Writer | Reader |
 |---|---|---|---|
 | `server.pid` | `<pid> <start-token>` | client, after successful start | watchdog |
+| `managed` | `<pid> <start-token>` per line | client, after a start and on `--manage-existing` | client and watchdog, as the authority to stop a listener |
+| `unmanaged-noted` | epoch ms | client, after the first notice for a server it did not start | client |
 | `watchdog.pid` | `<pid> <start-token>` | **watchdog only** — see below | client, watchdog |
 | `watchdog-request` | JSON `{server, discoveryPending, host, idleTimeout, requestedAt}` | client | retiring watchdog |
 | `last-activity` | epoch ms | client, before and after each request | watchdog |

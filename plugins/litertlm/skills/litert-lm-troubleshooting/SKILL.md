@@ -5,8 +5,10 @@ description: Failure catalogue for local LiteRT-LM inference — crashes, droppe
 
 # When local inference misbehaves
 
-Observed against **litert-lm 0.14.0**, RTX 5070 Ti Laptop GPU (12 GB), Windows 11 and WSL2.
-Symptoms first, since that is what you have when you arrive.
+Observed against **litert-lm 0.14.0**, RTX 5070 Ti Laptop GPU (12 GB), Windows 11 and WSL2, unless
+an entry says otherwise. 0.15.0 and later add `config.json`, which changes some answers below;
+measured limits have not been repeated on them. Symptoms first, since that is what you have when
+you arrive.
 
 ---
 
@@ -125,7 +127,8 @@ A **timeout** names itself instead, as *"The operation was aborted due to timeou
 Neither is a network problem.
 
 **Cause**: *usually* an over-long prompt. `serve` on **litert-lm 0.14.0** runs at a fixed
-`max_num_tokens=4096`, offers no flag to raise it and no way to ask what it is. Once a prompt
+`max_num_tokens=4096`, offers no flag to raise it and no way to ask what it is (0.15.0 and later
+read a per-model value from config; see below). Once a prompt
 exceeds it the server **breaks the HTTP response** rather than returning a clean error, so
 there is no status code to match on — which is why this arrives looking like a dead server
 rather than an over-long request.
@@ -213,11 +216,11 @@ that the model read the whole thing. A failure shows less still: the request may
 been sent at all, so it is not even evidence against that size. Do not raise `--max-bytes` on
 the strength of either. See `--allow-oversize` in `litertlm-review.mjs --help`.
 
-**When this is expected to stop being true**: watch `litert-lm`, not the driver. The
-unreleased **0.15.0** config at `~/.litert-lm/config.json` carries a per-model
-`max_num_tokens`. That the field exists is not yet evidence `serve` reads it — the workaround
-retires when `serve` can be told a token budget or reports the one it has, whichever arrives.
-When it does, **re-measure rather than assuming the number rose**.
+**On 0.15.0 and later**: `serve` reads `max_num_tokens` from config when it loads a model
+(`litertlm_backend.py configure <id> --max-num-tokens <n>`), per the v0.19.1 source. Nothing here
+has been measured on those versions, so the 6 KiB guard stands as a conservative default rather
+than a limit: **measure the model you serve, then pass `--max-bytes`**, rather than assuming a
+figure.
 
 ---
 
@@ -226,7 +229,8 @@ When it does, **re-measure rather than assuming the number rose**.
 **Symptom**: responses take ~13 s where ~3 s is expected. Nothing reports a problem.
 
 **Cause**: the model is serving on **CPU**. Its metadata omits `backend_constraint`, so the
-resolver falls back to CPU — and `serve` has no `--backend` flag to override it.
+resolver falls back to CPU, `serve` has no `--backend` flag, and nothing in `config.json` says
+otherwise.
 
 **Diagnose**:
 
@@ -234,15 +238,25 @@ resolver falls back to CPU — and `serve` has no `--backend` flag to override i
 python "${CLAUDE_PLUGIN_ROOT}/tools/litertlm_backend.py" resolve
 ```
 
-Anything reporting `cpu` is affected. Fix via `/litertlm:setup` step 3, or directly — dry run
-first, it writes nothing:
+Anything whose first column is `cpu` is affected; `embedded=cpu` alone is not, because a config
+override wins. A first column of `REFUSED` is a load failure, not a slow model: the config asks for
+a backend the file's `backend_constraint` excludes, and the engine answers `Main backend constraint
+mismatch`. Clear that override with `configure <model-id> --clear --yes`. Fix via `/litertlm:setup` step 4. On 0.15.0 and later that is one override, with the
+model file left alone:
+
+```bash
+python "${CLAUDE_PLUGIN_ROOT}/tools/litertlm_backend.py" configure <model-id> --backend gpu --yes
+```
+
+On 0.14 and earlier it is the header repair — dry run first, it writes nothing:
 
 ```bash
 python "${CLAUDE_PLUGIN_ROOT}/tools/litertlm_backend.py" check <model.litertlm>
 python "${CLAUDE_PLUGIN_ROOT}/tools/litertlm_backend.py" patch <model.litertlm> --backend gpu --yes
 ```
 
-Reverses with `--backend cpu --yes`. See the `litertlm-format` skill for why this is safe.
+Reverses with `--backend cpu --yes`, which changes the behaviour but leaves the key in the
+header; `restore <model> --original --yes` puts the first block back byte for byte. See the `litertlm-format` skill for why this is safe.
 
 ---
 
@@ -257,15 +271,47 @@ A patch writes both. Interrupted between the two, they disagree, and the flatbuf
 truncated. **`patch --backend cpu` cannot undo this** — it reverses a *completed* patch, and
 this one never completed.
 
-**Fix**: `patch` copies the 16 KB header block aside before writing and removes it only on
-success, so a leftover copy is itself the evidence the run died.
+**Fix**: `patch` copies the 16 KB header block aside before writing and removes it only once a
+fresh read proves the new header is the intended one, so a leftover `.hdrbak` is itself the
+evidence the run died or failed verification. `patch` and `check` refuse until it is resolved,
+because a second attempt must never replace the only way back.
 
 ```bash
 python "${CLAUDE_PLUGIN_ROOT}/tools/litertlm_backend.py" restore <model.litertlm>
 ```
 
+If the model loads and you want to keep it as it is, resolve it the other way instead. That
+deletes the recovery copy, so it needs the user's agreement:
+
+```bash
+python "${CLAUDE_PLUGIN_ROOT}/tools/litertlm_backend.py" discard-backup <model.litertlm>
+```
+
+`restore` refuses a copy whose section layout differs from the model, because that copy came
+from another file. `--force` overrides that for a torn header that happens to parse; it does not
+override a copy that describes sections past the end of the file.
+
+A `<model>.litertlm.hdrorig` beside a patched model is expected: it is the header as first seen,
+kept for `restore --original`, and it is not a sign of a failed patch.
+
 Every command that hits an unreadable header already says whether a backup exists. If none
 does, the model must be re-imported — the payload is intact but nothing describes it.
+
+---
+
+## "It was not started" / "Nothing was started"
+
+**Symptom**: a request or a cold start refuses with one of those messages and names a directory.
+
+**Cause**: the plugin could not write its coordination state there, usually a full or read-only
+disk, or a `LITERT_LM_PLUGIN_RUNTIME` pointing somewhere unwritable. It refuses on purpose: the
+idle watchdog counts those records to know whether a request is running, and the start claim is
+what keeps concurrent clients from each launching an engine. Going ahead without them is how a
+request gets killed mid-generation.
+
+**Fix**: make the named directory writable, or point `LITERT_LM_PLUGIN_RUNTIME` elsewhere. For the
+same reason the watchdog will not stop a server while it cannot write `stopping`, so a server can
+outlive its idle timeout until the directory recovers. That is the safe direction to fail in.
 
 ---
 
@@ -324,6 +370,12 @@ There is **no Windows or Linux binary in GitHub Releases** — only macOS arm64 
 ---
 
 ## The server holds VRAM after you finish
+
+If a note says the server is one **this plugin did not start**, that is the reason, and it is by
+design: the plugin uses such a server but neither `--stop` nor the idle watchdog will end it. Stop
+it yourself, or take it over with `--stop --manage-existing` on the user's say-so. Setting
+`LITERT_LM_PLUGIN_MANAGE_EXISTING=1` makes that the standing choice. A server left running across
+a plugin update counts as not started by it, because the record it would need is newer than it is.
 
 Expected: it stops itself after the idle period (default 900 s) and the next call restarts it
 transparently. To reclaim immediately:

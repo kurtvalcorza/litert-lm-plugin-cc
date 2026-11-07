@@ -355,6 +355,11 @@ export function addressVerdict(listenAddress, host) {
   if (h === 'localhost') return 'serves';              // either family may be the one
   if (h.includes(':') ? a !== '0.0.0.0' : a === '0.0.0.0') return 'serves';
 
+  // The two cross-family cases are not alike. An IPv4 socket cannot accept IPv6 at all,
+  // so `0.0.0.0` against a v6 literal is settled, and calling it unprovable blocked
+  // idle-stop and `--stop` for ever on a listener that cannot be the one we talk to.
+  if (h.includes(':')) return 'foreign';
+
   // A CROSS-FAMILY WILDCARD IS UNPROVABLE, NOT ABSENT — and the difference is the
   // whole verdict. `::` serves v4 callers when IPV6_V6ONLY is off and does not when
   // it is on, and no platform query here reports which. Excluding it outright was the
@@ -407,8 +412,14 @@ function listenersOnPort(port) {
     // and both cases are finally distinguishable. Verified on this host: empty port 0
     // with no rows, live port 0 with a row, malformed query 3.
     const r = run('powershell.exe', ['-NoProfile', '-Command',
+      //
+      // `-State Listen` is applied here rather than as a parameter because some Windows
+      // builds return every row with a null State (seen on 10.0.26300), and on those
+      // the parameter matched nothing: a live server read as an empty port, with a
+      // success status. A listener is what remains identifiable there, having no peer.
       'try { '
-      + `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction Stop `
+      + `Get-NetTCPConnection -LocalPort ${port} -ErrorAction Stop `
+      + "| Where-Object { $_.RemotePort -eq 0 -and ($_.State -eq 'Listen' -or $null -eq $_.State) } "
       + '| ForEach-Object { ($_.LocalAddress, $_.OwningProcess) -join [char]9 } '
       + "} catch { if ($_.FullyQualifiedErrorId -notlike 'CmdletizationQuery_NotFound*')"
       + ' { exit 3 } }; exit 0']);
@@ -1076,7 +1087,7 @@ export function isRecordedProcess(pid, token) {
  * invocation is the answer.
  *
  * Deliberately does NOT require `--port <n>`: a server started by hand as plain
- * `litert-lm serve` on the default port carries no such flag, and `ensureServer`
+ * `litert-lm serve` on the default port carries no such flag, and --manage-existing
  * adopts exactly that server. The listening socket already supplies the port; the
  * command line only has to supply the identity.
  *
@@ -1148,6 +1159,65 @@ export function commandLaunches(cmdline, exe) {
  */
 export const looksLikeLitertLmServe = (pid) =>
   isLitertLmServeCommand(identity(pid)?.cmdline);
+
+/**
+ * May this plugin stop the `litert-lm serve` holding a socket? Returns the pid test.
+ *
+ * CONNECTING IS NOT OWNING. Any server on the port can answer a request; that says
+ * nothing about who is entitled to end it. The command line used to settle both, so
+ * a server the user started by hand was adopted on first contact and then killed by
+ * `--stop` or the idle watchdog. So authority now needs two things: that it is a
+ * litert-lm server, and that its exact identity is one this plugin recorded, because
+ * it launched it or was told to take it over with --manage-existing.
+ *
+ * Anything that fails lands in `strangers`: never signalled, and reported. One rule
+ * with one home, because the client and the watchdog both have to answer this.
+ */
+/** Clock error between a process's start time and `Date.now()`, worst on Linux (see below). */
+const START_CLOCK_SLACK_MS = 1500;
+
+/**
+ * Wall-clock start time of the process a token describes, or null if it cannot be read.
+ *
+ * Windows tokens are FILETIME ticks. Linux tokens are clock ticks since boot, at the 100 Hz
+ * USER_HZ the kernel reports everywhere, on a boot time known only to about a second. macOS
+ * tokens start with `lstart`, which has whole seconds.
+ */
+function tokenStartMs(token) {
+  if (!token) return null;
+  const text = String(token);
+  if (process.platform === 'win32' || process.platform === 'linux') {
+    if (!/^\d+$/.test(text)) return null;
+    return process.platform === 'win32'
+      ? Number(BigInt(text) / 10000n) - 11644473600000
+      : BOOT_TIME_MS + Number(text) * 10;
+  }
+  const at = Date.parse(text.split('#')[0]);
+  return Number.isNaN(at) ? null : at;
+}
+
+/**
+ * Did this process start at or after `sinceMs`?
+ *
+ * What makes a listener ours when descent cannot show it: a server that was already
+ * running cannot have started after our spawn, however slowly it answers. A token that
+ * cannot be read is a no, because this grants authority to stop a process.
+ */
+export function startedSince(token, sinceMs) {
+  const at = tokenStartMs(token);
+  return at !== null && at >= sinceMs - START_CLOCK_SLACK_MS;
+}
+
+export function managedServeTest(recordTexts) {
+  const known = new Set();
+  for (const text of recordTexts) {
+    for (const line of String(text ?? '').split('\n')) {
+      const rec = parsePidRecord(line);
+      if (rec?.token) known.add(`${rec.pid} ${rec.token}`);
+    }
+  }
+  return (pid) => looksLikeLitertLmServe(pid) && known.has(`${pid} ${startToken(pid)}`);
+}
 
 // ---------------------------------------------------------------------------
 // The pid-file record
