@@ -102,7 +102,9 @@ an invalid config, so fix that first.
 
 A row marked `REFUSED` will fail to load. The file declares a `backend_constraint` and the config
 asks for a backend outside it; config chooses only among what the file allows. Clear the override
-with `configure <model-id> --clear --yes`, or set a backend the row lists.
+with `configure <model-id> --clear --yes`, or set a backend the row lists. If the override says
+`(default)` it comes from `default.backend` in `config.json`, which `configure` does not edit: set a
+per-model backend the row lists instead.
 
 A model whose effective backend is `cpu` **will serve on CPU**, roughly 4–5× slower, silently.
 `litert-lm serve` has no `--backend` flag. Measured on an RTX 5070 Ti Laptop GPU: the same prompt

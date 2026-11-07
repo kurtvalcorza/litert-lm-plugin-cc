@@ -80,7 +80,9 @@ comma-separated list the engine enforces after config is applied, so the resolve
 is only the default among the allowed ones. Measured on 0.19.1 with a real model, CPU only: no key
 accepts config freely; `npu,cpu` with config `cpu` loads and answers; `npu` with config `cpu` fails
 with `Main backend constraint mismatch. Model requires one of [npu] but Main backend is CPU`. Any
-other pairing is read from that message, not measured.
+other pairing is read from that message, not measured. Files with several main sections were not
+measured either, so the plugin only reports a limit when every main section declares one, and never
+for an artisan model.
 
 **Never patch an artisan model.** Step 1 short-circuits, so `backend_constraint` is never
 consulted for them — a write would be a no-op that merely looked like a fix, and they cannot

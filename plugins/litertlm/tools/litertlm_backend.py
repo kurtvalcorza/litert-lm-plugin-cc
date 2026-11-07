@@ -436,16 +436,29 @@ def allowed_backends(path):
     mismatch. Model requires one of [npu] but Main backend is CPU"), while `npu,cpu` with
     the same config loads and answers. Both measured on 0.19.1. A file with no key has no
     limit, which is why config is the right repair for the models this tool exists for.
+
+    Only a single declared list was measured, so this answers narrowly: it returns a limit
+    only when every main section declares one, and then the union of them. A file with an
+    artisan section, or a main section with no key, might load on anything, and calling
+    such a model REFUSED would block one that works.
     """
     try:
-        declared = [v for v in _main_constraint(read_header(path)[1]) if v]
+        sections = summarize(read_header(path)[1])[0]
     except SystemExit:
         raise
     except Exception as e:  # noqa: BLE001 - a damaged header reaches the flatbuffer reader
         raise SystemExit(f"ABORT: cannot read the header of {path}: {type(e).__name__}: {e}")             from None
-    if not declared:
+    mains = [{key: value for key, value, _ in s[3]} for s in sections]
+    mains = [m for m in mains if m.get("model_type") in (PREFILL_DECODE, ARTISAN_TEXT_DECODER)]
+    if (not mains or any(m["model_type"] == ARTISAN_TEXT_DECODER for m in mains)
+            or not all(m.get(KEY) for m in mains)):
         return None
-    return [part.strip().lower() for part in declared[0].split(",") if part.strip()]
+    allowed = []
+    for main in mains:
+        for part in main[KEY].split(","):
+            if part.strip() and part.strip().lower() not in allowed:
+                allowed.append(part.strip().lower())
+    return allowed or None
 
 
 def _resolve_row(model_id, path, cfg):
@@ -515,7 +528,10 @@ def cmd_configure(args):
     if not args.clear and args.backend is None and args.max_num_tokens is None:
         raise SystemExit("Nothing to do: pass --backend, --max-num-tokens or --clear.")
 
-    model_file = os.path.join(cfg.get_cli_base_dir(), "models", args.model_id, "model.litertlm")
+    # `litert-lm list` prints org/name for a directory called org--name, and either may be
+    # the key in config.json, so both spellings have to reach the same model.
+    model_file = os.path.join(cfg.get_cli_base_dir(), "models",
+                              args.model_id.replace("/", "--"), "model.litertlm")
     if not os.path.isfile(model_file):
         raise SystemExit(f"No imported model named '{args.model_id}'. List them: litert-lm list")
 
@@ -544,16 +560,25 @@ def cmd_configure(args):
         raise SystemExit(f"ABORT: {path} is not a JSON object; it was left alone.")
 
     models = data.setdefault("models", {})
-    entry = models.setdefault(args.model_id, {})
-    if args.clear:
-        entry.pop("backend", None)
-        entry.pop("max_num_tokens", None)
-    if args.backend is not None:
-        entry["backend"] = args.backend
-    if args.max_num_tokens is not None:
-        entry["max_num_tokens"] = args.max_num_tokens
-    if not entry:
-        del models[args.model_id]
+    if not isinstance(models, dict):
+        raise SystemExit(f"ABORT: `models` in {path} is not an object; it was left alone.")
+    alternate = (args.model_id.replace("--", "/") if "--" in args.model_id
+                 else args.model_id.replace("/", "--"))
+    keys = [k for k in (args.model_id, alternate) if k in models] or [args.model_id]
+    if any(not isinstance(models.get(k, {}), dict) for k in keys):
+        raise SystemExit(f"ABORT: the entry for {args.model_id} in {path} is not an object; "
+                         "it was left alone.")
+    for key in keys:
+        entry = models.setdefault(key, {})
+        if args.clear:
+            entry.pop("backend", None)
+            entry.pop("max_num_tokens", None)
+        if args.backend is not None:
+            entry["backend"] = args.backend
+        if args.max_num_tokens is not None:
+            entry["max_num_tokens"] = args.max_num_tokens
+        if not entry:
+            del models[key]
     if not models:
         del data["models"]
 

@@ -159,6 +159,23 @@ class Effective(Base):
         self.assertRegex(row, r"listed\s+cpu\s+embedded=gpu\s+override=cpu \(model\)")
         self.assertIn("serves on CPU", row)
 
+    def test_no_override_is_never_refused_by_a_later_section(self):
+        for name, sections in (("nokey", [(None, None), ("npu", None)]),
+                               ("artisan", [(None, lb.ARTISAN_TEXT_DECODER), ("cpu", None)])):
+            self.model(name, sections=sections)
+        self.write_config({})
+        self.assertNotIn("REFUSED", self.resolve())
+
+    def test_a_backend_any_main_section_declares_is_allowed(self):
+        self.model("two", sections=[("cpu", None), ("gpu", None)])
+        self.write_config({"models": {"two": {"backend": "gpu"}}})
+        self.assertRegex(self.row("two"), r"two\s+gpu\s")
+
+    def test_several_sections_are_still_a_limit_when_all_declare(self):
+        self.model("two", sections=[("cpu", None), ("gpu", None)])
+        self.write_config({"models": {"two": {"backend": "npu"}}})
+        self.assertIn("allows only cpu,gpu", self.row("two"))
+
     def test_the_list_tolerates_spacing_and_case(self):
         self.model("spaced", constraint="GPU, cpu")
         self.write_config({"models": {"spaced": {"backend": "cpu"}}})
@@ -272,6 +289,34 @@ class Configure(Base):
         self.write_config({"models": {"declared": {"backend": "cpu"}}})
         self.run_configure("declared", clear=True)
         self.assertRegex(self.row("declared"), r"declared\s+gpu\s+embedded=gpu\s+override=none")
+
+    def test_updates_the_entry_under_the_spelling_the_runtime_reads(self):
+        self.model("org--mdl")
+        self.write_config({"models": {"org/mdl": {"backend": "gpu"}}})
+        self.run_configure("org--mdl", backend="cpu")
+        self.assertEqual(self.config()["models"], {"org/mdl": {"backend": "cpu"}})
+
+    def test_clear_reaches_the_entry_under_either_spelling(self):
+        self.model("org--mdl")
+        self.write_config({"models": {"org/mdl": {"backend": "gpu"}}})
+        self.run_configure("org--mdl", clear=True)
+        self.assertNotIn("models", self.config())
+
+    def test_takes_the_id_litert_lm_list_prints(self):
+        self.model("org--mdl")
+        self.run_configure("org/mdl", backend="gpu")
+        self.assertEqual(self.config()["models"]["org/mdl"]["backend"], "gpu")
+
+    def test_a_config_of_the_wrong_shape_is_left_alone(self):
+        self.model("plain")
+        path = self.write_config({"models": ["not", "an", "object"]})
+        with open(path, encoding="utf-8") as f:
+            before = f.read()
+        with self.assertRaises(SystemExit) as caught:
+            self.run_configure("plain", backend="gpu")
+        self.assertIn("left alone", str(caught.exception))
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), before)
 
     def test_refuses_an_unknown_model(self):
         with self.assertRaises(SystemExit) as caught:

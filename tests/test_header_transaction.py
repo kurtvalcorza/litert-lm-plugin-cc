@@ -47,19 +47,32 @@ def _kv(key, value):
     return kv
 
 
-def _header(begin=16384, end=16384 + 4096, constraint=None, tokenizer=None):
-    """A real header: one prefill/decode section plus system metadata."""
+def _section(begin, end, constraint=None, tokenizer=None, model_type=None):
     sec = lb.SCHEMA.SectionObjectT()
     sec.beginOffset = begin
     sec.endOffset = end
     sec.dataType = lb.SCHEMA.AnySectionDataType.TFLiteModel
-    sec.items = [_kv("model_type", lb.PREFILL_DECODE)]
+    sec.items = [_kv("model_type", model_type or lb.PREFILL_DECODE)]
     if constraint is not None:
         sec.items.append(_kv(lb.KEY, constraint))
     if tokenizer is not None:
         sec.items.append(_kv("tokenizer", tokenizer))
+    return sec
+
+
+def _header(begin=16384, end=16384 + 4096, constraint=None, tokenizer=None, sections=None):
+    """A real header: one prefill/decode section unless told otherwise, plus metadata.
+
+    `sections` is a list of (constraint, model_type), laid out one after another.
+    """
     section_md = lb.SCHEMA.SectionMetadataT()
-    section_md.objects = [sec]
+    if sections is None:
+        section_md.objects = [_section(begin, end, constraint, tokenizer)]
+    else:
+        size = (end - begin) // len(sections)
+        section_md.objects = [
+            _section(begin + i * size, begin + (i + 1) * size, c, model_type=t)
+            for i, (c, t) in enumerate(sections)]
     system_md = lb.SCHEMA.SystemMetadataT()
     system_md.entries = [_kv("author", "the test suite")]
     meta = lb.SCHEMA.LiteRTLMMetaDataT()
