@@ -34,23 +34,34 @@ USAGE
     litertlm_backend.py check   <model.litertlm>   # dry-run the patch, writes nothing
     litertlm_backend.py patch   <model.litertlm> [--backend gpu] [--yes]
     litertlm_backend.py restore <model.litertlm>   # undo an INTERRUPTED patch
+    litertlm_backend.py restore <model.litertlm> --original   # the bytes as first seen
+    litertlm_backend.py discard-backup <model.litertlm>       # the model is fine; drop it
 
 REVERSING
 ---------
-Repair is applied in place and is reversible: re-run `patch` with the previous
-backend. This is a supported operation, not a trick.
+A patch that COMPLETED reverses two ways, and they are not the same thing:
 
-    litertlm_backend.py patch <model.litertlm> --backend gpu --yes    # repair
-    litertlm_backend.py patch <model.litertlm> --backend cpu --yes    # undo it
+    litertlm_backend.py patch <model.litertlm> --backend cpu --yes    # behaviour
+    litertlm_backend.py restore <model.litertlm> --original --yes     # the exact bytes
 
-That reverses a patch that COMPLETED. A patch that was interrupted is a different
-problem: the header bytes and the length that describes them live at different
-offsets, so a crash between the two writes leaves them disagreeing and the file
-stops parsing — `patch` cannot reverse what it never finished writing. So `patch`
-first copies the 16 KB header block to `<model>.litertlm.hdrbak` and removes it only
-on success. If that file is still there, the previous run died; put it back with:
+Re-patching changes what the model resolves to, but a model that never carried the
+key keeps one afterwards. `restore --original` puts back the first block byte for byte,
+from `<model>.litertlm.hdrorig`, which the first patch writes and no later one touches.
 
-    litertlm_backend.py restore <model.litertlm>
+A patch that was INTERRUPTED is a different problem: the header bytes and the length
+that describes them live at different offsets, so a crash between the two writes leaves
+them disagreeing and the file stops parsing — `patch` cannot reverse what it never
+finished writing. So `patch` first copies the 16 KB header block to
+`<model>.litertlm.hdrbak`, and removes it only after a fresh read of the file proves the
+new header is what was intended. If that file is still there, the previous run died or
+failed verification, and `patch` refuses to run again until you decide:
+
+    litertlm_backend.py restore <model.litertlm>          # go back
+    litertlm_backend.py discard-backup <model.litertlm>   # keep what is there
+
+Refusing is the point. The backup is the only way back from a partial write, so a second
+attempt must never replace it — and because it is created exclusively, the same file is
+what stops two patches running at once.
 
 Any command that hits an unreadable header says this, and says which case applies.
 Re-importing the model is the external fallback. Operating on a copy remains
@@ -71,8 +82,12 @@ import argparse
 import glob
 import io
 import os
+import stat
 import struct
 import sys
+import tempfile
+
+from litert_lm_paths import candidate_site_packages, explicit_site_packages
 
 # Main-section model types, verbatim from litert_lm_builder.TfLiteModelType. An
 # earlier version wrote "artisan_text_decoder" without the "tf_lite_" prefix, which
@@ -97,30 +112,9 @@ MAIN_TYPES = (PREFILL_DECODE, ARTISAN_TEXT_DECODER)
 KEY = "backend_constraint"
 
 
-def _candidate_site_packages():
-    """Plausible locations of the litert-lm CLI's site-packages, across platforms."""
-    home = os.path.expanduser("~")
-    pats = []
-    appdata = os.environ.get("APPDATA")
-    if appdata:  # Windows, `uv tool install`
-        pats.append(os.path.join(appdata, "uv", "tools", "litert-lm", "Lib", "site-packages"))
-    pats += [
-        # Linux / macOS, `uv tool install`
-        os.path.join(home, ".local", "share", "uv", "tools", "litert-lm",
-                     "lib", "python*", "site-packages"),
-        # pipx
-        os.path.join(home, ".local", "pipx", "venvs", "litert-lm",
-                     "lib", "python*", "site-packages"),
-    ]
-    out = []
-    for p in pats:
-        out.extend(sorted(glob.glob(p)) if "*" in p else ([p] if os.path.isdir(p) else []))
-    return out
-
-
 def load_litertlm_modules():
     """Import the CLI's bundled model/peek/core modules from wherever they live."""
-    override = os.environ.get("LITERT_LM_SITE_PACKAGES")
+    override = explicit_site_packages()
     if override:
         # An explicit override that does not work is a mistake worth surfacing.
         # Silently falling back to auto-discovery would hide it and produce results
@@ -135,7 +129,7 @@ def load_litertlm_modules():
     try:
         from litert_lm_cli import model as m  # noqa: PLC0415
     except ImportError:
-        for cand in _candidate_site_packages():
+        for cand in candidate_site_packages():
             sys.path.insert(0, cand)
             try:
                 from litert_lm_cli import model as m  # noqa: PLC0415
@@ -170,7 +164,10 @@ def read_header(path):
         if f.read(8) != CORE.HEADER_MAGIC_BYTES:
             raise SystemExit(f"{path}: not a .litertlm file (bad magic)")
         f.seek(CORE.HEADER_END_LOCATION_BYTE_OFFSET)
-        header_end = struct.unpack("<Q", f.read(8))[0]
+        field = f.read(8)
+        if len(field) != 8:
+            raise SystemExit(f"{path}: truncated before its header_end field.")
+        header_end = struct.unpack("<Q", field)[0]
         # header_end comes straight from the file, so a corrupt or hostile container
         # can set it to anything. It must be bounded before the read below, on both
         # sides, and the upper bound is BLOCK_SIZE — NOT file_size:
@@ -234,6 +231,47 @@ def summarize(buf):
             system.append((d.get("key"), d.get("value"), d.get("value_type")))
 
     return (tuple(sections), tuple(system))
+
+
+def _layout(buf):
+    """The part of a header that a patch must never change, and a copy must match.
+
+    `summarize` minus the section key/value items: where each section sits, what type it
+    is, and the system metadata. A header block is only meaningful against the payload
+    it was written for, so this is what identifies a saved block as belonging to a file.
+    """
+    sections, system = summarize(buf)
+    return (tuple(s[:3] for s in sections), system)
+
+
+def _identity(buf):
+    """What identifies a header across patches: all of it except what a patch rewrites.
+
+    `_layout` is what must survive a patch, but two releases can share a layout and differ
+    only in section items, such as a tokenizer. Comparing the items too keeps a block from
+    one of them out of the other. The payload stays uncovered: same header, different
+    weights cannot be told apart from one block.
+    """
+    sections, system = summarize(buf)
+    return (tuple((*s[:3], tuple(i for i in s[3] if i[0] != KEY)) for s in sections), system)
+
+
+def _main_constraint(buf):
+    """backend_constraint of each patchable main section, as written (None if absent)."""
+    meta = SCHEMA.LiteRTLMMetaData.GetRootAs(buf, 0)
+    out = []
+    sm = meta.SectionMetadata()
+    for i in range(sm.ObjectsLength() if sm else 0):
+        items = {}
+        sec = sm.Objects(i)
+        for j in range(sec.ItemsLength()):
+            it = sec.Items(j)
+            if it is not None:
+                d = PEEK.kvp_to_dict(it)
+                items[d.get("key")] = d.get("value")
+        if items.get("model_type") == PREFILL_DECODE:
+            out.append(items.get(KEY))
+    return out
 
 
 def _unreadable(path, exc):
@@ -338,7 +376,12 @@ def cmd_resolve(args):
         if not os.path.exists(path):
             continue
         try:
+            # Bounds first. The resolver parses the header with upstream's reader, which
+            # is not ours to vouch for against a hostile `header_end`.
+            read_header(path)
             backend = M.model_default_backend(path)
+        except SystemExit as e:
+            backend = f"ERROR: {e}"
         except Exception as e:  # noqa: BLE001
             backend = f"ERROR: {type(e).__name__}: {e}"
         flag = "  <-- serves on CPU" if backend == "cpu" else ""
@@ -350,6 +393,7 @@ def cmd_show(args):
     # header does not fail at the read — it fails later, on the first offset that
     # points past the buffer, which is inside these loops.
     lines = []
+    read_header(args.model)  # the same bound `patch` gets, before upstream's reader runs
     try:
         with io.StringIO() as devnull:
             metadata = PEEK.read_litertlm_header(args.model, devnull)
@@ -382,6 +426,7 @@ def _validate(path, backend):
     try:
         identical, _ = repack(orig, None)
         lossless = summarize(orig) == summarize(identical)
+        new, changed = repack(orig, backend)
     except SystemExit:
         raise
     except Exception as e:  # noqa: BLE001
@@ -391,17 +436,17 @@ def _validate(path, backend):
     if not lossless:
         raise SystemExit("ABORT: round-trip is lossy; refusing to touch this file.")
 
-    new, changed = repack(orig, backend)
     fits = len(new) <= limit
     print(f"with {KEY}={backend}: {len(new)} bytes (limit {limit}) -> "
           f"{'FITS' if fits else 'TOO BIG'}")
     for _status, message in changed:
         print(f"  {message}")
-    return header_end, new, changed, fits
+    return header_end, orig, new, changed, fits
 
 
 def cmd_check(args):
-    _, _, changed, fits = _validate(args.model, args.backend)
+    _refuse_pending_backup(args.model)
+    _, _, _, changed, fits = _validate(args.model, args.backend)
 
     # A dry run that matched no section used to print "FITS" and exit 0, which reads
     # as "ready to patch" — then the real patch aborts with "no main section found".
@@ -427,56 +472,330 @@ def _backup_path(model):
     return model + ".hdrbak"
 
 
-def _write_header_backup(model):
-    """Copy the whole first block aside before touching the file.
+def _original_path(model):
+    return model + ".hdrorig"
 
-    The rewrite is not atomic and cannot be made so in place: the header bytes live
-    at offset 32 and the length that describes them lives at offset 24, so a crash
-    between those two writes leaves them disagreeing and the flatbuffer parses
-    truncated. No ordering of the two fixes that — only a copy does. The block is
-    16 KB; the file it protects is several GB, and re-downloading one is the
-    alternative. This machine has already taken one unplanned BSOD.
+
+def _is_regular(path):
+    """A regular file at this exact name. Never follows a link to answer."""
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+# O_NOFOLLOW does not exist on Windows; O_BINARY exists nowhere else. Without O_BINARY a
+# Windows descriptor translates line endings, which would corrupt a header silently.
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_BINARY = getattr(os, "O_BINARY", 0)
+
+
+def _fsync_dir(path):
+    """Make a create or remove in this directory durable, where the OS can be asked."""
+    if os.name != "posix":
+        return
+    try:
+        fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _create_exclusive(path, data):
+    """Create `path` holding `data`, or fail if ANYTHING already has that name.
+
+    O_CREAT|O_EXCL is the whole defence, on both platforms: it refuses an existing file,
+    a directory, and a symbolic link, dangling or not, without following it. Checking
+    first and opening after would leave a gap to plant a link in; this has no gap.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _BINARY, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+    except BaseException:
+        # Ours, and incomplete: a torn copy must not pass for a recovery point.
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
+    _fsync_dir(path)
+
+
+def _require_regular_model(model):
+    """Writes go to the file the caller named, not wherever a link there points."""
+    if not _is_regular(model):
+        raise SystemExit(
+            f"ABORT: {model} is not a regular file (a link, or missing).\n"
+            "  Refusing to write through it, because the recovery files would then sit\n"
+            "  beside the link rather than the file. Name the real path.")
+
+
+def _refuse_pending_backup(model):
+    """Stop while a recovery copy exists, whatever is actually at that name."""
+    path = _backup_path(model)
+    if not os.path.lexists(path):
+        return
+    if _is_regular(path):
+        raise SystemExit(
+            f"ABORT: a header backup is already present:\n  {path}\n"
+            "  An earlier patch did not finish, or one is running now. Nothing was written,\n"
+            "  and that file was left exactly as it is: it may be the only way back.\n"
+            f"    Go back:          litertlm_backend.py restore {model}\n"
+            f"    Keep the current: litertlm_backend.py discard-backup {model}")
+    raise SystemExit(
+        f"ABORT: something other than a regular file is at the backup path:\n  {path}\n"
+        "  This tool never creates that. Nothing was written. Inspect it and remove it\n"
+        "  yourself; if it is a link, removing the link does not touch what it points at.")
+
+
+def _copy_first_block(model):
+    """Save the first block aside, exclusively. Returns (backup path, the block).
+
+    The rewrite is not atomic and cannot be made so in place: the header bytes live at
+    offset 32 and the length that describes them lives at offset 24, so a crash between
+    those two writes leaves them disagreeing and the flatbuffer parses truncated. No
+    ordering of the two fixes that — only a copy does. The block is 16 KB; the file it
+    protects is several GB, and re-downloading one is the alternative. This machine has
+    already taken one unplanned BSOD.
+
+    Exclusive creation also makes this the lock: of two concurrent writers, one gets
+    the file. Needs no parseable header, because a restore may be fixing one.
     """
     with open(model, "rb") as f:
         block = f.read(CORE.BLOCK_SIZE)
     if len(block) != CORE.BLOCK_SIZE:
         raise SystemExit(f"ABORT: {model} is smaller than one {CORE.BLOCK_SIZE}-byte block.")
     path = _backup_path(model)
-    with open(path, "wb") as b:
-        b.write(block)
-        b.flush()
-        os.fsync(b.fileno())
-    return path
+    try:
+        _create_exclusive(path, block)
+    except FileExistsError:
+        _refuse_pending_backup(model)
+        raise SystemExit(f"ABORT: {path} appeared and vanished; retry.") from None
+    except OSError as e:
+        raise SystemExit(
+            f"ABORT: could not create the header backup, so nothing was written:\n"
+            f"  {path}\n  {e}") from None
+    return path, block
+
+
+def _take_write_authority(model, header_end, orig):
+    """`_copy_first_block`, then confirm the file is still the one that was validated.
+
+    Everything `patch` computed came from a read taken BEFORE it held authority, and a
+    patch that finished in that gap has already moved the file on from what `orig`
+    describes. Writing anyway would replace that patch's result with a stale one.
+    """
+    path, block = _copy_first_block(model)
+    if _block_header(block) != (header_end, orig):
+        os.remove(path)
+        raise SystemExit(
+            f"ABORT: {model} changed while it was being checked; another patch ran.\n"
+            "  Nothing was written. Run the command again to see the current state.")
+    return path, block
+
+
+def _save_original(model, block):
+    """Keep the first block as first seen, once, for `restore --original`.
+
+    Written beside the file under a temporary name and moved into place, so a crash
+    cannot leave a torn original that a later patch would then decline to replace.
+    Called with write authority held, which is what makes the existence test safe.
+    """
+    path = _original_path(model)
+    if os.path.lexists(path):
+        if not _is_regular(path):
+            raise SystemExit(
+                f"ABORT: something other than a regular file is at:\n  {path}\n"
+                "  This tool never creates that. Inspect it and remove it yourself.")
+        if not _same_file_as(path, block):
+            raise SystemExit(
+                f"ABORT: {path}\n  was not saved from this file, so `restore --original` could "
+                "not return to it, and\n  this file's own first block would be lost. Nothing "
+                "was written. If the model was\n  re-imported, that copy is stale: delete it "
+                "and retry.")
+        return
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)),
+                               prefix=os.path.basename(path) + ".")
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(block)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    _fsync_dir(path)
+
+
+def _block_header(block):
+    """(header_end, header bytes) of a first block, under the same bound as read_header."""
+    header_end = struct.unpack_from("<Q", block, CORE.HEADER_END_LOCATION_BYTE_OFFSET)[0]
+    if not CORE.HEADER_BEGIN_BYTE_OFFSET <= header_end <= CORE.BLOCK_SIZE:
+        raise ValueError(f"header_end={header_end} is out of bounds")
+    return header_end, block[CORE.HEADER_BEGIN_BYTE_OFFSET:header_end]
+
+
+def _read_saved_block(path):
+    """A saved first block, read without following a link and without trusting its size."""
+    if not _is_regular(path):
+        raise SystemExit(f"ABORT: {path} is not a regular file; refusing to read it.")
+    fd = os.open(path, os.O_RDONLY | _NOFOLLOW | _BINARY)
+    with os.fdopen(fd, "rb") as b:
+        block = b.read(CORE.BLOCK_SIZE + 1)
+    if len(block) != CORE.BLOCK_SIZE or block[:8] != CORE.HEADER_MAGIC_BYTES:
+        raise SystemExit(f"ABORT: {path} is not a valid header block; refusing to write it.")
+    return block
+
+
+def _same_file_as(path, block):
+    """Is the saved copy at `path` a first block of the same file `block` came from?"""
+    try:
+        return (_identity(_block_header(_read_saved_block(path))[1])
+                == _identity(_block_header(block)[1]))
+    except (SystemExit, Exception):  # noqa: BLE001 - an unreadable copy is simply not a match
+        return False
+
+
+def _check_block_belongs(model, block, path, force):
+    """Refuse a saved block that does not describe this file's payload.
+
+    A header is only right for the payload it was written for: its offsets are what the
+    runtime follows. Restoring one from a re-imported or different model parses cleanly
+    and then reads weights from the wrong place.
+    """
+    try:
+        saved = _layout(_block_header(block)[1])
+    except Exception as e:  # noqa: BLE001
+        raise SystemExit(f"ABORT: {path} does not parse as a header ({e}); "
+                         "refusing to write it.") from None
+
+    size = os.path.getsize(model)
+    if any(end > size for _, end, _ in saved[0]):
+        raise SystemExit(f"ABORT: {path} describes sections past the end of {model}; "
+                         "it belongs to a different file.")
+    if force:
+        return
+
+    # An unreadable header is the expected state after an interrupted patch, so it is
+    # not evidence either way. Only a header that parses can contradict the copy.
+    try:
+        current = _identity(read_header(model)[1])
+    except (SystemExit, Exception):  # noqa: BLE001
+        return
+    if current != _identity(_block_header(block)[1]):
+        raise SystemExit(
+            f"ABORT: {path}\n  does not match {model}: its header differs, so\n"
+            "  it was saved from a different file. Nothing was written. If you are sure\n"
+            "  it is right, re-run with --force.")
+
+
+def _pwrite(f, offset, data):
+    """One positioned write. The seam the interruption tests cut at."""
+    f.seek(offset)
+    f.write(data)
+    f.flush()
+
+
+def _write_block(model, block):
+    with open(model, "r+b") as f:
+        _pwrite(f, 0, block)
+        os.fsync(f.fileno())
+    with open(model, "rb") as f:
+        if f.read(CORE.BLOCK_SIZE) != block:
+            raise OSError("the first block does not read back as written")
+
+
+def _same_bytes(path, block):
+    """After a finished restore: a saved copy that cannot be read is merely not this one."""
+    try:
+        return _read_saved_block(path) == block
+    except SystemExit:
+        return False
 
 
 def cmd_restore(args):
-    """Put back the header block saved by an interrupted `patch`."""
-    path = _backup_path(args.model)
-    if not os.path.isfile(path):
+    """Put back a saved first block: an interrupted patch's, or the original."""
+    _require_regular_model(args.model)
+    backup = _backup_path(args.model)
+    original = _original_path(args.model)
+    path = original if args.original else backup
+
+    if args.original:
+        # Finishing that first is not bureaucracy: this restore needs the same path for
+        # its own recovery copy, and must not take it from an unresolved one.
+        _refuse_pending_backup(args.model)
+    if not os.path.lexists(path):
         raise SystemExit(
+            f"No original header is saved at:\n  {path}\n"
+            "  The first patch writes it. A model patched before this tool kept one has\n"
+            "  none; `patch --backend <previous>` still reverses the behaviour."
+            if args.original else
             f"No backup found at:\n  {path}\n"
-            "  A backup exists only while a patch is in progress; a completed patch\n"
-            "  removes it. If the model is broken and there is no backup, re-import it."
-        )
-    with open(path, "rb") as b:
-        block = b.read()
-    if len(block) != CORE.BLOCK_SIZE or block[:8] != CORE.HEADER_MAGIC_BYTES:
-        raise SystemExit(f"ABORT: {path} is not a valid header block; refusing to write it.")
+            "  A backup exists only while a patch is unresolved. If the model is broken\n"
+            "  and there is no backup, re-import it.")
+
+    block = _read_saved_block(path)
+    _check_block_belongs(args.model, block, path, args.force)
 
     if not _consent(
-        f"\nAbout to restore the original header block of:\n  {args.model}\nfrom {path}",
+        f"\nAbout to restore the header block of:\n  {args.model}\nfrom {path}",
         args.yes,
     ):
         raise SystemExit("Declined; nothing was written.")
 
-    with open(args.model, "r+b") as f:
-        f.seek(0)
-        f.write(block)
-        f.flush()
-        os.fsync(f.fileno())
-    os.remove(path)
-    print(f"header restored from backup; {os.path.basename(path)} removed")
+    try:
+        if args.original:
+            _copy_first_block(args.model)   # this write can be interrupted too
+        _write_block(args.model, block)
+    except OSError as e:
+        raise SystemExit(f"ABORT: the restore did not complete ({e}).\n  "
+                         f"{backup} was kept; retry once the cause is fixed.") from None
+
+    os.remove(backup)
+    # The original has done its job once the file is the original again, whichever route
+    # got it there. Leaving it would make the NEXT patch's "first seen" a lie.
+    if _is_regular(original) and _same_bytes(original, block):
+        os.remove(original)
+    _fsync_dir(path)
+    print(f"header restored from {os.path.basename(path)}")
     print("verify:  litertlm_backend.py resolve")
+
+
+def cmd_discard_backup(args):
+    """Resolve a pending backup by keeping the model as it stands."""
+    path = _backup_path(args.model)
+    if not os.path.lexists(path):
+        raise SystemExit(f"No backup found at:\n  {path}")
+    if stat.S_ISDIR(os.lstat(path).st_mode):
+        raise SystemExit(f"ABORT: {path} is a directory; inspect it and remove it yourself.")
+    try:
+        summarize(read_header(args.model)[1])
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001
+        _unreadable(args.model, e)
+
+    if not _consent(
+        f"\nThe model header parses. About to delete the recovery copy:\n  {path}\n"
+        "After this the file cannot be put back to how it was before that patch.",
+        args.yes,
+    ):
+        raise SystemExit("Declined; nothing was removed.")
+    os.remove(path)        # on a link this removes the link, never its target
+    _fsync_dir(path)
+    print(f"{os.path.basename(path)} removed; the model was left as it is")
 
 
 def _consent(preamble, assumed):
@@ -501,15 +820,36 @@ def _consent(preamble, assumed):
     return answer.strip().lower() in ("y", "yes")
 
 
-def cmd_patch(args):
-    stale = _backup_path(args.model)
-    if os.path.isfile(stale):
-        print(f"WARNING: a header backup is already present:\n  {stale}\n"
-              "  That means an earlier patch did not finish. If this model no longer\n"
-              "  loads, restore it first:  litertlm_backend.py restore <model>\n",
-              file=sys.stderr)
+def _verify_written(model, new, orig, backend):
+    """Prove the rewrite from a fresh read, not from the writes having returned.
 
-    header_end, new, changed, fits = _validate(args.model, args.backend)
+    A successful fsync says the bytes reached the disk; it does not say they are the
+    header that was meant. Returns a list of what is wrong, empty when nothing is.
+    """
+    try:
+        new_end, seen = read_header(model)
+        problems = []
+        if seen != new:
+            problems.append("the header bytes differ from what was written")
+        if new_end != CORE.HEADER_BEGIN_BYTE_OFFSET + len(new):
+            problems.append("the recorded header length is wrong")
+        if _layout(seen) != _layout(orig):
+            problems.append("section offsets or system metadata changed")
+        declared = _main_constraint(seen)
+        if any(v != backend for v in declared):
+            problems.append(f"{KEY} reads {declared}, expected {backend}")
+        return problems
+    except SystemExit as e:
+        return [str(e)]
+    except Exception as e:  # noqa: BLE001
+        return [f"the new header does not parse: {type(e).__name__}: {e}"]
+
+
+def cmd_patch(args):
+    _require_regular_model(args.model)
+    _refuse_pending_backup(args.model)
+
+    header_end, orig, new, changed, fits = _validate(args.model, args.backend)
     if not changed:
         raise SystemExit("ABORT: no main section found to patch.")
     if not fits:
@@ -536,39 +876,50 @@ def cmd_patch(args):
     # Consent gate (FR-019). Another command driving this tool must assert that it
     # already obtained consent, in the same invocation, by passing --yes. Without a
     # terminal to prompt at and without --yes, refuse rather than write silently.
-    prior = "cpu" if args.backend != "cpu" else "gpu"
     if not _consent(
         f"\nAbout to rewrite the header of:\n  {args.model}\n"
         "Only the first 16 KB is written; the payload is not touched.\n"
-        f"Reversible with:  litertlm_backend.py patch <model> --backend {prior} --yes",
+        "Byte-exact with:  litertlm_backend.py restore <model> --original --yes",
         args.yes,
     ):
         raise SystemExit("Declined; nothing was written.")
 
-    backup = _write_header_backup(args.model)
+    backup, block = _take_write_authority(args.model, header_end, orig)
+    try:
+        _save_original(args.model, block)
+    except BaseException:
+        # Nothing has been written yet, so this copy recovers nothing and would only
+        # block the next attempt.
+        os.remove(backup)
+        raise
+
+    restore_hint = f"  Restore it with:  litertlm_backend.py restore {args.model}"
+    new_end = CORE.HEADER_BEGIN_BYTE_OFFSET + len(new)
     try:
         with open(args.model, "r+b") as f:
-            f.seek(CORE.HEADER_BEGIN_BYTE_OFFSET)
-            f.write(new)
-            new_end = CORE.HEADER_BEGIN_BYTE_OFFSET + len(new)
-            if new_end < header_end:  # scrub stale tail bytes
-                f.write(b"\x00" * (header_end - new_end))
-            f.seek(CORE.HEADER_END_LOCATION_BYTE_OFFSET)
-            f.write(struct.pack("<Q", new_end))
-            f.flush()
+            tail = b"\x00" * max(0, header_end - new_end)     # scrub stale tail bytes
+            _pwrite(f, CORE.HEADER_BEGIN_BYTE_OFFSET, new + tail)
+            _pwrite(f, CORE.HEADER_END_LOCATION_BYTE_OFFSET, struct.pack("<Q", new_end))
             os.fsync(f.fileno())
     except BaseException:
         # The backup is the only way back, so say where it is before unwinding.
-        print(f"\nWrite failed. The original header is saved at:\n  {backup}\n"
-              f"  Restore it with:  litertlm_backend.py restore {args.model}",
+        print(f"\nWrite failed. The original header is saved at:\n  {backup}\n{restore_hint}",
               file=sys.stderr)
         raise
-    os.remove(backup)
 
-    reverse_to = "cpu" if args.backend != "cpu" else "gpu"
+    problems = _verify_written(args.model, new, orig, args.backend)
+    if problems:
+        details = "\n".join(f"  - {p}" for p in problems)
+        raise SystemExit(
+            f"ABORT: the rewritten header failed verification:\n{details}\n"
+            f"The original header is saved at:\n  {backup}\n{restore_hint}")
+
+    os.remove(backup)
+    _fsync_dir(backup)
+
     print(f"header rewritten: end {header_end} -> {new_end}")
     print("verify:   litertlm_backend.py resolve")
-    print(f"reverse:  litertlm_backend.py patch {args.model} --backend {reverse_to} --yes")
+    print(f"exact:    litertlm_backend.py restore {args.model} --original --yes")
     print("payload:  unchanged — confirm with payload_checksum.py")
 
 
@@ -607,8 +958,21 @@ def main():
         help="put back the header block saved by an interrupted patch (<model>.hdrbak)",
     )
     p.add_argument("model")
+    p.add_argument("--original", action="store_true",
+                   help="restore the block as first seen (<model>.hdrorig), byte for byte")
+    p.add_argument("--force", action="store_true",
+                   help="write a saved block even though its section layout differs from "
+                        "the model's. For a torn header that happens to parse.")
     p.add_argument("--yes", action="store_true", help="confirm the write, as for patch")
     p.set_defaults(func=cmd_restore)
+
+    p = sub.add_parser(
+        "discard-backup",
+        help="keep the model as it stands and remove a pending <model>.hdrbak",
+    )
+    p.add_argument("model")
+    p.add_argument("--yes", action="store_true", help="confirm the removal, as for patch")
+    p.set_defaults(func=cmd_discard_backup)
 
     args = ap.parse_args()
     args.func(args)
