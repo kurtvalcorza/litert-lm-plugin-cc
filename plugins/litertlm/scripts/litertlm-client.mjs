@@ -633,14 +633,29 @@ function parseArgs(argv) {
   };
   const rest = [];
 
+  let promptFile = null;
+  let systemFile = null;
+
   const needValue = (flag, value) => {
     if (value === undefined) throw new UsageError(`${flag} requires a value`);
     return value;
   };
-  const needInt = (flag, value, min) => {
+
+  /** A blocking read of a fifo here would sit ahead of every timeout and signal handler. */
+  const readArgumentFile = (flag, path) => {
+    try {
+      if (!statSync(path).isFile()) throw new UsageError(`${flag} ${path} is not a regular file.`);
+      return readFileSync(path, 'utf8');
+    } catch (err) {
+      if (err instanceof UsageError) throw err;
+      throw new UsageError(`could not read ${flag} ${path} (${err.code ?? err.message}).`);
+    }
+  };
+  const needInt = (flag, value, min, max = Infinity) => {
     const n = Number(needValue(flag, value));
-    if (!Number.isInteger(n) || n < min) {
-      throw new UsageError(`${flag} requires an integer >= ${min} (got "${value}")`);
+    if (!Number.isInteger(n) || n < min || n > max) {
+      const range = max === Infinity ? `>= ${min}` : `from ${min} to ${max}`;
+      throw new UsageError(`${flag} requires an integer ${range} (got "${value}")`);
     }
     return n;
   };
@@ -652,8 +667,11 @@ function parseArgs(argv) {
       // reporting the wrong source is worse than reporting none.
       case '--model': opts.model = needValue(a, argv[++i]); opts.modelExplicit = true; break;
       case '--system': opts.system = needValue(a, argv[++i]); break;
+      case '--system-file': systemFile = needValue(a, argv[++i]); break;
       case '--max-tokens': opts.maxTokens = needInt(a, argv[++i], 1); break;
-      case '--port': opts.port = needInt(a, argv[++i], 1); break;
+      case '--port': opts.port = needInt(a, argv[++i], 1, 65535); break;
+      case '--prompt-file': promptFile = needValue(a, argv[++i]); break;
+      case '--wait-stdin': opts.waitStdin = true; break;
       case '--idle-timeout': opts.idleTimeout = needInt(a, argv[++i], 0); break;
       case '--json': opts.json = true; break;
       case '--manage-existing': opts.manageExisting = true; break;
@@ -667,6 +685,16 @@ function parseArgs(argv) {
     }
   }
   opts.prompt = rest.join(' ');
+  if (promptFile !== null) {
+    if (opts.prompt) throw new UsageError('prompt given twice (--prompt-file and an argument); pass one.');
+    opts.prompt = readArgumentFile('--prompt-file', promptFile);
+    if (!opts.prompt.trim()) opts.prompt = '';
+    opts.promptFromFile = true;
+  }
+  if (systemFile !== null) {
+    if (opts.system !== null) throw new UsageError('system prompt given twice; pass one.');
+    opts.system = readArgumentFile('--system-file', systemFile).trim() || null;
+  }
   return opts;
 }
 
@@ -1888,7 +1916,17 @@ async function chat(opts) {
     throw new Error(`the server rejected the request (HTTP ${res.status}).`
       + `\n  ${text.slice(0, 500).trim()}${hint}`);
   }
-  return JSON.parse(text);
+  try {
+    return JSON.parse(text);
+  } catch {
+    // Reached when the response breaks after the headers, which is the same over-long
+    // prompt the catch above describes, arriving later. The bare SyntaxError said none of it.
+    throw new Error(`the server answered HTTP ${res.status}, but the body was not valid JSON `
+      + `(${text.length} characters, cut off or malformed).\n`
+      + `  CHECK THE PROMPT SIZE FIRST — this request was ${Buffer.byteLength(body)} bytes. An\n`
+      + '  over-long prompt can break the response partway through. Send less and see if\n'
+      + '  it clears; if a short prompt does this too, suspect the server.');
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1905,6 +1943,11 @@ Options:
   --system <text>     System instruction
   --max-tokens <n>    Response cap (default: ${DEFAULTS.maxTokens})
   --port <n>          Server port (default: ${DEFAULTS.port})
+  --wait-stdin        Wait for piped input however long it takes to start. By default a
+                      request with a prompt gives it 5 seconds, then goes without it.
+  --system-file <p>   Read the --system text from a file, for the same reason as below.
+  --prompt-file <p>   Read the prompt from a file. For text from anyone other than you:
+                      it never passes through a shell.
   --manage-existing   Take over a litert-lm server this plugin did not start, so that
                       --stop and the idle watchdog may end it. Without this such a
                       server is used but never stopped. Also: LITERT_LM_PLUGIN_MANAGE_EXISTING=1
@@ -1924,12 +1967,47 @@ Notes:
   First call after idle pays engine init. Warm calls are fast.
 `.trim();
 
-async function readStdin() {
-  if (process.stdin.isTTY) return '';
-  let data = '';
-  process.stdin.setEncoding('utf8');
-  for await (const chunk of process.stdin) data += chunk;
-  return data.trim();
+/** How long a request that already has its prompt waits for piped input to begin. */
+const STDIN_GRACE_MS = 5000;
+const EXIT_STDIN_DROPPED = 5;
+
+/**
+ * Piped input, to EOF. A caller can hold stdin open and never write to it, as a background
+ * shell does, and stdin then never ends. With a prompt in hand that must not hang forever,
+ * so the first byte gets a grace period. Once data arrives it is read to EOF however slowly
+ * it comes. Giving up resolves null rather than empty, because input that starts late is
+ * left out, and the caller has to end the run as incomplete. With no prompt, stdin is the
+ * prompt, so there is nothing to do but wait.
+ */
+function readStdin({ hasPrompt, wait }) {
+  if (process.stdin.isTTY) return Promise.resolve('');
+  return new Promise((resolve, reject) => {
+    let data = '';
+    let grace = null;
+    const finish = () => {
+      clearTimeout(grace);
+      resolve(data.trim());
+    };
+    if (hasPrompt && !wait) {
+      grace = setTimeout(() => {
+        process.stderr.write(`[litertlm] nothing arrived on stdin within ${STDIN_GRACE_MS / 1000}s, `
+          + 'so the prompt is sent without it, and this run will exit 5.\n'
+          + '  Input that was going to be piped in is not included. --wait-stdin waits for it.\n');
+        process.stdin.destroy();
+        resolve(null);
+      }, STDIN_GRACE_MS);
+    }
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (chunk) => {
+      clearTimeout(grace);
+      data += chunk;
+    });
+    process.stdin.once('end', finish);
+    process.stdin.once('error', (err) => {
+      clearTimeout(grace);
+      reject(err);
+    });
+  });
 }
 
 async function main() {
@@ -2060,7 +2138,11 @@ async function main() {
     return;
   }
 
-  const piped = await readStdin();
+  // A prompt file counts even when empty: the caller gave its prompt, and it was nothing.
+  const piped = await readStdin({
+    hasPrompt: Boolean(opts.prompt) || Boolean(opts.promptFromFile), wait: opts.waitStdin,
+  });
+  const stdinDropped = piped === null;
   if (piped) opts.prompt = opts.prompt ? `${opts.prompt}\n\n${piped}` : piped;
   if (!opts.prompt) {
     throw new UsageError('no prompt supplied (pass an argument or pipe input). Try --help.');
@@ -2117,9 +2199,15 @@ async function main() {
     process.off('SIGTERM', onSignal);
   }
 
-  if (opts.json) { process.stdout.write(JSON.stringify(resp, null, 2) + '\n'); return; }
+  // Like the review launcher's 5: the answer is delivered, and it is not complete.
+  if (stdinDropped) process.exitCode = EXIT_STDIN_DROPPED;
+  if (opts.json) {
+    const body = stdinDropped ? { ...resp, stdin_dropped: true } : resp;
+    process.stdout.write(JSON.stringify(body, null, 2) + '\n');
+    return;
+  }
 
-  const choice = resp.choices?.[0];
+  const choice = resp?.choices?.[0];
   if (choice?.message?.tool_calls) {
     // The plugin surfaces tool calls; it never executes them (FR-034).
     process.stdout.write(JSON.stringify(choice.message.tool_calls, null, 2) + '\n');

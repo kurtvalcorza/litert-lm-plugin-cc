@@ -49,7 +49,7 @@ treat 0 as approval.
 | 2 | Usage error — unknown flag, empty value for a range-selecting option, unresolvable base, base sharing no history with `HEAD` |
 | 3 | Nothing to review — the range resolved and its diff is empty |
 | 4 | Refused as oversized |
-| 5 | A pass ran but did **not** cover the whole in-scope diff — the request was sent oversized under `--allow-oversize` (not all of it was read), or the model answered with a tool call and reviewed nothing |
+| 5 | A pass ran but did **not** cover the whole in-scope diff — the request was sent oversized under `--allow-oversize` (not all of it was read), the model answered with a tool call and reviewed nothing, or untracked files in scope are invisible to the diff |
 
 3, 4, and 5 exist as distinct codes because each is a run that produced no usable review — empty,
 refused, or incomplete — and a caller that cannot tell them from 0 will report a clean pass.

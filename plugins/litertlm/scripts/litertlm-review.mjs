@@ -39,7 +39,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -131,6 +131,17 @@ class ExitError extends Error {
 
 const usage = (m) => new ExitError(EXIT.USAGE, m);
 
+/**
+ * The most git output this will hold. A guard measured in kilobytes has no use for a
+ * diff in the hundreds of megabytes, and this was 512 MiB, all of it buffered before the
+ * size check ran: the machine paid for a diff in order to refuse it. Big enough that
+ * every refusal below it can still name the largest files, and that is all it is for.
+ */
+const ACQUIRE_CAP = 32 * 1024 * 1024;
+
+/** git produced more than it was allowed to. Partial output is never a usable diff. */
+class OutputTooLarge extends Error {}
+
 // Sub-kilobyte values matter here: a --max-bytes of 50 rendered as "0.0 KB" reads as
 // a bug in the guard rather than as the number the caller passed.
 const kb = (bytes) => (bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`);
@@ -146,13 +157,11 @@ const kb = (bytes) => (bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1
  * — and nothing else. Every other call aborts the run on a non-zero status, which is
  * the whole difference between this and a shell pipeline.
  */
-function git(args, { allowFail = false } = {}) {
-  const r = spawnSync('git', args, {
-    maxBuffer: 512 * 1024 * 1024,   // a branch diff can be large; ENOBUFS here would look like an empty diff
-    windowsHide: true,
-  });
+function git(args, { allowFail = false, maxBuffer = ACQUIRE_CAP } = {}) {
+  const r = spawnSync('git', args, { maxBuffer, windowsHide: true });
 
   if (r.error) {
+    if (r.error.code === 'ENOBUFS') throw new OutputTooLarge();
     if (r.error.code === 'ENOENT') {
       throw new ExitError(EXIT.ENVIRONMENT,
         `'git' was not found on PATH.\n`
@@ -257,6 +266,8 @@ function parseArgs(argv) {
     model: null, port: null, action: 'review',
   };
   const rest = [];
+  let focusFile = null;
+  let pathsFile = null;
 
   const needValue = (flag, value) => {
     if (value === undefined) throw usage(`${flag} requires a value`);
@@ -280,10 +291,10 @@ function parseArgs(argv) {
     }
     return v;
   };
-  const needInt = (flag, value, min) => {
+  const needInt = (flag, value, min, max = Infinity) => {
     const n = Number(needValue(flag, value));
-    if (!Number.isInteger(n) || n < min) {
-      throw usage(`${flag} requires an integer >= ${min} (got "${value}")`);
+    if (!Number.isInteger(n) || n < min || n > max) {
+      throw usage(`${flag} requires an integer >= ${min}${max === Infinity ? '' : ` and <= ${max}`} (got "${value}")`);
     }
     return n;
   };
@@ -294,13 +305,15 @@ function parseArgs(argv) {
       case '--base': opts.base = needNonEmpty(a, argv[++i]); break;
       case '--staged': opts.staged = true; break;
       case '--path': opts.paths.push(needNonEmpty(a, argv[++i])); break;
+      case '--paths-file': pathsFile = needNonEmpty(a, argv[++i]); break;
       case '--focus': opts.focus = needValue(a, argv[++i]); break;
+      case '--focus-file': focusFile = needNonEmpty(a, argv[++i]); break;
       case '--max-bytes': opts.maxBytes = needInt(a, argv[++i], 1); break;
       case '--allow-oversize': opts.allowOversize = true; break;
       case '--dry-run': opts.dryRun = true; break;
       case '--model': opts.model = needNonEmpty(a, argv[++i]); break;
       case '--max-tokens': opts.maxTokens = needInt(a, argv[++i], 1); break;
-      case '--port': opts.port = needInt(a, argv[++i], 1); break;
+      case '--port': opts.port = needInt(a, argv[++i], 1, 65535); break;
       case '-h': case '--help': opts.action = 'help'; break;
       default:
         // An unknown flag must not become focus text. A silently-absorbed typo would
@@ -314,7 +327,30 @@ function parseArgs(argv) {
     throw usage('--base and --staged name different ranges; pass one.');
   }
 
+  // A leading dash would reach git as an option. `resolves` happens to fail on one today,
+  // through the `^{commit}` it appends, which is an accident rather than a guard.
+  if (opts.base?.startsWith('-')) {
+    throw usage(`--base '${opts.base}' looks like an option, not a ref.`);
+  }
+
+  if (pathsFile !== null) {
+    try {
+      opts.paths.push(...readFileSync(pathsFile, 'utf8').split(/\r?\n/).filter(Boolean));
+    } catch (err) {
+      throw usage(`could not read --paths-file ${pathsFile} (${err.code ?? err.message}).`);
+    }
+  }
+
   const positional = rest.join(' ').trim();
+  if (focusFile !== null) {
+    if (positional || opts.focus) throw usage('focus given twice; pass one.');
+    try {
+      opts.focus = readFileSync(focusFile, 'utf8').trim();
+    } catch (err) {
+      throw usage(`could not read --focus-file ${focusFile} (${err.code ?? err.message}).`);
+    }
+    return opts;
+  }
   if (positional && opts.focus) {
     throw usage('focus given twice (--focus and a positional argument); pass one.');
   }
@@ -328,16 +364,30 @@ function parseArgs(argv) {
 
 function collectDiff(opts) {
   const pathspec = opts.paths.length ? ['--', ...opts.paths] : [];
+  // A caller who set --max-bytes past the cap asked for that much; everyone else gets it.
+  const read = (args) => {
+    try {
+      return git(args, { maxBuffer: Math.max(ACQUIRE_CAP, opts.maxBytes + 1) }).stdout;
+    } catch (err) {
+      if (!(err instanceof OutputTooLarge)) throw err;
+      throw new ExitError(EXIT.OVERSIZE,
+        `this diff is larger than ${kb(ACQUIRE_CAP)}, so it was not read and nothing was sent.\n`
+        + '  --allow-oversize does not reach this far: past this size the request is not a\n'
+        + '  long shot, it is a diff no model here could read.\n\n'
+        + '  Narrow it:    --path <pathspec>   (repeatable)\n'
+        + `  See why:      git diff --stat ${args.slice(1).join(' ')}`.trimEnd());
+    }
+  };
 
   if (opts.staged) {
-    return { range: 'staged changes (git diff --staged)', buf: git(['diff', '--staged', ...pathspec]).stdout };
+    return { range: 'staged changes (git diff --staged)', buf: read(['diff', '--staged', ...pathspec]) };
   }
   if (opts.base) {
     const base = resolveBase(opts.base);
     const expr = `${base}...HEAD`;
-    return { range: `${expr}${opts.base === 'auto' ? '  (--base auto chose this)' : ''}`, buf: git(['diff', expr, ...pathspec]).stdout };
+    return { range: `${expr}${opts.base === 'auto' ? '  (--base auto chose this)' : ''}`, buf: read(['diff', expr, ...pathspec]) };
   }
-  return { range: 'uncommitted changes (git diff HEAD)', buf: git(['diff', 'HEAD', ...pathspec]).stdout };
+  return { range: 'uncommitted changes (git diff HEAD)', buf: read(['diff', 'HEAD', ...pathspec]) };
 }
 
 /**
@@ -354,9 +404,18 @@ function collectDiff(opts) {
  * staged nor in a committed range.
  */
 function untrackedFiles(paths) {
-  const args = ['ls-files', '--others', '--exclude-standard'];
-  if (paths.length) args.push('--', ...paths);
+  // `ls-files` lists below the current directory and `git diff` covers the whole repository,
+  // so without `:/` a review from a subdirectory reports files elsewhere as covered.
+  const args = ['-c', 'core.quotePath=false', 'ls-files', '--others', '--exclude-standard',
+    '--', ...(paths.length ? paths : [':/'])];
   return git(args).text.split('\n').map((s) => s.trim()).filter(Boolean);
+}
+
+/** Submodules with local changes: the diff has one `-dirty` line and none of the changes. */
+function dirtySubmodules(text) {
+  return text.split(/^diff --git /m).slice(1)
+    .filter((part) => /^\+Subproject commit [0-9a-f]+-dirty$/m.test(part))
+    .map((part) => part.slice(0, part.indexOf('\n')).match(/ b\/(.*)$/)?.[1] ?? 'unknown');
 }
 
 /**
@@ -455,6 +514,8 @@ Range (default: uncommitted changes, matching /litertlm:review):
                       that resolves here and shares history with HEAD.
   --staged            Review staged changes only.
   --path <pathspec>   Narrow to a path. Repeatable.
+  --paths-file <path> Read pathspecs from a file, one per line. For a file name you did not
+                      type yourself: a repository's names are its author's to choose.
 
 Guards:
   --max-bytes <n>     Refuse a request larger than this — the diff plus --focus, which
@@ -469,6 +530,8 @@ Guards:
                       Worth trying, since the ceiling depends on the model and no API
                       reports it. Not grounds for raising --max-bytes.
   --dry-run           Report the range and size, send nothing, start nothing.
+  --focus-file <path> Read the focus from a file. For text from anyone other than you:
+                      it never passes through a shell.
 
 Passed to the client:
   --model <id>        Model id (default: the client's — see Readiness below)
@@ -479,7 +542,8 @@ Passed to the client:
 Exit codes (a COVERAGE signal, never a findings verdict):
   0 full pass ran      1 environment failure   2 usage error
   3 nothing to review (empty diff)              4 refused as oversized
-  5 ran but did NOT cover the whole diff (oversized send, or a model tool call)
+  5 ran but did NOT cover the whole diff (oversized send, a model tool call, or
+    untracked files in scope that a diff against HEAD cannot show)
 
   This launcher is NOT a pass/fail gate. The model cannot check itself, so no exit
   code says the diff is clean — 0 means only that a full pass ran and its advisory
@@ -605,6 +669,7 @@ function main() {
   }
 
   const files = fileSizes(text);
+  const dirty = (!opts.staged && !opts.base) ? dirtySubmodules(text) : [];
   const out = process.stdout;
 
   // --focus is appended to the prompt and travels in the same request as the diff, so a
@@ -663,6 +728,10 @@ function main() {
     out.write(`NOT COVERED: ${untrackedNote} — untracked, so a diff against HEAD cannot see\n`);
     out.write('them. Silence about a new file below means it was never sent. git add -N to include.\n');
   }
+  if (dirty.length) {
+    out.write(`NOT COVERED: changes inside submodule${dirty.length === 1 ? '' : 's'} `
+      + `${dirty.join(', ')} — the diff shows only that they are dirty.\n`);
+  }
   if (oversize) out.write(`\n${OVERSIZE_STAMP(sent, opts.maxBytes)}\n`);
   out.write(`${RULE}\n\n`);
 
@@ -692,7 +761,11 @@ function main() {
   // cover the whole in-scope diff, so it must not exit 0 and read as a completed pass.
   // Set `process.exitCode` rather than calling `process.exit`, so the report just written
   // to stdout is flushed before the process ends (a hard exit truncates it on Windows).
-  if (toolCallInsteadOfReview || oversize) process.exitCode = EXIT.INCOMPLETE;
+  // Untracked files count: a pass over tracked changes alone is not a pass over the
+  // working tree, however complete it reads. See untrackedFiles.
+  if (toolCallInsteadOfReview || oversize || untracked.length || dirty.length) {
+    process.exitCode = EXIT.INCOMPLETE;
+  }
 }
 
 try {
