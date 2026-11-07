@@ -371,6 +371,12 @@ There is **no Windows or Linux binary in GitHub Releases** — only macOS arm64 
 
 ## The server holds VRAM after you finish
 
+If a note says the server is one **this plugin did not start**, that is the reason, and it is by
+design: the plugin uses such a server but neither `--stop` nor the idle watchdog will end it. Stop
+it yourself, or take it over with `--stop --manage-existing` on the user's say-so. Setting
+`LITERT_LM_PLUGIN_MANAGE_EXISTING=1` makes that the standing choice. A server left running across
+a plugin update counts as not started by it, because the record it would need is newer than it is.
+
 Expected: it stops itself after the idle period (default 900 s) and the next call restarts it
 transparently. To reclaim immediately:
 

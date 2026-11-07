@@ -28,7 +28,7 @@ import { reapMarkers } from './marker-state.mjs';
 // client applied, so the supervisor could SIGTERM a bystander the client would have
 // refused to touch. One home, one rule, no weaker copy.
 import {
-  formatPidRecord, identifyPortOwners, looksLikeLitertLmServe, parsePidRecord,
+  formatPidRecord, identifyPortOwners, managedServeTest, parsePidRecord,
   recordIsStale, resolveTargets, signallablePid, startToken,
 } from './process-identity.mjs';
 
@@ -254,6 +254,9 @@ async function serverReachable() {
  * command line, the recorded pid by the start token written when it was spawned.
  * Anything unprovable is left running.
  */
+const isManaged = () => managedServeTest(
+  ['managed', 'server.pid', 'survivors'].map((name) => readState(name, '')));
+
 function ourTargets() {
   // Same helper the client uses, so the port is re-asked AFTER identification and a
   // pid reissued mid-lookup to a litert-lm on another port cannot be adopted as
@@ -264,7 +267,7 @@ function ourTargets() {
   // A litert-lm bound to another interface on this port is a different server, and
   // supervising the socket we talk to means asking about that socket, not the number.
   const { ours: targets, unidentified, discoveryFailed } =
-    identifyPortOwners(opts.port, looksLikeLitertLmServe, opts.host);
+    identifyPortOwners(opts.port, isManaged(), opts.host);
   const recorded = ownedPid('server.pid');
   if (recorded !== null && !targets.some((t) => t.pid === recorded)) {
     targets.push({ pid: recorded, token: startToken(recorded) });
@@ -336,8 +339,8 @@ function cleanupAndExit(code = 0) {
  * the client that owns the proven replacement server.
  *
  * The request is matched by complete identity against either `server.pid` or a
- * currently proven listener, so an adopted manual server is covered without making
- * a bare pid authoritative. The slot is released before spawning, but creation is
+ * currently proven listener, so a server handed over with --manage-existing is covered
+ * without making a bare pid authoritative. The slot is released before spawning, but creation is
  * not success: this process waits for a live successor claim, and reclaims its own
  * exact record for another attempt if the child fails before publishing one.
  */
@@ -352,7 +355,7 @@ function requestedReplacement(request, chased, host) {
       return { status: 'none', replacement: null };
     }
 
-    const discovered = identifyPortOwners(opts.port, looksLikeLitertLmServe, host);
+    const discovered = identifyPortOwners(opts.port, isManaged(), host);
     if (discovered.discoveryFailed || discovered.unidentified.length) {
       return { status: 'pending', replacement: null };
     }
@@ -369,7 +372,7 @@ function requestedReplacement(request, chased, host) {
   const candidates = [];
   const recorded = parsePidRecord(readState('server.pid', ''));
   if (recorded?.token) candidates.push(recorded);
-  const discovered = identifyPortOwners(opts.port, looksLikeLitertLmServe, host);
+  const discovered = identifyPortOwners(opts.port, isManaged(), host);
   if (!discovered.discoveryFailed && !discovered.unidentified.length) {
     candidates.push(...discovered.ours.filter((rec) => rec.token));
   }
