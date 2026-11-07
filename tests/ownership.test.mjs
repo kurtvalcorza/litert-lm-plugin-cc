@@ -133,7 +133,13 @@ const PORT = {
 };
 
 const spawned = [];
-const reap = (child) => { spawned.push(child); return child; };
+// Windows reissues pids, and this process memoises identities for its whole run, so a new
+// fixture could otherwise be given the token of a dead one, and read as a reused pid.
+const reap = (child) => {
+  spawned.push(child);
+  forgetIdentities([child.pid]);
+  return child;
+};
 after(() => {
   for (const c of spawned) { try { c.kill('SIGKILL'); } catch { /* already gone */ } }
 });
@@ -1491,9 +1497,6 @@ describe('starting beside a leftover', () => {
     const dir = stateDir(runtime, port);
 
     const leftover = await startBystander();
-    // Windows reissues pids, and this process memoises identities for its whole run, so
-    // a dead test's token could otherwise be returned here for this new process.
-    forgetIdentities([leftover.pid]);
     const token = startToken(leftover.pid);
     if (token === null) {
       t.skip('cannot establish process identity on this host');
