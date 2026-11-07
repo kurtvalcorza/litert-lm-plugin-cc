@@ -242,7 +242,8 @@ python "${CLAUDE_PLUGIN_ROOT}/tools/litertlm_backend.py" check <model.litertlm>
 python "${CLAUDE_PLUGIN_ROOT}/tools/litertlm_backend.py" patch <model.litertlm> --backend gpu --yes
 ```
 
-Reverses with `--backend cpu --yes`. See the `litertlm-format` skill for why this is safe.
+Reverses with `--backend cpu --yes`, which changes the behaviour but leaves the key in the
+header; `restore <model> --original --yes` puts the first block back byte for byte. See the `litertlm-format` skill for why this is safe.
 
 ---
 
@@ -257,12 +258,28 @@ A patch writes both. Interrupted between the two, they disagree, and the flatbuf
 truncated. **`patch --backend cpu` cannot undo this** — it reverses a *completed* patch, and
 this one never completed.
 
-**Fix**: `patch` copies the 16 KB header block aside before writing and removes it only on
-success, so a leftover copy is itself the evidence the run died.
+**Fix**: `patch` copies the 16 KB header block aside before writing and removes it only once a
+fresh read proves the new header is the intended one, so a leftover `.hdrbak` is itself the
+evidence the run died or failed verification. `patch` and `check` refuse until it is resolved,
+because a second attempt must never replace the only way back.
 
 ```bash
 python "${CLAUDE_PLUGIN_ROOT}/tools/litertlm_backend.py" restore <model.litertlm>
 ```
+
+If the model loads and you want to keep it as it is, resolve it the other way instead. That
+deletes the recovery copy, so it needs the user's agreement:
+
+```bash
+python "${CLAUDE_PLUGIN_ROOT}/tools/litertlm_backend.py" discard-backup <model.litertlm>
+```
+
+`restore` refuses a copy whose section layout differs from the model, because that copy came
+from another file. `--force` overrides that for a torn header that happens to parse; it does not
+override a copy that describes sections past the end of the file.
+
+A `<model>.litertlm.hdrorig` beside a patched model is expected: it is the header as first seen,
+kept for `restore --original`, and it is not a sign of a failed patch.
 
 Every command that hits an unreadable header already says whether a backup exists. If none
 does, the model must be re-imported — the payload is intact but nothing describes it.

@@ -117,7 +117,8 @@ change. If they decline, write nothing and say the system still works, just on t
 declining must not leave things half-configured.
 
 Reassure accurately: only the first 16 KB of the file is rewritten, the multi-gigabyte payload
-is untouched, and the change reverses with `--backend cpu --yes`.
+is untouched, the change reverses with `--backend cpu --yes`, and `restore --original --yes` puts
+the header back byte for byte.
 
 The payload claim is checkable, not just a claim — hash before and after and compare:
 

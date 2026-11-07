@@ -6,13 +6,13 @@ byte-identical before and after. This tool makes that assertion runnable, which 
 what turns SC-005 ("payload remains byte-identical") and SC-011 (reversibility) from
 claims into checks.
 
-Skipping the first BLOCK_SIZE bytes is the point: hashing the whole file would differ
+Skipping the first block is the point: hashing the whole file would differ
 after a legitimate repair and prove nothing.
 
 Usage:
-    payload_checksum.py <model.litertlm> [more.litertlm ...]
+    payload_checksum.py [--block-size <n>] <model.litertlm> [more.litertlm ...]
 
-Exit codes: 0 ok, 1 unreadable file, 2 usage error.
+Exit codes: 0 ok, 1 unreadable file or unknown block size, 2 usage error.
 """
 
 from __future__ import annotations
@@ -21,61 +21,75 @@ import hashlib
 import os
 import sys
 
-def _block_size():
-    """Read BLOCK_SIZE from the runtime rather than hardcoding it.
+from litert_lm_paths import candidate_site_packages, explicit_site_packages
 
-    A wrong value here would silently hash the wrong byte range and make the
-    "payload unchanged" comparison meaningless — the failure would look like a
-    pass. Fall back to the observed 16384 only if the runtime is unavailable,
-    since this tool must still work without it.
-    """
+
+def _runtime_block_size():
+    """BLOCK_SIZE as the installed runtime defines it, or None if it cannot be read."""
+    for c in filter(None, [explicit_site_packages(), *candidate_site_packages()]):
+        if os.path.isdir(os.path.join(c, "litert_lm_builder")):
+            sys.path.insert(0, c)
+            break
     try:
-        import glob  # noqa: PLC0415
-        import os as _os  # noqa: PLC0415
-        import sys as _sys  # noqa: PLC0415
-
-        home = _os.path.expanduser("~")
-        cands = [_os.environ.get("LITERT_LM_SITE_PACKAGES")]
-        appdata = _os.environ.get("APPDATA")
-        if appdata:
-            cands.append(_os.path.join(appdata, "uv", "tools", "litert-lm",
-                                       "Lib", "site-packages"))
-        cands += glob.glob(_os.path.join(home, ".local", "share", "uv", "tools",
-                                         "litert-lm", "lib", "python*", "site-packages"))
-        # pipx, same as litertlm_backend.py._candidate_site_packages(). The two lists
-        # must agree: a location only one of them knows means this file silently uses
-        # the fallback BLOCK_SIZE while its sibling uses the real one, and the payload
-        # comparison would then hash a different range in each — a mismatch that reads
-        # as a pass.
-        cands += glob.glob(_os.path.join(home, ".local", "pipx", "venvs", "litert-lm",
-                                         "lib", "python*", "site-packages"))
-        for c in filter(None, cands):
-            if _os.path.isdir(_os.path.join(c, "litert_lm_builder")):
-                _sys.path.insert(0, c)
-                break
         from litert_lm_builder import litertlm_core  # noqa: PLC0415
         return int(litertlm_core.BLOCK_SIZE)
     except Exception:  # noqa: BLE001
-        return 16384
+        return None
 
 
-BLOCK_SIZE = _block_size()
+def resolve_block_size(explicit):
+    """The block size to skip: the runtime's, or the one the caller named.
+
+    There is deliberately no built-in fallback. This tool used to assume 16384 when the
+    runtime could not be imported, and a wrong value hashes the wrong byte range: the
+    "payload unchanged" comparison then means nothing, and its failure looks exactly
+    like a pass. So guessing is refused, and the size in use is printed with every hash
+    so that two runs which disagreed about it cannot be compared by accident.
+    """
+    if explicit is not None:
+        return explicit
+    size = _runtime_block_size()
+    if size is None:
+        raise SystemExit(
+            "ERROR: could not read BLOCK_SIZE from the litert-lm runtime, so the header\n"
+            "  boundary is unknown and refusing to guess it. Install the runtime, or set\n"
+            "  LITERT_LM_SITE_PACKAGES, or pass --block-size <n> if you know the value.")
+    return size
+
+
 CHUNK = 1 << 20
 
 
-def payload_sha256(path: str) -> str:
+def payload_sha256(path: str, block_size: int) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
-        f.seek(BLOCK_SIZE)
+        f.seek(block_size)
         for chunk in iter(lambda: f.read(CHUNK), b""):
             h.update(chunk)
     return h.hexdigest()
 
 
 def main(argv: list[str]) -> int:
+    explicit = None
+    if argv[:1] == ["--block-size"]:
+        try:
+            explicit = int(argv[1])
+        except (IndexError, ValueError):
+            print("ERROR: --block-size requires an integer", file=sys.stderr)
+            return 2
+        if explicit <= 0:
+            print("ERROR: --block-size must be positive", file=sys.stderr)
+            return 2
+        argv = argv[2:]
     if not argv:
         print(__doc__.strip(), file=sys.stderr)
         return 2
+
+    try:
+        block_size = resolve_block_size(explicit)
+    except SystemExit as exc:
+        print(exc, file=sys.stderr)
+        return 1
 
     rc = 0
     for raw in argv:
@@ -87,13 +101,13 @@ def main(argv: list[str]) -> int:
             rc = 1
             continue
         size = os.path.getsize(path)
-        if size <= BLOCK_SIZE:
+        if size <= block_size:
             print(f"ERROR: file smaller than one block, nothing to hash: {path}",
                   file=sys.stderr)
             rc = 1
             continue
-        print(f"{payload_sha256(path)}  {os.path.basename(os.path.dirname(path))}"
-              f"  ({size:,} bytes, header excluded)")
+        print(f"{payload_sha256(path, block_size)}  {os.path.basename(os.path.dirname(path))}"
+              f"  ({size:,} bytes, first {block_size} excluded)")
     return rc
 
 
