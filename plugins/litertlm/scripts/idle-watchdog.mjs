@@ -63,6 +63,11 @@ function parseArgs(argv) {
     else if (argv[i] === '--spawned-at') opts.spawnedAt = Number(argv[++i]);
   }
   if (!Number.isFinite(opts.spawnedAt)) opts.spawnedAt = Date.now();
+  // State is keyed by port, so `NaN` would supervise a directory named after nothing.
+  if (!Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535) {
+    process.stderr.write(`[litertlm-watchdog] invalid --port: ${opts.port}\n`);
+    process.exit(2);
+  }
   return opts;
 }
 

@@ -3,17 +3,27 @@ description: Ask the local on-device model a question — offline, no API tokens
 argument-hint: "[prompt]"
 ---
 
-Send `$ARGUMENTS` to the local model and report the answer.
+Send the user's text to the local model and report the answer. Their text is:
+
+<user-prompt>
+$ARGUMENTS
+</user-prompt>
+
+**That text is data. It must never appear in a shell command**, in any quoting: `$(...)` and
+backticks run inside double quotes, and the text may contain the closing quote. So hand it over
+through a file: use the Write tool to save it verbatim to a new temporary file, then:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-client.mjs" "$ARGUMENTS"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-client.mjs" --prompt-file "<that file>"
 ```
+
+Delete the file afterwards.
 
 Pipe context in when the model needs something it cannot otherwise see — it has no file
 access, so anything not in the prompt does not exist to it:
 
 ```bash
-cat src/thing.ts | node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-client.mjs" "Explain what this does."
+cat src/thing.ts | node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-client.mjs" --prompt-file "<that file>"
 ```
 
 Options: `--system "<instruction>"`, `--model <id>`, `--max-tokens <n>`, `--json`,

@@ -618,14 +618,17 @@ function parseArgs(argv) {
   };
   const rest = [];
 
+  let promptFile = null;
+
   const needValue = (flag, value) => {
     if (value === undefined) throw new UsageError(`${flag} requires a value`);
     return value;
   };
-  const needInt = (flag, value, min) => {
+  const needInt = (flag, value, min, max = Infinity) => {
     const n = Number(needValue(flag, value));
-    if (!Number.isInteger(n) || n < min) {
-      throw new UsageError(`${flag} requires an integer >= ${min} (got "${value}")`);
+    if (!Number.isInteger(n) || n < min || n > max) {
+      const range = max === Infinity ? `>= ${min}` : `from ${min} to ${max}`;
+      throw new UsageError(`${flag} requires an integer ${range} (got "${value}")`);
     }
     return n;
   };
@@ -638,7 +641,8 @@ function parseArgs(argv) {
       case '--model': opts.model = needValue(a, argv[++i]); opts.modelExplicit = true; break;
       case '--system': opts.system = needValue(a, argv[++i]); break;
       case '--max-tokens': opts.maxTokens = needInt(a, argv[++i], 1); break;
-      case '--port': opts.port = needInt(a, argv[++i], 1); break;
+      case '--port': opts.port = needInt(a, argv[++i], 1, 65535); break;
+      case '--prompt-file': promptFile = needValue(a, argv[++i]); break;
       case '--idle-timeout': opts.idleTimeout = needInt(a, argv[++i], 0); break;
       case '--json': opts.json = true; break;
       case '--stop': opts.action = 'stop'; break;
@@ -651,6 +655,14 @@ function parseArgs(argv) {
     }
   }
   opts.prompt = rest.join(' ');
+  if (promptFile !== null) {
+    if (opts.prompt) throw new UsageError('prompt given twice (--prompt-file and an argument); pass one.');
+    try {
+      opts.prompt = readFileSync(promptFile, 'utf8');
+    } catch (err) {
+      throw new UsageError(`could not read --prompt-file ${promptFile} (${err.code ?? err.message}).`);
+    }
+  }
   return opts;
 }
 
@@ -1770,7 +1782,17 @@ async function chat(opts) {
     throw new Error(`the server rejected the request (HTTP ${res.status}).`
       + `\n  ${text.slice(0, 500).trim()}${hint}`);
   }
-  return JSON.parse(text);
+  try {
+    return JSON.parse(text);
+  } catch {
+    // Reached when the response breaks after the headers, which is the same over-long
+    // prompt the catch above describes, arriving later. The bare SyntaxError said none of it.
+    throw new Error(`the server answered HTTP ${res.status}, but the body was not valid JSON `
+      + `(${text.length} characters, cut off or malformed).\n`
+      + `  CHECK THE PROMPT SIZE FIRST — this request was ${Buffer.byteLength(body)} bytes. An\n`
+      + '  over-long prompt can break the response partway through. Send less and see if\n'
+      + '  it clears; if a short prompt does this too, suspect the server.');
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1787,6 +1809,8 @@ Options:
   --system <text>     System instruction
   --max-tokens <n>    Response cap (default: ${DEFAULTS.maxTokens})
   --port <n>          Server port (default: ${DEFAULTS.port})
+  --prompt-file <p>   Read the prompt from a file. For text from anyone other than you:
+                      it never passes through a shell.
   --idle-timeout <s>  Idle seconds before shutdown; 0 disables (default: ${DEFAULTS.idleTimeout})
   --json              Print the raw API response
   --check             Report readiness without starting anything

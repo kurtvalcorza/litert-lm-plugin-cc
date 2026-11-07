@@ -36,6 +36,16 @@ steady state — a first call after idle is slower because it pays engine initia
 16 KB metadata header**; the multi-gigabyte payload is never touched, which is verifiable, and
 the change is reversible.
 
+## Upgrading to 0.5.0
+
+**A server this plugin did not start is no longer its to stop.** It is still used, but `--stop` and
+the idle watchdog leave it running and a note says so. That includes a server left running across
+this update. Hand one over with `--manage-existing`, or set `LITERT_LM_PLUGIN_MANAGE_EXISTING=1` to
+make that the standing choice.
+
+`/litertlm:review` now exits 5, not 0, when untracked files in scope were not seen. Anything keying
+on that code should treat it as incomplete coverage.
+
 ## Requirements
 
 - [Node.js](https://nodejs.org/) ≥ 18 and Python ≥ 3.9 — both standard-library only, no

@@ -25,6 +25,7 @@ positional prompt precedes the piped content, separated by a blank line — so
 | `--port <n>` | 9379 | Server port. |
 | `--idle-timeout <s>` | 900 | Idle seconds before the watchdog stops the server. `0` disables idle shutdown. |
 | `--json` | off | Emit the raw response object rather than message text. |
+| `--prompt-file <path>` | none | Read the prompt from a file, so text from elsewhere never passes through a shell. Excludes a positional prompt; piped stdin is still appended. |
 | `--check` | — | Report readiness; start nothing; exit. |
 | `--list` | — | List served model ids; exit. |
 | `--stop` | — | Stop server and watchdog; exit. |
