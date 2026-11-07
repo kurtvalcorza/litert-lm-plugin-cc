@@ -19,6 +19,9 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-client.mjs" --prompt-file "<that fi
 
 Delete the file afterwards.
 
+If a piped command takes more than a few seconds to produce its first output, add `--wait-stdin`.
+Without it, the request goes without the piped input after 5 seconds, and a notice on stderr says so.
+
 Pipe context in when the model needs something it cannot otherwise see — it has no file
 access, so anything not in the prompt does not exist to it:
 

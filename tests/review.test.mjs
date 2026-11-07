@@ -261,6 +261,74 @@ describe('rejecting bad input early', () => {
   }
 });
 
+describe('stdin held open', () => {
+  const GRACE_MS = 5000;
+
+  /** The client with stdin as a real pipe, which `script` feeds and may never close. */
+  function piped(args, script = () => {}) {
+    return new Promise((resolve) => {
+      const child = spawn(process.execPath, [CLIENT, '--port', String(port), ...args], {
+        cwd: scratch,
+        windowsHide: true,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env, LITERT_LM_PLUGIN_RUNTIME: runtime, LITERT_LM_PLUGIN_MODEL: 'fake' },
+      });
+      child.stdin.on('error', () => { /* the client may have gone first */ });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.setEncoding('utf8').on('data', (d) => { stdout += d; });
+      child.stderr.setEncoding('utf8').on('data', (d) => { stderr += d; });
+      child.on('close', (status) => resolve({ status, stdout, stderr }));
+      script(child.stdin);
+    });
+  }
+  const content = () => requests.at(-1).messages.at(-1).content;
+
+  test('a pipe nobody writes to cannot hang a request that has its prompt',
+    { timeout: 30_000 }, async () => {
+      const r = await piped(['the prompt']);
+      assert.equal(r.status, 0, r.stderr);
+      assert.equal(content(), 'the prompt');
+      assert.match(r.stderr, /nothing arrived on stdin/);
+      assert.match(r.stderr, /--wait-stdin/, 'leaving input out must be said, and how to avoid it');
+    });
+
+  test('input already piped in is still used, without a notice', { timeout: 30_000 }, async () => {
+    const r = await piped(['the prompt'], (stdin) => stdin.end('from the pipe\n'));
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(content(), 'the prompt\n\nfrom the pipe');
+    assert.doesNotMatch(r.stderr, /nothing arrived/);
+  });
+
+  test('input that has begun is read to EOF, past the grace period',
+    { timeout: 30_000 }, async () => {
+      const r = await piped(['the prompt'], (stdin) => {
+        stdin.write('first ');
+        setTimeout(() => stdin.end('second'), GRACE_MS + 1000);
+      });
+      assert.equal(r.status, 0, r.stderr);
+      assert.equal(content(), 'the prompt\n\nfirst second');
+      assert.doesNotMatch(r.stderr, /nothing arrived/);
+    });
+
+  test('--wait-stdin takes input that starts after the grace period',
+    { timeout: 30_000 }, async () => {
+      const r = await piped(['the prompt', '--wait-stdin'], (stdin) => {
+        setTimeout(() => stdin.end('late'), GRACE_MS + 1000);
+      });
+      assert.equal(r.status, 0, r.stderr);
+      assert.equal(content(), 'the prompt\n\nlate');
+    });
+
+  test('with no prompt, stdin is the prompt and is waited for', { timeout: 30_000 }, async () => {
+    const r = await piped([], (stdin) => {
+      setTimeout(() => stdin.end('only the pipe'), GRACE_MS + 1000);
+    });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(content(), 'only the pipe');
+  });
+});
+
 describe('a 200 that is not the answer', () => {
   test('an unparseable body gets the size guidance, not a SyntaxError', async () => {
     const previous = reply;

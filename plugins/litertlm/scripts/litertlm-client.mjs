@@ -643,6 +643,7 @@ function parseArgs(argv) {
       case '--max-tokens': opts.maxTokens = needInt(a, argv[++i], 1); break;
       case '--port': opts.port = needInt(a, argv[++i], 1, 65535); break;
       case '--prompt-file': promptFile = needValue(a, argv[++i]); break;
+      case '--wait-stdin': opts.waitStdin = true; break;
       case '--idle-timeout': opts.idleTimeout = needInt(a, argv[++i], 0); break;
       case '--json': opts.json = true; break;
       case '--stop': opts.action = 'stop'; break;
@@ -1809,6 +1810,8 @@ Options:
   --system <text>     System instruction
   --max-tokens <n>    Response cap (default: ${DEFAULTS.maxTokens})
   --port <n>          Server port (default: ${DEFAULTS.port})
+  --wait-stdin        Wait for piped input however long it takes to start. By default a
+                      request with a prompt gives it 5 seconds, then goes without it.
   --prompt-file <p>   Read the prompt from a file. For text from anyone other than you:
                       it never passes through a shell.
   --idle-timeout <s>  Idle seconds before shutdown; 0 disables (default: ${DEFAULTS.idleTimeout})
@@ -1827,12 +1830,45 @@ Notes:
   First call after idle pays engine init. Warm calls are fast.
 `.trim();
 
-async function readStdin() {
-  if (process.stdin.isTTY) return '';
-  let data = '';
-  process.stdin.setEncoding('utf8');
-  for await (const chunk of process.stdin) data += chunk;
-  return data.trim();
+/** How long a request that already has its prompt waits for piped input to begin. */
+const STDIN_GRACE_MS = 5000;
+
+/**
+ * Piped input, to EOF. A caller can hold stdin open and never write to it, as a background
+ * shell does, and stdin then never ends. With a prompt in hand that must not hang forever,
+ * so the first byte gets a grace period. Once data arrives it is read to EOF however slowly
+ * it comes, and giving up is reported, because input that starts late is left out. With no
+ * prompt, stdin is the prompt, so there is nothing to do but wait.
+ */
+function readStdin({ hasPrompt, wait }) {
+  if (process.stdin.isTTY) return Promise.resolve('');
+  return new Promise((resolve, reject) => {
+    let data = '';
+    let grace = null;
+    const finish = () => {
+      clearTimeout(grace);
+      resolve(data.trim());
+    };
+    if (hasPrompt && !wait) {
+      grace = setTimeout(() => {
+        process.stderr.write(`[litertlm] nothing arrived on stdin within ${STDIN_GRACE_MS / 1000}s, `
+          + 'so the prompt was sent without it.\n'
+          + '  Input that was going to be piped in is not included. --wait-stdin waits for it.\n');
+        process.stdin.destroy();
+        resolve('');
+      }, STDIN_GRACE_MS);
+    }
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (chunk) => {
+      clearTimeout(grace);
+      data += chunk;
+    });
+    process.stdin.once('end', finish);
+    process.stdin.once('error', (err) => {
+      clearTimeout(grace);
+      reject(err);
+    });
+  });
 }
 
 async function main() {
@@ -1953,7 +1989,7 @@ async function main() {
     return;
   }
 
-  const piped = await readStdin();
+  const piped = await readStdin({ hasPrompt: Boolean(opts.prompt), wait: opts.waitStdin });
   if (piped) opts.prompt = opts.prompt ? `${opts.prompt}\n\n${piped}` : piped;
   if (!opts.prompt) {
     throw new UsageError('no prompt supplied (pass an argument or pipe input). Try --help.');
