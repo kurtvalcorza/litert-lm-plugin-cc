@@ -17,7 +17,11 @@ cat src/thing.ts | node "${CLAUDE_PLUGIN_ROOT}/scripts/litertlm-client.mjs" "Exp
 ```
 
 Options: `--system "<instruction>"`, `--model <id>`, `--max-tokens <n>`, `--json`,
-`--idle-timeout <seconds>`.
+`--idle-timeout <seconds>`, `--manage-existing`.
+
+If a server is already running that the plugin did not start, it is used but never stopped, and a
+note on stderr says so. `--manage-existing` hands a litert-lm server over to the plugin; pass it
+only if the user asks, because the idle watchdog may then end a process they started.
 
 Only stdout carries the answer; progress notices and warnings go to stderr. Exit code 2 means
 the command was called wrong, 1 means the environment is not ready — and the message names the

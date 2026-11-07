@@ -412,8 +412,14 @@ function listenersOnPort(port) {
     // and both cases are finally distinguishable. Verified on this host: empty port 0
     // with no rows, live port 0 with a row, malformed query 3.
     const r = run('powershell.exe', ['-NoProfile', '-Command',
+      //
+      // `-State Listen` is applied here rather than as a parameter because some Windows
+      // builds return every row with a null State (seen on 10.0.26300), and on those
+      // the parameter matched nothing: a live server read as an empty port, with a
+      // success status. A listener is what remains identifiable there, having no peer.
       'try { '
-      + `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction Stop `
+      + `Get-NetTCPConnection -LocalPort ${port} -ErrorAction Stop `
+      + "| Where-Object { $_.State -eq 'Listen' -or ($null -eq $_.State -and $_.RemotePort -eq 0) } "
       + '| ForEach-Object { ($_.LocalAddress, $_.OwningProcess) -join [char]9 } '
       + "} catch { if ($_.FullyQualifiedErrorId -notlike 'CmdletizationQuery_NotFound*')"
       + ' { exit 3 } }; exit 0']);
@@ -1081,7 +1087,7 @@ export function isRecordedProcess(pid, token) {
  * invocation is the answer.
  *
  * Deliberately does NOT require `--port <n>`: a server started by hand as plain
- * `litert-lm serve` on the default port carries no such flag, and `ensureServer`
+ * `litert-lm serve` on the default port carries no such flag, and --manage-existing
  * adopts exactly that server. The listening socket already supplies the port; the
  * command line only has to supply the identity.
  *
@@ -1153,6 +1159,30 @@ export function commandLaunches(cmdline, exe) {
  */
 export const looksLikeLitertLmServe = (pid) =>
   isLitertLmServeCommand(identity(pid)?.cmdline);
+
+/**
+ * May this plugin stop the `litert-lm serve` holding a socket? Returns the pid test.
+ *
+ * CONNECTING IS NOT OWNING. Any server on the port can answer a request; that says
+ * nothing about who is entitled to end it. The command line used to settle both, so
+ * a server the user started by hand was adopted on first contact and then killed by
+ * `--stop` or the idle watchdog. So authority now needs two things: that it is a
+ * litert-lm server, and that its exact identity is one this plugin recorded, because
+ * it launched it or was told to take it over with --manage-existing.
+ *
+ * Anything that fails lands in `strangers`: never signalled, and reported. One rule
+ * with one home, because the client and the watchdog both have to answer this.
+ */
+export function managedServeTest(recordTexts) {
+  const known = new Set();
+  for (const text of recordTexts) {
+    for (const line of String(text ?? '').split('\n')) {
+      const rec = parsePidRecord(line);
+      if (rec?.token) known.add(`${rec.pid} ${rec.token}`);
+    }
+  }
+  return (pid) => looksLikeLitertLmServe(pid) && known.has(`${pid} ${startToken(pid)}`);
+}
 
 // ---------------------------------------------------------------------------
 // The pid-file record
