@@ -29,7 +29,7 @@ import { reapMarkers } from './marker-state.mjs';
 // refused to touch. One home, one rule, no weaker copy.
 import {
   formatPidRecord, identifyPortOwners, managedServeTest, parsePidRecord,
-  resolveTargets, signallablePid, startToken,
+  recordIsStale, resolveTargets, signallablePid, startToken,
 } from './process-identity.mjs';
 
 const POLL_INTERVAL_MS = 5000;
@@ -99,7 +99,10 @@ function writeState(name, value) {
 function claimStopping() {
   const stamp = String(Date.now());
   writeState('stopping', stamp);
-  return readState('stopping') === stamp;
+  if (readState('stopping') === stamp) return true;
+  // A failed write can leave a torn file, and clients read any `stopping` as a shutdown.
+  clearState('stopping');
+  return false;
 }
 
 function clearState(name) {
@@ -268,6 +271,15 @@ function ourTargets() {
   const recorded = ownedPid('server.pid');
   if (recorded !== null && !targets.some((t) => t.pid === recorded)) {
     targets.push({ pid: recorded, token: startToken(recorded) });
+  }
+  if (recorded === null) {
+    // `ownedPid` is null for a record that is contradicted and also for one that could
+    // not be looked up, and only the first means gone. A failed lookup stays unjudged, or
+    // one transient error would end supervision and delete the only identity.
+    const record = parsePidRecord(readState('server.pid', ''));
+    if (record?.token && !recordIsStale(record, stateWrittenAt('server.pid'))) {
+      unidentified.push(...resolveTargets([record]).unknown);
+    }
   }
   return { targets, unidentified, discoveryFailed };
 }

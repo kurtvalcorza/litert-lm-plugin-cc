@@ -32,8 +32,8 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import {
-  _parsers, _queries, addressServes, addressVerdict, commandLaunches, descendantsOf, formatPidRecord,
-  identity, managedServeTest,
+  _parsers, _queries, addressServes, addressVerdict, commandLaunches, descendantsOf,
+  forgetIdentities, formatPidRecord, identity, managedServeTest,
   identifyPortOwners, isLitertLmServeCommand, parsePidRecord, pidsOnPort, processTable,
   portOwnerDiscoveryHelp, recordIsStale, signallablePid, startGeneration, startToken,
 } from '../plugins/litertlm/scripts/process-identity.mjs';
@@ -108,6 +108,7 @@ const PORT = {
   unmanagedPredicate: reservePort(19191),
   silentIdle: reservePort(19241),
   silentGone: reservePort(19251),
+  silentUnjudged: reservePort(19581),
   stranger: reservePort(19301),
   reuse: reservePort(19311),
   watchdogStranger: reservePort(19321),
@@ -1560,6 +1561,9 @@ describe('starting beside a leftover', () => {
     const dir = stateDir(runtime, port);
 
     const leftover = await startBystander();
+    // Windows reissues pids, and this process memoises identities for its whole run, so
+    // a dead test's token could otherwise be returned here for this new process.
+    forgetIdentities([leftover.pid]);
     const token = startToken(leftover.pid);
     if (token === null) {
       t.skip('cannot establish process identity on this host');
@@ -2932,6 +2936,48 @@ describe('a server that stops answering', () => {
       'silence must not exempt a server from the idle schedule');
     assert.ok(await waitFor(() => readIfPresent(join(dir, 'stopped-idle')) !== null,
       { timeout: 10_000 }), 'and the stop is reported');
+  });
+
+  test('a failed identity lookup is not a death', { timeout: 60_000 }, async (t) => {
+    if (!(await canDiscoverPortOwners())) {
+      t.skip('no socket-owner discovery on this host (needs lsof or ss)');
+      return;
+    }
+    const port = PORT.silentUnjudged;
+    const runtime = runtimeDir();
+    const dir = stateDir(runtime, port);
+    const silent = await startBystander();
+    const record = formatPidRecord(silent.pid);
+    writeFileSync(join(dir, 'server.pid'), record, 'utf8');
+    writeFileSync(join(dir, 'last-activity'), String(Date.now()), 'utf8');
+
+    // Every platform's way of describing this one process fails; it stays alive throughout.
+    const preload = fastClock(runtime);
+    writeFileSync(preload, `${readFileSync(preload, 'utf8')}
+      const cp = require('node:child_process');
+      const fs = require('node:fs');
+      const target = ${JSON.stringify(String(silent.pid))};
+      const realSpawn = cp.spawnSync;
+      cp.spawnSync = (cmd, args, options) => (String(args).includes(target)
+        ? { stdout: '', stderr: '', status: 1, signal: null }
+        : realSpawn(cmd, args, options));
+      const realRead = fs.readFileSync;
+      fs.readFileSync = (file, ...rest) => {
+        if (String(file).startsWith('/proc/' + target + '/')) {
+          throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+        }
+        return realRead(file, ...rest);
+      };
+      require('node:module').syncBuiltinESMExports();
+    `, 'utf8');
+    const watchdog = supervise(port, runtime, preload, 3600);
+
+    await sleep(6000);
+    assert.ok(alive(watchdog.pid), 'a lookup that failed proves nothing about the process');
+    assert.equal(readIfPresent(join(dir, 'server.pid')), record, 'its identity is kept');
+
+    try { watchdog.kill('SIGKILL'); } catch { /* already gone */ }
+    try { silent.kill('SIGKILL'); } catch { /* already gone */ }
   });
 
   test('stands down when nothing is left', { timeout: 60_000 }, async (t) => {
