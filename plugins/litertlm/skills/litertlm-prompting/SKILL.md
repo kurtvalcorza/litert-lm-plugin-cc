@@ -78,6 +78,9 @@ If you are unsure, say so rather than guessing."
 The "say so rather than guessing" clause measurably reduces confident invention. Worth
 including whenever the answer might be outside what you supplied.
 
+Inline `--system` is for text you wrote. If any of it came from the user, save it to a file and
+pass `--system-file`: it would otherwise be part of a shell command.
+
 ### 7. Keep input short
 
 A long prompt fails, and how it fails depends on the runtime. Measured on litert-lm 0.14.0

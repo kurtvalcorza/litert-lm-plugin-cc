@@ -266,6 +266,7 @@ function parseArgs(argv) {
   };
   const rest = [];
   let focusFile = null;
+  let pathsFile = null;
 
   const needValue = (flag, value) => {
     if (value === undefined) throw usage(`${flag} requires a value`);
@@ -303,6 +304,7 @@ function parseArgs(argv) {
       case '--base': opts.base = needNonEmpty(a, argv[++i]); break;
       case '--staged': opts.staged = true; break;
       case '--path': opts.paths.push(needNonEmpty(a, argv[++i])); break;
+      case '--paths-file': pathsFile = needNonEmpty(a, argv[++i]); break;
       case '--focus': opts.focus = needValue(a, argv[++i]); break;
       case '--focus-file': focusFile = needNonEmpty(a, argv[++i]); break;
       case '--max-bytes': opts.maxBytes = needInt(a, argv[++i], 1); break;
@@ -328,6 +330,14 @@ function parseArgs(argv) {
   // through the `^{commit}` it appends, which is an accident rather than a guard.
   if (opts.base?.startsWith('-')) {
     throw usage(`--base '${opts.base}' looks like an option, not a ref.`);
+  }
+
+  if (pathsFile !== null) {
+    try {
+      opts.paths.push(...readFileSync(pathsFile, 'utf8').split(/\r?\n/).filter(Boolean));
+    } catch (err) {
+      throw usage(`could not read --paths-file ${pathsFile} (${err.code ?? err.message}).`);
+    }
   }
 
   const positional = rest.join(' ').trim();
@@ -393,9 +403,18 @@ function collectDiff(opts) {
  * staged nor in a committed range.
  */
 function untrackedFiles(paths) {
-  const args = ['ls-files', '--others', '--exclude-standard'];
-  if (paths.length) args.push('--', ...paths);
+  // `ls-files` lists below the current directory and `git diff` covers the whole repository,
+  // so without `:/` a review from a subdirectory reports files elsewhere as covered.
+  const args = ['-c', 'core.quotePath=false', 'ls-files', '--others', '--exclude-standard',
+    '--', ...(paths.length ? paths : [':/'])];
   return git(args).text.split('\n').map((s) => s.trim()).filter(Boolean);
+}
+
+/** Submodules with local changes: the diff has one `-dirty` line and none of the changes. */
+function dirtySubmodules(text) {
+  return text.split(/^diff --git /m).slice(1)
+    .filter((part) => /^\+Subproject commit [0-9a-f]+-dirty$/m.test(part))
+    .map((part) => part.slice(0, part.indexOf('\n')).match(/ b\/(.*)$/)?.[1] ?? 'unknown');
 }
 
 /**
@@ -494,6 +513,8 @@ Range (default: uncommitted changes, matching /litertlm:review):
                       that resolves here and shares history with HEAD.
   --staged            Review staged changes only.
   --path <pathspec>   Narrow to a path. Repeatable.
+  --paths-file <path> Read pathspecs from a file, one per line. For a file name you did not
+                      type yourself: a repository's names are its author's to choose.
 
 Guards:
   --max-bytes <n>     Refuse a request larger than this — the diff plus --focus, which
@@ -647,6 +668,7 @@ function main() {
   }
 
   const files = fileSizes(text);
+  const dirty = (!opts.staged && !opts.base) ? dirtySubmodules(text) : [];
   const out = process.stdout;
 
   // --focus is appended to the prompt and travels in the same request as the diff, so a
@@ -705,6 +727,10 @@ function main() {
     out.write(`NOT COVERED: ${untrackedNote} — untracked, so a diff against HEAD cannot see\n`);
     out.write('them. Silence about a new file below means it was never sent. git add -N to include.\n');
   }
+  if (dirty.length) {
+    out.write(`NOT COVERED: changes inside submodule${dirty.length === 1 ? '' : 's'} `
+      + `${dirty.join(', ')} — the diff shows only that they are dirty.\n`);
+  }
   if (oversize) out.write(`\n${OVERSIZE_STAMP(sent, opts.maxBytes)}\n`);
   out.write(`${RULE}\n\n`);
 
@@ -736,7 +762,9 @@ function main() {
   // to stdout is flushed before the process ends (a hard exit truncates it on Windows).
   // Untracked files count: a pass over tracked changes alone is not a pass over the
   // working tree, however complete it reads. See untrackedFiles.
-  if (toolCallInsteadOfReview || oversize || untracked.length) process.exitCode = EXIT.INCOMPLETE;
+  if (toolCallInsteadOfReview || oversize || untracked.length || dirty.length) {
+    process.exitCode = EXIT.INCOMPLETE;
+  }
 }
 
 try {

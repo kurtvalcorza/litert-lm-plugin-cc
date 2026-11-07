@@ -118,9 +118,45 @@ const hostile = (marker) => [
 describe('review coverage', () => {
   test('a complete pass over tracked changes exits 0', async () => {
     const { dir } = repo();
+    const before_ = requests.length;
     const r = await review(dir);
     assert.equal(r.status, 0, r.stderr);
     assert.doesNotMatch(r.stdout, /NOT COVERED/);
+    assert.equal(requests.length, before_ + 1);
+    assert.match(requests.at(-1).messages.at(-1).content, /^\+two$/m,
+      'the launcher exists to put the diff in front of the model');
+  });
+
+  test('an untracked file outside the current directory is still in scope', async () => {
+    const { dir, git } = repo();
+    mkdirSync(join(dir, 'sub'));
+    writeFileSync(join(dir, 'sub', 'kept.txt'), 'x\n');
+    git('add', 'sub');
+    writeFileSync(join(dir, 'new.txt'), 'at the root\n');
+    const r = await review(join(dir, 'sub'));
+    assert.equal(r.status, 5, r.stdout);
+    assert.match(r.stdout, /NOT COVERED: 1 untracked file/);
+  });
+
+  test('a non-ASCII name is reported as it is, not octal-quoted', async () => {
+    const { dir } = repo();
+    writeFileSync(join(dir, 'caf\u00e9.txt'), 'x\n');
+    const r = await review(dir);
+    assert.equal(r.status, 5, r.stdout);
+    assert.match(r.stdout, /caf\u00e9\.txt/);
+  });
+
+  test('changes inside a submodule make the pass incomplete', async () => {
+    const { dir: inner } = repo();
+    spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-qam',
+      'second'], { cwd: inner });
+    const { dir, git } = repo();
+    git('-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', inner, 'mod');
+    git('commit', '-qm', 'add submodule');
+    writeFileSync(join(dir, 'mod', 'tracked.txt'), 'changed inside\n');
+    const r = await review(dir);
+    assert.equal(r.status, 5, r.stdout);
+    assert.match(r.stdout, /NOT COVERED: changes inside submodule mod/);
   });
 
   test('an untracked file in scope makes the pass incomplete', async () => {
@@ -230,20 +266,53 @@ describe('arguments as data', () => {
     assert.equal((await client('--prompt-file', file, 'two')).status, 2);
   });
 
-  test('the command templates never put $ARGUMENTS in a shell command', () => {
+  test('the command templates use $ARGUMENTS only inside the data block', () => {
     for (const name of ['ask.md', 'review.md']) {
       const text = readFileSync(join(ROOT, 'plugins', 'litertlm', 'commands', name), 'utf8');
-      const fences = [...text.matchAll(/```(?:bash|sh|shell)[\s\S]*?```/g)].map((m) => m[0]);
-      assert.ok(fences.length > 0, name);
-      for (const fence of fences) {
-        assert.doesNotMatch(fence, /\$ARGUMENTS|\$[0-9]/,
-          `${name} would hand shell source containing user text to the agent`);
-      }
+      const outside = text.replace(/<user-(?:prompt|focus)>\s*\$ARGUMENTS\s*<\/user-(?:prompt|focus)>/g, '');
+      assert.notEqual(outside, text, `${name} no longer has its data block`);
+      assert.doesNotMatch(outside, /\$ARGUMENTS|\$[0-9]/,
+        `${name} would hand text containing user input to the agent outside the data block`);
     }
+  });
+
+  test('--system-file delivers hostile text byte for byte', async () => {
+    const marker = join(scratch, 'pwned-system');
+    const text = hostile(marker);
+    const file = join(scratch, 'system.txt');
+    writeFileSync(file, text);
+    const r = await client('--system-file', file, 'the prompt');
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(requests.at(-1).messages[0].content, text.trim());
+    assert.equal(existsSync(marker), false);
+  });
+
+  test('a prompt file that is not a regular file is refused, not read', async () => {
+    assert.equal((await client('--prompt-file', scratch)).status, 2);
+  });
+
+  test('a prompt file of only whitespace is no prompt', async () => {
+    const file = join(scratch, 'blank.txt');
+    writeFileSync(file, '  \n\t\n');
+    const before_ = requests.length;
+    assert.equal((await client('--prompt-file', file)).status, 2);
+    assert.equal(requests.length, before_);
   });
 });
 
 describe('rejecting bad input early', () => {
+  test('--paths-file narrows with names no shell could survive', async () => {
+    const { dir } = repo();
+    const hostileName = process.platform === 'win32' ? 'a$(b).txt' : '$(touch pwned-name).txt';
+    writeFileSync(join(dir, hostileName), 'x\n');
+    const list = join(scratch, 'paths.txt');
+    writeFileSync(list, `tracked.txt\n${hostileName}\n`);
+    const r = await review(dir, '--paths-file', list, '--dry-run');
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /excluded|NOT COVERED|1 file/);
+    assert.equal(existsSync(join(dir, 'pwned-name')), false);
+  });
+
   test('a ref that looks like an option is refused before git sees it', async () => {
     const { dir } = repo();
     const r = await review(dir, '--base', '--output=pwned');
@@ -284,14 +353,28 @@ describe('stdin held open', () => {
   }
   const content = () => requests.at(-1).messages.at(-1).content;
 
-  test('a pipe nobody writes to cannot hang a request that has its prompt',
+  test('a pipe nobody writes to cannot hang a request, and ends it as incomplete',
     { timeout: 30_000 }, async () => {
       const r = await piped(['the prompt']);
-      assert.equal(r.status, 0, r.stderr);
+      assert.equal(r.status, 5, 'an answer that may be missing its input is not a success');
       assert.equal(content(), 'the prompt');
+      assert.match(r.stdout, /ok/, 'the answer is still delivered');
       assert.match(r.stderr, /nothing arrived on stdin/);
       assert.match(r.stderr, /--wait-stdin/, 'leaving input out must be said, and how to avoid it');
     });
+
+  test('--json carries the same fact on stdout', { timeout: 30_000 }, async () => {
+    const r = await piped(['the prompt', '--json']);
+    assert.equal(r.status, 5, r.stderr);
+    assert.equal(JSON.parse(r.stdout).stdin_dropped, true);
+  });
+
+  test('an empty prompt file cannot hang either', { timeout: 30_000 }, async () => {
+    const file = join(scratch, 'empty-held.txt');
+    writeFileSync(file, '');
+    const r = await piped(['--prompt-file', file]);
+    assert.equal(r.status, 2, r.stderr);
+  });
 
   test('input already piped in is still used, without a notice', { timeout: 30_000 }, async () => {
     const r = await piped(['the prompt'], (stdin) => stdin.end('from the pipe\n'));

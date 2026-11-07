@@ -25,7 +25,8 @@ positional prompt precedes the piped content, separated by a blank line — so
 | `--port <n>` | 9379 | Server port. |
 | `--idle-timeout <s>` | 900 | Idle seconds before the watchdog stops the server. `0` disables idle shutdown. |
 | `--json` | off | Emit the raw response object rather than message text. |
-| `--wait-stdin` | off | With a prompt given, wait for piped input without limit. By default the first byte gets 5 s, after which the prompt is sent without stdin and stderr says so. Once data arrives it is always read to EOF. With no prompt, stdin is always waited for. |
+| `--wait-stdin` | off | With a prompt given, wait for piped input without limit. By default the first byte gets 5 s, after which the prompt is sent without stdin, stderr says so, `--json` output gains `stdin_dropped: true` and the exit code is 5. Once data arrives it is always read to EOF. With no prompt, stdin is always waited for. |
+| `--system-file <path>` | none | Read the system prompt from a file, so text from anyone else never reaches a shell. |
 | `--prompt-file <path>` | none | Read the prompt from a file, so text from elsewhere never passes through a shell. Excludes a positional prompt; piped stdin is still appended. |
 | `--check` | — | Report readiness; start nothing; exit. |
 | `--list` | — | List served model ids; exit. |
