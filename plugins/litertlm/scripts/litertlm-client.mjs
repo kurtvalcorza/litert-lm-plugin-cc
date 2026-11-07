@@ -34,7 +34,7 @@ import {
   commandLaunches, forgetIdentities, formatPidRecord, identifyPortOwners, identities, identity,
   looksLikeLitertLmServe, managedServeTest, parsePidRecord, portOwnerDiscoveryHelp, recordIsStale,
   resolveTargets,
-  signallablePid, startGeneration, startToken,
+  signallablePid, startedSince, startGeneration, startToken,
 } from './process-identity.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -746,20 +746,28 @@ const anyManagedAlive = (port) => managedRecords(port)
   });
 
 /**
+ * litert-lm listeners on the port that started at or after our spawn.
+ *
+ * The start time is the evidence. "The port answered nobody before the spawn" proves
+ * nothing, because a user's server that is loading binds the port and answers nobody
+ * for minutes, and our launcher then fails on the port and leaves theirs as the listener.
+ * The gap left is a user starting their own server after our spawn, within the clock
+ * slack or before our launcher binds: it wins the bind and is recorded as ours.
+ */
+const launchedOwners = (opts, spawnedAt) =>
+  identifyPortOwners(opts.port, looksLikeLitertLmServe, opts.host).ours
+    .filter((owner) => startedSince(owner.token, spawnedAt));
+
+/**
  * Record every process of this start: the launcher, its stages and the listener.
  *
  * The listener is proven from the socket as well as from descent, because descent can
  * miss it: a launcher that hands off and exits before the first table walk leaves the
  * generation empty, and the plugin then disowned the server it had just started.
- * `cancelStartedServer` trusts the same evidence for the same reason. It holds because
- * this runs inside the exclusive start claim, on a port that answered nobody before the
- * spawn. The one gap left is a user starting their own `litert-lm serve` on this port
- * within those few seconds, which beats our launcher to the bind and gets recorded.
  */
-async function recordManaged(opts, generation) {
+async function recordManaged(opts, generation, spawnedAt) {
   await generation.sample(true);
-  const { ours } = identifyPortOwners(opts.port, looksLikeLitertLmServe, opts.host);
-  for (const owner of ours) if (owner.token) generation.adopt(owner);
+  for (const owner of launchedOwners(opts, spawnedAt)) generation.adopt(owner);
   writeState(opts.port, 'managed', generation.members()
     .filter((m) => m.token).map((m) => `${m.pid} ${m.token}`).join('\n'));
   clearState(opts.port, 'unmanaged-noted');
@@ -791,10 +799,14 @@ function adoptExisting(opts) {
       + `was taken over.\n  ${portOwnerDiscoveryHelp()}\n`);
     return;
   }
-  const added = ours.filter((o) => o.token).map((o) => `${o.pid} ${o.token}`);
-  if (!added.length) return;
-  writeState(opts.port, 'managed',
-    [String(readState(opts.port, 'managed', '')), ...added].filter(Boolean).join('\n'));
+  const known = String(readState(opts.port, 'managed', '')).split('\n').filter(Boolean);
+  const added = ours.filter((o) => o.token).map((o) => `${o.pid} ${o.token}`)
+    .filter((record) => !known.includes(record));
+  if (!added.length) {
+    if (ours.length) clearState(opts.port, 'unmanaged-noted');
+    return;
+  }
+  writeState(opts.port, 'managed', [...known, ...added].join('\n'));
   clearState(opts.port, 'unmanaged-noted');
 }
 
@@ -1033,7 +1045,7 @@ async function cancelStartedServer(opts, generation, child, spawnedAt) {
       // a valid identity, and the loop below signals it: a cancelled start killing the
       // valid newer one, which is the exact failure the generation boundary exists to
       // prevent, re-entered through the staleness of its own check.
-      const owners = classifyPortOwners(opts).ours;
+      const owners = launchedOwners(opts, spawnedAt);
       if (ownsStartClaim(port, spawnedAt)) {
         for (const owner of owners) generation.adopt(owner);
       }
@@ -1346,7 +1358,7 @@ async function ensureServer(opts) {
     await cancelIfStopped(opts, generation, child, spawnedAt);
 
     if (up) {
-      await recordManaged(opts, generation);
+      await recordManaged(opts, generation, spawnedAt);
       // Again: that discovery walk takes seconds on Windows, and a stop landing inside it
       // would otherwise see a server this start then goes on to return.
       await cancelIfStopped(opts, generation, child, spawnedAt);
@@ -1394,8 +1406,13 @@ async function ensureServer(opts) {
  * another local address on the same port passes the command-line test and is not
  * ours by any reading; the port number alone could not say so.
  */
-const classifyPortOwners = (opts) =>
-  identifyPortOwners(opts.port, isManaged(opts.port), opts.host);
+const classifyPortOwners = (opts) => {
+  // `managed` is written once the server is up, so during a start the claim is the record.
+  const managed = isManaged(opts.port);
+  const claim = liveStartClaim(opts.port);
+  return identifyPortOwners(opts.port, (pid) => managed(pid) || (claim !== null
+    && looksLikeLitertLmServe(pid) && startedSince(startToken(pid), claim.spawnedAt)), opts.host);
+};
 
 /**
  * Of `targets`, those still running as themselves — and those we could not judge.

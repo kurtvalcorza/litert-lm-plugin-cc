@@ -35,7 +35,7 @@ import {
   _parsers, _queries, addressServes, addressVerdict, commandLaunches, descendantsOf,
   forgetIdentities, formatPidRecord, identity, managedServeTest,
   identifyPortOwners, isLitertLmServeCommand, parsePidRecord, pidsOnPort, processTable,
-  portOwnerDiscoveryHelp, recordIsStale, signallablePid, startGeneration, startToken,
+  portOwnerDiscoveryHelp, recordIsStale, signallablePid, startGeneration, startedSince, startToken,
 } from '../plugins/litertlm/scripts/process-identity.mjs';
 
 const SCRIPTS = join(dirname(fileURLToPath(import.meta.url)), '..', 'plugins', 'litertlm', 'scripts');
@@ -106,6 +106,9 @@ const PORT = {
   unmanagedAdopt: reservePort(19171),
   unmanagedWatchdog: reservePort(19181),
   unmanagedPredicate: reservePort(19191),
+  unmanagedSlow: reservePort(19591),
+  unmanagedCancel: reservePort(19601),
+  unmanagedRepeat: reservePort(19611),
   silentIdle: reservePort(19241),
   silentGone: reservePort(19251),
   silentUnjudged: reservePort(19581),
@@ -3099,6 +3102,145 @@ describe('a server this plugin did not start', () => {
       assert.ok(alive(server.pid), 'an idle server the plugin did not start is left alone');
       assert.equal(readIfPresent(join(dir, 'stopped-idle')), null);
       try { server.kill('SIGKILL'); } catch { /* already gone */ }
+    });
+
+  /** A copy of node named litert-lm, whose `serve` is the script in the directory it runs in. */
+  function fakeExecutable(binDir) {
+    mkdirSync(binDir, { recursive: true });
+    const exe = join(binDir, process.platform === 'win32' ? 'litert-lm.exe' : 'litert-lm');
+    try { linkSync(process.execPath, exe); } catch { copyFileSync(process.execPath, exe); }
+    if (process.platform !== 'win32') chmodSync(exe, 0o755);
+    return exe;
+  }
+
+  const pathWith = (binDir) => {
+    const sep = process.platform === 'win32' ? ';' : ':';
+    return {
+      ...process.env,
+      PATH: `${binDir}${sep}${process.env.PATH ?? ''}`,
+      Path: `${binDir}${sep}${process.env.Path ?? ''}`,
+    };
+  };
+
+  test('one already running but slow to answer is not mistaken for our start',
+    { timeout: 90_000 }, async (t) => {
+      if (!(await gate(t))) return;
+      const port = PORT.unmanagedSlow;
+      const runtime = runtimeDir();
+      const userDir = join(runtime, 'slow-user');
+      const launchDir = join(runtime, 'slow-launch');
+      mkdirSync(userDir);
+      mkdirSync(launchDir);
+      const binDir = join(runtime, 'slow-bin');
+      const exe = fakeExecutable(binDir);
+      writeFileSync(join(userDir, 'serve'), `
+        const { createServer } = require('node:http');
+        const began = Date.now();
+        createServer((req, res) => {
+          setTimeout(() => {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ object: 'list', data: [{ id: 'fake' }] }));
+          }, Math.max(0, 12000 - (Date.now() - began)));
+        }).listen(${port}, '127.0.0.1');
+        setInterval(() => {}, 1000);
+      `, 'utf8');
+      // Our launcher finds the port taken, as a real one would, and gives up.
+      writeFileSync(join(launchDir, 'serve'), 'process.exit(1);', 'utf8');
+      const user = reap(spawn(exe, ['serve', '--host', '127.0.0.1', '--port', String(port)],
+        { cwd: userDir, stdio: 'ignore', windowsHide: true }));
+      await sleep(3000);
+
+      const used = spawnSync(process.execPath,
+        [CLIENT, '--list', '--port', String(port), '--idle-timeout', '0'], {
+          encoding: 'utf8', windowsHide: true, cwd: launchDir,
+          env: { ...pathWith(binDir), LITERT_LM_PLUGIN_RUNTIME: runtime },
+        });
+      assert.equal(used.status, 0, used.stderr);
+      const managed = readIfPresent(join(stateDir(runtime, port), 'managed')) ?? '';
+      assert.ok(!managed.split('\n').some((line) => parsePidRecord(line)?.pid === user.pid),
+        `answering late is not being ours: ${managed}`);
+
+      const stopped = runClient(['--stop', '--port', String(port)], runtime);
+      assert.equal(stopped.status, 0, stopped.stderr);
+      await sleep(1500);
+      assert.ok(alive(user.pid), 'a plain --stop must leave it running');
+      try { user.kill('SIGKILL'); } catch { /* already gone */ }
+    });
+
+  test('a start overtaken by --stop still ends its own listener', { timeout: 90_000 }, async (t) => {
+    if (!(await gate(t))) return;
+    const port = PORT.unmanagedCancel;
+    const runtime = runtimeDir();
+    const launchDir = join(runtime, 'cancel-launch');
+    mkdirSync(join(launchDir, 'stage2'), { recursive: true });
+    const binDir = join(runtime, 'cancel-bin');
+    fakeExecutable(binDir);
+    writeFileSync(join(launchDir, 'stage2', 'serve'), `
+      const { createServer } = require('node:http');
+      const { writeFileSync } = require('node:fs');
+      const { join } = require('node:path');
+      createServer(() => { /* loading: accepts, never answers */ })
+        .listen(${port}, '127.0.0.1', () => {
+          writeFileSync(join(__dirname, 'listener.pid'), String(process.pid), 'utf8');
+        });
+      setInterval(() => {}, 1000);
+    `, 'utf8');
+    // Hands off to a detached stage and exits, so descent can miss the listener.
+    writeFileSync(join(launchDir, 'serve'), `
+      const { spawn } = require('node:child_process');
+      const { join } = require('node:path');
+      spawn(process.execPath, ['serve', '--host', '127.0.0.1', '--port', '${port}'],
+        { cwd: join(__dirname, 'stage2'), detached: true, stdio: 'ignore', windowsHide: true })
+        .unref();
+    `, 'utf8');
+
+    const start = reap(spawn(process.execPath,
+      [CLIENT, '--list', '--port', String(port), '--idle-timeout', '0'], {
+        cwd: launchDir, stdio: 'ignore', windowsHide: true,
+        env: { ...pathWith(binDir), LITERT_LM_PLUGIN_RUNTIME: runtime },
+      }));
+    const pidFile = join(launchDir, 'stage2', 'listener.pid');
+    assert.ok(await waitFor(() => readIfPresent(pidFile) !== null, { timeout: 30_000 }));
+    const listener = Number.parseInt(readIfPresent(pidFile), 10);
+    t.after(() => { try { process.kill(listener, 'SIGKILL'); } catch { /* gone */ } });
+    await sleep(3000);        // long enough for the launcher to have exited
+
+    const stopped = runClient(['--stop', '--port', String(port)], runtime);
+    assert.equal(stopped.status, 0, stopped.stderr);
+    assert.doesNotMatch(stopped.stderr, /did not start/, 'it is ours, mid-start or not');
+    assert.ok(await waitFor(() => !alive(listener), { timeout: 40_000 }),
+      'the server a start launched must not outlive being stopped');
+    assert.ok(await waitFor(() => !alive(start.pid), { timeout: 40_000 }));
+  });
+
+  test('--manage-existing does not grow the record on every request', { timeout: 60_000 },
+    async (t) => {
+      if (!(await gate(t))) return;
+      const { runtime, server } = await manualServer('unmanagedRepeat');
+      const dir = stateDir(runtime, PORT.unmanagedRepeat);
+      for (let i = 0; i < 3; i += 1) {
+        const r = runClient(['--list', '--manage-existing', '--port',
+          String(PORT.unmanagedRepeat), '--idle-timeout', '0'], runtime);
+        assert.equal(r.status, 0, r.stderr);
+      }
+      assert.equal(readIfPresent(join(dir, 'managed')).trim().split('\n').length, 1);
+      try { server.kill('SIGKILL'); } catch { /* already gone */ }
+    });
+
+  test('a start time is read correctly enough to rule out an older process',
+    { timeout: 30_000 }, async (t) => {
+      const child = await startBystander();
+      forgetIdentities([child.pid]);
+      const token = startToken(child.pid);
+      if (token === null) {
+        t.skip('cannot establish process identity on this host');
+        return;
+      }
+      assert.equal(startedSince(token, Date.now() - 60_000), true, 'it started in the last minute');
+      assert.equal(startedSince(token, Date.now() + 60_000), false, 'it did not start in the future');
+      assert.equal(startedSince(null, 0), false, 'an unreadable token grants nothing');
+      assert.equal(startedSince('not a token', 0), false);
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
     });
 
   test('authority needs the whole identity, and a litert-lm command line', { timeout: 60_000 },

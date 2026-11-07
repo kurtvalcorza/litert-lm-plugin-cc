@@ -419,7 +419,7 @@ function listenersOnPort(port) {
       // success status. A listener is what remains identifiable there, having no peer.
       'try { '
       + `Get-NetTCPConnection -LocalPort ${port} -ErrorAction Stop `
-      + "| Where-Object { $_.State -eq 'Listen' -or ($null -eq $_.State -and $_.RemotePort -eq 0) } "
+      + "| Where-Object { $_.RemotePort -eq 0 -and ($_.State -eq 'Listen' -or $null -eq $_.State) } "
       + '| ForEach-Object { ($_.LocalAddress, $_.OwningProcess) -join [char]9 } '
       + "} catch { if ($_.FullyQualifiedErrorId -notlike 'CmdletizationQuery_NotFound*')"
       + ' { exit 3 } }; exit 0']);
@@ -1173,6 +1173,41 @@ export const looksLikeLitertLmServe = (pid) =>
  * Anything that fails lands in `strangers`: never signalled, and reported. One rule
  * with one home, because the client and the watchdog both have to answer this.
  */
+/** Clock error between a process's start time and `Date.now()`, worst on Linux (see below). */
+const START_CLOCK_SLACK_MS = 1500;
+
+/**
+ * Wall-clock start time of the process a token describes, or null if it cannot be read.
+ *
+ * Windows tokens are FILETIME ticks. Linux tokens are clock ticks since boot, at the 100 Hz
+ * USER_HZ the kernel reports everywhere, on a boot time known only to about a second. macOS
+ * tokens start with `lstart`, which has whole seconds.
+ */
+function tokenStartMs(token) {
+  if (!token) return null;
+  const text = String(token);
+  if (process.platform === 'win32' || process.platform === 'linux') {
+    if (!/^\d+$/.test(text)) return null;
+    return process.platform === 'win32'
+      ? Number(BigInt(text) / 10000n) - 11644473600000
+      : BOOT_TIME_MS + Number(text) * 10;
+  }
+  const at = Date.parse(text.split('#')[0]);
+  return Number.isNaN(at) ? null : at;
+}
+
+/**
+ * Did this process start at or after `sinceMs`?
+ *
+ * What makes a listener ours when descent cannot show it: a server that was already
+ * running cannot have started after our spawn, however slowly it answers. A token that
+ * cannot be read is a no, because this grants authority to stop a process.
+ */
+export function startedSince(token, sinceMs) {
+  const at = tokenStartMs(token);
+  return at !== null && at >= sinceMs - START_CLOCK_SLACK_MS;
+}
+
 export function managedServeTest(recordTexts) {
   const known = new Set();
   for (const text of recordTexts) {
