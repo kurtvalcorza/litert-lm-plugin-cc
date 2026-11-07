@@ -159,12 +159,16 @@ class Effective(Base):
         self.assertRegex(row, r"listed\s+cpu\s+embedded=gpu\s+override=cpu \(model\)")
         self.assertIn("serves on CPU", row)
 
-    def test_no_override_is_never_refused_by_a_later_section(self):
-        for name, sections in (("nokey", [(None, None), ("npu", None)]),
-                               ("artisan", [(None, lb.ARTISAN_TEXT_DECODER), ("cpu", None)])):
-            self.model(name, sections=sections)
+    def test_a_section_without_a_key_means_no_limit(self):
+        self.model("nokey", sections=[(None, None), ("npu", None)])
         self.write_config({})
-        self.assertNotIn("REFUSED", self.resolve())
+        self.assertRegex(self.row("nokey"), r"nokey\s+cpu\s+embedded=cpu\s+override=none")
+
+    def test_an_artisan_section_means_no_limit(self):
+        # Its key is declared, and still not one this tool can read as a limit.
+        self.model("art", sections=[("npu", lb.ARTISAN_TEXT_DECODER), ("cpu", None)])
+        self.write_config({})
+        self.assertRegex(self.row("art"), r"art\s+gpu\s+embedded=gpu\s+override=none")
 
     def test_a_backend_any_main_section_declares_is_allowed(self):
         self.model("two", sections=[("cpu", None), ("gpu", None)])
