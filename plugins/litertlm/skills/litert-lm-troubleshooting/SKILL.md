@@ -276,6 +276,12 @@ fresh read proves the new header is the intended one, so a leftover `.hdrbak` is
 evidence the run died or failed verification. `patch` and `check` refuse until it is resolved,
 because a second attempt must never replace the only way back.
 
+If instead they say another patch, restore or discard-backup **is running**, one is: `patch`,
+`restore` and `discard-backup` hold an OS lock on `<model>.litertlm.lock` while they run, and
+the `.hdrbak` belongs to that run. Wait for it to finish rather than restoring or discarding.
+A `.lock` file on its own is harmless — the OS drops the lock when its process exits, even in
+a crash — so deleting it never "unsticks" anything.
+
 ```bash
 python "${CLAUDE_PLUGIN_ROOT}/tools/litertlm_backend.py" restore <model.litertlm>
 ```
