@@ -817,47 +817,75 @@ _LOCK_BUSY = {errno.EAGAIN, errno.EACCES,
               getattr(errno, "EDEADLOCK", errno.EAGAIN)}
 
 
+_REPARSE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+
+def _is_link_or_reparse(st):
+    """A symlink, or on Windows any reparse point (a junction or a mount point included)."""
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & _REPARSE)
+
+
+def _check_lock_handle(fd, path):
+    """Refuse unless `fd` is the one plain, singly-named file that `path` itself names."""
+    held, named = os.fstat(fd), os.lstat(path)
+    if _is_link_or_reparse(named) or not stat.S_ISREG(held.st_mode) or \
+            (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
+        raise SystemExit(
+            f"ABORT: the lock path changed while it was being opened:\n  {path}\n"
+            "  Something there is not the plain file it should be (a link, or a swap).\n"
+            "  Nothing was written to the model. Inspect it before running the command again.")
+    if held.st_nlink != 1:
+        raise SystemExit(
+            f"ABORT: the lock file has {held.st_nlink} names (a hard link):\n  {path}\n"
+            "  This tool never creates that, and locking it could lock another file.\n"
+            "  Nothing was written. Inspect it and remove that name yourself.")
+
+
 def _open_lock_file(path, create):
     """A descriptor on the regular file at exactly `path`, never on what a link names.
 
-    Created with O_EXCL where it is missing, which refuses a link of any kind outright.
-    An existing file is opened only if it is a regular file, and then only if the opened
-    descriptor is the same file the name holds: on Windows, where there is no O_NOFOLLOW,
-    that comparison is what catches a link swapped in between the check and the open.
+    On POSIX, O_NOFOLLOW makes both the create and the open refuse a link outright.
+    Windows has neither O_NOFOLLOW nor a public no-follow open, and O_CREAT|O_EXCL there
+    FOLLOWS a dangling link and creates its target. So on every platform anything
+    already at the name is examined with lstat first and refused unless it is a plain
+    file, and every descriptor, created or opened, is then checked against the name: a
+    link planted between the check and the open shows up as a mismatch, and the handle
+    is closed and refused. (A file that such a race made at the link's target is left
+    alone: this tool cannot be sure of that path, and never deletes through a link.)
     It must also have exactly one name: a hard link to another file would put the lock,
     which is mandatory on Windows, on that file's bytes.
-    Nothing is ever written to it, so a refused open has changed nothing.
+    Nothing is ever written to it, so a refused open has changed nothing at the model.
     Returns None when `create` is false and nothing is there.
     """
     flags = os.O_RDONLY | _NOFOLLOW | _BINARY
-    if create:
+    if not os.path.lexists(path):
+        if not create:
+            return None
         try:
             fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o644)
         except FileExistsError:
-            pass
+            pass                      # appeared meanwhile: examine it like any other
         else:
+            try:
+                _check_lock_handle(fd, path)
+            except BaseException:
+                os.close(fd)
+                raise
             _fsync_dir(path)
             return fd
-    elif not os.path.lexists(path):
-        return None
-    if not _is_regular(path):
+    try:
+        named = os.lstat(path)
+    except FileNotFoundError:
+        raise SystemExit(f"ABORT: the lock file vanished while it was being opened:\n  {path}\n"
+                         "  Nothing was written. Run the command again.") from None
+    if _is_link_or_reparse(named) or not stat.S_ISREG(named.st_mode):
         raise SystemExit(
             f"ABORT: something other than a regular file is at the lock path:\n  {path}\n"
             "  This tool never creates that. Nothing was written. Inspect it and remove it\n"
             "  yourself; if it is a link, removing the link does not touch what it points at.")
     fd = os.open(path, flags)        # O_NOFOLLOW: a link here is ELOOP on POSIX
     try:
-        held, named = os.fstat(fd), os.lstat(path)
-        if not stat.S_ISREG(held.st_mode) or \
-                (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
-            raise SystemExit(
-                f"ABORT: the lock path changed while it was being opened:\n  {path}\n"
-                "  Nothing was written. Inspect it before running the command again.")
-        if held.st_nlink != 1:
-            raise SystemExit(
-                f"ABORT: the lock file has {held.st_nlink} names (a hard link):\n  {path}\n"
-                "  This tool never creates that, and locking it could lock another file.\n"
-                "  Nothing was written. Inspect it and remove that name yourself.")
+        _check_lock_handle(fd, path)
     except BaseException:
         os.close(fd)
         raise

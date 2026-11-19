@@ -797,6 +797,47 @@ class WriteLock(Case):
         self.assertFalse(os.path.lexists(target))
         self.assertEqual(_first_block(self.model), self.block)
 
+    @unittest.skipUnless(os.name == "nt", "junctions are a Windows object")
+    def test_a_dangling_junction_at_the_lock_path_is_refused(self):
+        """The no-privilege variant of the dangling-link test, so Windows runs it locally."""
+        import _winapi
+        target = os.path.join(self.dir, "gone")
+        os.mkdir(target)
+        _winapi.CreateJunction(target, lb._lock_path(self.model))
+        os.rmdir(target)                  # dangling now: the junction names nothing
+        with self.assertRaises(SystemExit) as caught:
+            _patch(self.model)
+        self.assertIn("lock path", str(caught.exception))
+        self.assertFalse(os.path.lexists(target))
+        self.assertEqual(_first_block(self.model), self.block)
+        self.assertFalse(os.path.lexists(self.backup))
+
+    def test_a_create_that_lands_elsewhere_is_refused(self):
+        """What a dangling link planted after the check does on Windows, where O_EXCL follows it.
+
+        The create succeeds, but on the link's target, while the name still holds
+        something else. The descriptor must be checked against the name and refused, or
+        the lock would be taken on a file nobody else will ever open by that name.
+        """
+        lock = lb._lock_path(self.model)
+        elsewhere = os.path.join(self.dir, "link-target.lock")
+        real_open = os.open
+
+        def through_a_link(path, flags, *rest):
+            if os.path.normcase(os.fspath(path)) == os.path.normcase(lock) and flags & os.O_CREAT:
+                fd = real_open(elsewhere, flags, *rest)
+                with open(lock, "wb"):    # stands in for the link the name now holds
+                    pass
+                return fd
+            return real_open(path, flags, *rest)
+
+        with mock.patch.object(lb.os, "open", through_a_link):
+            with self.assertRaises(SystemExit) as caught:
+                _patch(self.model)
+        self.assertIn("changed while it was being opened", str(caught.exception))
+        self.assertEqual(_first_block(self.model), self.block)
+        self.assertFalse(os.path.lexists(self.backup))
+
 
 class MalformedContainers(Case):
     def _set_end(self, value):
