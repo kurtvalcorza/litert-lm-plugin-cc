@@ -760,18 +760,19 @@ def _fsync_dir(path):
 def _create_exclusive(path, data):
     """Create `path` holding `data`, or fail if ANYTHING already has that name.
 
-    O_CREAT|O_EXCL is the whole defence, on both platforms: it refuses an existing file,
-    a directory, and a symbolic link, dangling or not, without following it. Checking
-    first and opening after would leave a gap to plant a link in; this has no gap.
+    `_create_new` does the creating, so a link at the name, dangling or not, is refused
+    on Windows as well as POSIX and nothing is written at a link's target. Raises
+    FileExistsError when the name is taken before the create.
     """
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _BINARY, 0o600)
+    fd = _create_new(path, os.O_WRONLY, 0o600, "backup")
     try:
         with os.fdopen(fd, "wb") as out:
             out.write(data)
             out.flush()
             os.fsync(out.fileno())
     except BaseException:
-        # Ours, and incomplete: a torn copy must not pass for a recovery point.
+        # Ours (the handle was checked against the name), and incomplete: a torn copy
+        # must not pass for a recovery point.
         try:
             os.remove(path)
         except OSError:
@@ -825,54 +826,77 @@ def _is_link_or_reparse(st):
     return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & _REPARSE)
 
 
-def _check_lock_handle(fd, path):
-    """Refuse unless `fd` is the one plain, singly-named file that `path` itself names."""
-    held, named = os.fstat(fd), os.lstat(path)
-    if _is_link_or_reparse(named) or not stat.S_ISREG(held.st_mode) or \
+def _check_named_handle(fd, path, what):
+    """Refuse unless `fd` is the one plain, singly-named file that `path` itself names.
+
+    `what` names the file in the message: "lock" or "backup".
+    """
+    held = os.fstat(fd)
+    try:
+        named = os.lstat(path)
+    except FileNotFoundError:
+        named = None
+    if named is None or _is_link_or_reparse(named) or not stat.S_ISREG(held.st_mode) or \
             (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
         raise SystemExit(
-            f"ABORT: the lock path changed while it was being opened:\n  {path}\n"
+            f"ABORT: the {what} path changed while it was being opened:\n  {path}\n"
             "  Something there is not the plain file it should be (a link, or a swap).\n"
             "  Nothing was written to the model. Inspect it before running the command again.")
     if held.st_nlink != 1:
         raise SystemExit(
-            f"ABORT: the lock file has {held.st_nlink} names (a hard link):\n  {path}\n"
-            "  This tool never creates that, and locking it could lock another file.\n"
+            f"ABORT: the {what} file has {held.st_nlink} names (a hard link):\n  {path}\n"
+            "  This tool never creates that, and using it could reach another file's bytes.\n"
             "  Nothing was written. Inspect it and remove that name yourself.")
+
+
+def _create_new(path, flags, mode, what):
+    """Create the regular file at exactly `path`; return a descriptor checked against it.
+
+    The guard shared by the files this tool creates beside a model under a fixed name
+    (`<model>.lock`, `<model>.hdrbak`). On POSIX, O_CREAT|O_EXCL|O_NOFOLLOW refuses any
+    link outright. Windows has neither O_NOFOLLOW nor a public no-follow open, and
+    O_CREAT|O_EXCL there FOLLOWS a dangling link and creates its target. So the name is
+    examined with lstat first, and anything there, a link or reparse point included,
+    raises FileExistsError for the caller to examine. After the create the descriptor is
+    checked against the name (`_check_named_handle`): a link planted between the check
+    and the create shows up as a mismatch, and the handle is closed and refused before
+    anything is written. A file that such a race made at the link's target is left
+    alone, empty: this tool cannot be sure of that path, and never deletes through a link.
+    """
+    if os.path.lexists(path):
+        raise FileExistsError(errno.EEXIST, "a file already has this name", path)
+    fd = os.open(path, flags | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _BINARY, mode)
+    try:
+        _check_named_handle(fd, path, what)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def _open_lock_file(path, create):
     """A descriptor on the regular file at exactly `path`, never on what a link names.
 
-    On POSIX, O_NOFOLLOW makes both the create and the open refuse a link outright.
-    Windows has neither O_NOFOLLOW nor a public no-follow open, and O_CREAT|O_EXCL there
-    FOLLOWS a dangling link and creates its target. So on every platform anything
-    already at the name is examined with lstat first and refused unless it is a plain
-    file, and every descriptor, created or opened, is then checked against the name: a
-    link planted between the check and the open shows up as a mismatch, and the handle
-    is closed and refused. (A file that such a race made at the link's target is left
-    alone: this tool cannot be sure of that path, and never deletes through a link.)
-    It must also have exactly one name: a hard link to another file would put the lock,
-    which is mandatory on Windows, on that file's bytes.
+    A new one is made by `_create_new`, which refuses a link on every platform. One
+    already there is examined with lstat and refused unless it is a plain file, and the
+    descriptor opened on it is checked against the name the same way (on POSIX,
+    O_NOFOLLOW also makes the open refuse a link outright). It must also have exactly
+    one name: a hard link to another file would put the lock, which is mandatory on
+    Windows, on that file's bytes.
     Nothing is ever written to it, so a refused open has changed nothing at the model.
     Returns None when `create` is false and nothing is there.
     """
     flags = os.O_RDONLY | _NOFOLLOW | _BINARY
-    if not os.path.lexists(path):
-        if not create:
-            return None
+    if create:
         try:
-            fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o644)
+            fd = _create_new(path, os.O_RDONLY, 0o644, "lock")
         except FileExistsError:
-            pass                      # appeared meanwhile: examine it like any other
+            pass                      # there already, or appeared meanwhile: examine it
         else:
-            try:
-                _check_lock_handle(fd, path)
-            except BaseException:
-                os.close(fd)
-                raise
             _fsync_dir(path)
             return fd
+    elif not os.path.lexists(path):
+        return None
     try:
         named = os.lstat(path)
     except FileNotFoundError:
@@ -885,7 +909,7 @@ def _open_lock_file(path, create):
             "  yourself; if it is a link, removing the link does not touch what it points at.")
     fd = os.open(path, flags)        # O_NOFOLLOW: a link here is ELOOP on POSIX
     try:
-        _check_lock_handle(fd, path)
+        _check_named_handle(fd, path, "lock")
     except BaseException:
         os.close(fd)
         raise
@@ -1066,6 +1090,12 @@ def _save_original(model, block):
     Written beside the file under a temporary name and moved into place, so a crash
     cannot leave a torn original that a later patch would then decline to replace.
     Called with write authority held, which is what makes the existence test safe.
+
+    It needs no `_create_new` guard. mkstemp picks an unpredictable name and creates it
+    with O_EXCL, so there is no fixed name to plant a link at. os.replace is a rename on
+    Windows as on POSIX: a link planted at the final name after the check is itself
+    replaced, never written through, and a junction or directory there makes the
+    rename fail, which removes the temporary file and leaves the model unwritten.
     """
     path = _original_path(model)
     if os.path.lexists(path):
