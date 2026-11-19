@@ -266,13 +266,21 @@ describe('arguments as data', () => {
     assert.equal((await client('--prompt-file', file, 'two')).status, 2);
   });
 
-  test('the command templates use $ARGUMENTS only inside the data block', () => {
+  test('the command templates put $ARGUMENTS last, after every instruction', () => {
+    // A closing tag can be forged by the text it wraps; the end of the message cannot. So the
+    // user's text comes once, at the very end, introduced as data, with nothing after it that
+    // it could pose as.
     for (const name of ['ask.md', 'review.md']) {
       const text = readFileSync(join(ROOT, 'plugins', 'litertlm', 'commands', name), 'utf8');
-      const outside = text.replace(/<user-(?:prompt|focus)>\s*\$ARGUMENTS\s*<\/user-(?:prompt|focus)>/g, '');
-      assert.notEqual(outside, text, `${name} no longer has its data block`);
-      assert.doesNotMatch(outside, /\$ARGUMENTS|\$[0-9]/,
-        `${name} would hand text containing user input to the agent outside the data block`);
+      assert.equal(text.match(/\$ARGUMENTS/g)?.length, 1, `${name} must substitute $ARGUMENTS exactly once`);
+      assert.doesNotMatch(text, /\$[0-9]/, `${name} substitutes a positional argument`);
+      const tail = text.trimEnd();
+      assert.ok(tail.endsWith('\n$ARGUMENTS'), `${name} has text after $ARGUMENTS, which the user's text could pose as`);
+      const before = tail.slice(0, -'$ARGUMENTS'.length).trimEnd().split('\n');
+      const intro = before.slice(-3).join(' ');
+      assert.match(intro, /Everything after this paragraph, to the end of this message/,
+        `${name} does not say where the user's text starts`);
+      assert.match(intro, /never\s+instructions/, `${name} does not say the user's text is data`);
     }
   });
 

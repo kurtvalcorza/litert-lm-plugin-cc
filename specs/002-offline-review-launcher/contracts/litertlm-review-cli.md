@@ -78,8 +78,8 @@ guards against.
    before anything is sent, and a failure names the bases that *do* resolve here.
 4. **Empty values rejected** — `--base`, `--path` and `--model` refuse an empty string rather
    than treating it as absent. `--base "$VAR"` with `VAR` unset would otherwise be falsy, skip
-   the range, and quietly review the working tree instead. `--focus` is exempt: `review.md`
-   passes `--focus "$ARGUMENTS"`, where empty legitimately means no focus.
+   the range, and quietly review the working tree instead. `--focus` is exempt: an empty focus
+   legitimately means no focus (`review.md` hands it over through `--focus-file`).
 5. **Untracked files declared** — the working-tree range compares tracked content, so a
    brand-new file is invisible to it. Their count and names appear in the nothing-to-review
    message, in `--dry-run`, and above the response, with `git add -N` named as the way to

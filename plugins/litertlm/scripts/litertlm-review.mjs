@@ -280,8 +280,8 @@ function parseArgs(argv) {
    * is falsy — so `if (opts.base)` would skip the range entirely and quietly review the
    * working tree instead. The caller asked for a branch and would have got something
    * else with no error, which is the silently-wrong-range failure this script exists to
-   * prevent. --focus is deliberately NOT in this set: review.md passes `--focus
-   * "$ARGUMENTS"`, and an empty focus legitimately means "no focus".
+   * prevent. --focus is deliberately NOT in this set: an empty focus legitimately means
+   * "no focus" (review.md itself hands the focus over through --focus-file).
    */
   const needNonEmpty = (flag, value) => {
     const v = needValue(flag, value);
