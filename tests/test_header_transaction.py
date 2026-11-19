@@ -264,6 +264,93 @@ class ExistingBackup(Case):
             self.assertEqual(f.read(), b"do not touch")
         self.assertEqual(_first_block(self.model), self.block)
 
+    def _plant_after_the_check(self, plant):
+        """Run `plant` once the pre-checks have passed, in the gap before the backup create."""
+        real = lb._validate
+
+        def hook(*args):
+            out = real(*args)
+            plant()
+            return out
+        return mock.patch.object(lb, "_validate", hook)
+
+    def test_dangling_symlink_planted_after_the_check_creates_nothing(self):
+        """Windows O_CREAT|O_EXCL follows a dangling link; the create must not reach it."""
+        target = os.path.join(self.dir, "would-be-created")
+        with self._plant_after_the_check(lambda: self._symlink(target, self.backup)):
+            with self.assertRaises(SystemExit):
+                _patch(self.model)
+        self.assertFalse(os.path.lexists(target))
+        self.assertTrue(os.path.islink(self.backup), "the link is left for the user")
+        self.assertEqual(_first_block(self.model), self.block)
+
+    @unittest.skipUnless(os.name == "nt", "junctions are a Windows object")
+    def test_dangling_junction_planted_after_the_check_creates_nothing(self):
+        """The no-privilege variant of the dangling-link test, so Windows runs it locally."""
+        import _winapi
+        target = os.path.join(self.dir, "gone")
+
+        def plant():
+            os.mkdir(target)
+            _winapi.CreateJunction(target, self.backup)
+            os.rmdir(target)              # dangling now: the junction names nothing
+
+        with self._plant_after_the_check(plant):
+            with self.assertRaises(SystemExit):
+                _patch(self.model)
+        self.assertFalse(os.path.lexists(target))
+        self.assertTrue(os.path.lexists(self.backup), "the junction is left for the user")
+        self.assertEqual(_first_block(self.model), self.block)
+
+    def test_a_backup_create_that_lands_elsewhere_is_refused(self):
+        """What a dangling link planted at the last instant does on Windows.
+
+        The create succeeds, but on the link's target, while the name holds something
+        else. The descriptor must be checked against the name and refused before the
+        block is written, or the recovery copy would sit where restore never looks.
+        """
+        elsewhere = os.path.join(self.dir, "link-target.hdrbak")
+        real_open = os.open
+
+        def through_a_link(path, flags, *rest):
+            if os.path.normcase(os.fspath(path)) == os.path.normcase(self.backup) \
+                    and flags & os.O_CREAT:
+                fd = real_open(elsewhere, flags, *rest)
+                with open(self.backup, "wb"):     # stands in for the link the name holds
+                    pass
+                return fd
+            return real_open(path, flags, *rest)
+
+        with mock.patch.object(lb.os, "open", through_a_link):
+            with self.assertRaises(SystemExit) as caught:
+                _patch(self.model)
+        self.assertIn("backup path changed while it was being opened", str(caught.exception))
+        self.assertEqual(os.path.getsize(elsewhere), 0, "nothing written at the link target")
+        self.assertTrue(os.path.lexists(self.backup), "what holds the name is left alone")
+        self.assertEqual(_first_block(self.model), self.block)
+        self.assertFalse(os.path.lexists(self.original))
+
+    def test_a_link_planted_at_the_original_is_replaced_not_written_through(self):
+        """`.hdrorig` is moved into place by rename, which replaces a link, not its target."""
+        victim = os.path.join(self.dir, "victim.txt")
+        with open(victim, "wb") as f:
+            f.write(b"do not touch")
+        real = lb.tempfile.mkstemp
+        prefix = os.path.basename(self.original) + "."
+
+        def plant(*args, **kwargs):
+            if kwargs.get("prefix") == prefix and not os.path.lexists(self.original):
+                self._symlink(victim, self.original)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(lb.tempfile, "mkstemp", plant):
+            _patch(self.model)
+        with open(victim, "rb") as f:
+            self.assertEqual(f.read(), b"do not touch")
+        self.assertFalse(os.path.islink(self.original))
+        with open(self.original, "rb") as f:
+            self.assertEqual(f.read(), self.block)
+
     def test_symlinked_backup_is_not_read_by_restore(self):
         decoy = os.path.join(self.dir, "decoy.bin")
         with open(decoy, "wb") as f:
