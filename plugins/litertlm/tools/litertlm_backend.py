@@ -296,19 +296,26 @@ def _main_constraint(buf):
     return out
 
 
-def _unreadable(path, exc):
+def _unreadable(path, exc, held=False):
     """Turn a header parse failure into an answer instead of a traceback.
 
     This is what an interrupted patch looks like from the outside: the declared
     header length and the header bytes disagree, so the flatbuffer reads truncated
     and any command touching it explodes. That is precisely the moment to point at
-    the backup, not to print a stack.
+    the backup, not to print a stack — unless a write is running right now, in which
+    case the header is mid-rewrite and the backup is that write's, not a leftover.
+    `held` says the caller holds the write lock itself, so there is nothing to ask.
     """
     backup = _backup_path(path)
-    hint = (f"  A backup from an interrupted patch is present. Restore it:\n"
-            f"    litertlm_backend.py restore {path}\n"
-            if os.path.isfile(backup)
-            else "  No backup is present, so re-import the model to replace it.\n")
+    if not os.path.isfile(backup):
+        hint = "  No backup is present, so re-import the model to replace it.\n"
+    elif not held and _write_running(path):
+        hint = (f"  A patch, restore or discard-backup is running on it now and holds\n"
+                f"  {_lock_path(path)}; the header may be mid-rewrite. Run this again once\n"
+                "  it has finished, rather than restoring.\n")
+    else:
+        hint = (f"  A backup from an interrupted patch is present. Restore it:\n"
+                f"    litertlm_backend.py restore {path}\n")
     # Qualify the type: the usual one is `struct.error`, whose bare __name__ is the
     # unhelpfully generic "error".
     kind = f"{type(exc).__module__}.{type(exc).__name__}".removeprefix("builtins.")
@@ -774,7 +781,9 @@ def _create_exclusive(path, data):
 
 
 def _lock_path(model):
-    return model + ".lock"
+    # Keyed on the resolved path, so every spelling of one file — an 8.3 short name, a
+    # different case on Windows, a `dir/../dir` detour — contends for the same lock.
+    return os.path.realpath(model) + ".lock"
 
 
 # A held OS lock on `<model>.lock` is what keeps two writers apart: `patch`, `restore` and
@@ -783,6 +792,14 @@ def _lock_path(model):
 # itself is left on disk and means nothing on its own: only a held lock does. That is also
 # why it is never removed — unlinking a lock file lets a third process lock a new inode
 # while a second still holds the old one.
+#
+# Two accepted edges. `check` (read-only) asks whether a write is running by taking the
+# lock for an instant and dropping it, so a writer that starts in that instant refuses as
+# "running"; run it again. And Windows can take a moment to release a dead process's lock,
+# so a writer refused just after a crash should simply retry.
+#
+# It is opened read-only and created 0o644: a lock needs no write access on either OS,
+# and another user sharing the model directory can still take it.
 try:
     import fcntl  # POSIX
 except ImportError:  # pragma: no cover - Windows
@@ -807,13 +824,15 @@ def _open_lock_file(path, create):
     An existing file is opened only if it is a regular file, and then only if the opened
     descriptor is the same file the name holds: on Windows, where there is no O_NOFOLLOW,
     that comparison is what catches a link swapped in between the check and the open.
+    It must also have exactly one name: a hard link to another file would put the lock,
+    which is mandatory on Windows, on that file's bytes.
     Nothing is ever written to it, so a refused open has changed nothing.
     Returns None when `create` is false and nothing is there.
     """
-    flags = os.O_RDWR | _NOFOLLOW | _BINARY
+    flags = os.O_RDONLY | _NOFOLLOW | _BINARY
     if create:
         try:
-            fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+            fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o644)
         except FileExistsError:
             pass
         else:
@@ -834,6 +853,11 @@ def _open_lock_file(path, create):
             raise SystemExit(
                 f"ABORT: the lock path changed while it was being opened:\n  {path}\n"
                 "  Nothing was written. Inspect it before running the command again.")
+        if held.st_nlink != 1:
+            raise SystemExit(
+                f"ABORT: the lock file has {held.st_nlink} names (a hard link):\n  {path}\n"
+                "  This tool never creates that, and locking it could lock another file.\n"
+                "  Nothing was written. Inspect it and remove that name yourself.")
     except BaseException:
         os.close(fd)
         raise
@@ -950,6 +974,10 @@ def _refuse_pending_backup(model, held=False):
             "  was written, and that file was left exactly as it is: it may be the only way back.\n"
             f"    Go back:          litertlm_backend.py restore {model}\n"
             f"    Keep the current: litertlm_backend.py discard-backup {model}")
+    if not os.path.lexists(path):
+        # Without the lock, the write that owned it can finish while this looks: the
+        # copy is gone because nothing is pending any more, not because it was odd.
+        return
     raise SystemExit(
         f"ABORT: something other than a regular file is at the backup path:\n  {path}\n"
         "  This tool never creates that. Nothing was written. Inspect it and remove it\n"
@@ -1201,7 +1229,7 @@ def _discard_backup_locked(args, path):
     except SystemExit:
         raise
     except Exception as e:  # noqa: BLE001
-        _unreadable(args.model, e)
+        _unreadable(args.model, e, held=True)
 
     if not _consent(
         f"\nThe model header parses. About to delete the recovery copy:\n  {path}\n"
@@ -1289,6 +1317,8 @@ def cmd_patch(args):
 
 def _patch_locked(args):
     _refuse_pending_backup(args.model, held=True)
+    # No backup can exist here (refused just above, under the lock), so an unreadable
+    # header never reaches _unreadable's lock probe, which would see our own lock.
     header_end, orig, new, changed, fits = _validate(args.model, args.backend)
     if not changed:
         raise SystemExit("ABORT: no main section found to patch.")

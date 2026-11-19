@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -552,7 +553,17 @@ class WriteLock(Case):
         proc = self.hold_in_another_process()
         proc.kill()
         proc.wait(20)
-        _patch(self.model)
+        # Windows can take a moment to drop a dead process's lock; that is a delay, not a
+        # stale lock, so allow a bounded wait for it before calling it a failure.
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                _patch(self.model)
+                break
+            except SystemExit as e:
+                if "is running on" not in str(e) or time.monotonic() > deadline:
+                    raise
+                time.sleep(0.2)
         self.assertEqual(lb._main_constraint(lb.read_header(self.model)[1]), ["gpu"])
 
     def test_the_lock_is_released_when_its_holder_finishes(self):
@@ -600,6 +611,137 @@ class WriteLock(Case):
         self.assertIn("restore", message)
         self.assertIn("discard-backup", message)
         self.assertNotIn("running now", message)
+
+    def test_an_unreadable_header_is_not_offered_for_restore_mid_write(self):
+        """L25-R1: show and check, which take no lock, must not say "Restore it"."""
+        self.leave_a_pending_backup()
+        self.hold_in_another_process()
+        runs = {
+            "show": lambda: lb.cmd_show(SimpleNamespace(model=self.model)),
+            "check": lambda: lb.cmd_check(SimpleNamespace(model=self.model, backend="gpu")),
+        }
+        for name, run in runs.items():
+            with self.subTest(name), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    run()
+                message = str(caught.exception)
+                self.assertIn("running on", message)
+                self.assertNotIn("Restore it", message)
+                self.assertNotIn("litertlm_backend.py restore", message)
+
+    def test_an_unreadable_header_without_a_running_write_still_names_restore(self):
+        self.leave_a_pending_backup()
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                lb.cmd_show(SimpleNamespace(model=self.model))
+        self.assertIn("Restore it", str(caught.exception))
+
+    def test_discard_backup_does_not_mistake_its_own_lock_for_a_running_write(self):
+        """It holds the lock when it reads the header, so it must not probe it."""
+        self.leave_a_pending_backup()
+        with self.assertRaises(SystemExit) as caught:
+            _discard(self.model)
+        message = str(caught.exception)
+        self.assertIn("Restore it", message)
+        self.assertNotIn("running", message)
+        self.assertTrue(lb._is_regular(self.backup))
+
+    def test_a_backup_that_appears_before_the_lock_is_refused_under_it(self):
+        """M5: the check inside the lock, not the advisory one before it, is the gate.
+
+        The copy lands after the unlocked check and before the lock is taken. Refused
+        under the lock, the run stops before validating or asking for consent; without
+        that check it would go on to the consent gate and stop there for another reason.
+        """
+        real = lb._write_lock
+
+        @contextlib.contextmanager
+        def late_backup(model):
+            with open(self.backup, "wb") as f:
+                f.write(self.block)
+            with real(model):
+                yield
+
+        with mock.patch.object(lb, "_write_lock", late_backup), \
+                mock.patch.object(sys.stdin, "isatty", return_value=False), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                lb.cmd_patch(SimpleNamespace(model=self.model, backend="gpu", yes=False,
+                                             legacy_header_edit=True))
+        self.assertIn("already present", str(caught.exception))
+        self.assertEqual(_first_block(self.model), self.block)
+
+    def test_a_lock_file_swapped_during_the_open_is_refused(self):
+        """M7: the opened descriptor must be the file the name holds.
+
+        Simulates what O_NOFOLLOW cannot stop on Windows: the open lands on another file
+        (a link followed, or a swap between check and open). Platform-independent.
+        """
+        lock = lb._lock_path(self.model)
+        with open(lock, "wb"):
+            pass
+        victim = os.path.join(self.dir, "victim.bin")
+        with open(victim, "wb") as f:
+            f.write(b"keep")
+        real_open = os.open
+
+        def diverted(path, flags, *rest):
+            if os.path.normcase(os.fspath(path)) == os.path.normcase(lock) \
+                    and not flags & os.O_CREAT:
+                return real_open(victim, flags, *rest)
+            return real_open(path, flags, *rest)
+
+        with mock.patch.object(lb.os, "open", diverted):
+            with self.assertRaises(SystemExit) as caught:
+                _patch(self.model)
+        self.assertIn("changed while it was being opened", str(caught.exception))
+        self.assertEqual(_first_block(self.model), self.block)
+        with open(victim, "rb") as f:
+            self.assertEqual(f.read(), b"keep")
+
+    def _hardlink(self, target, link):
+        try:
+            os.link(target, link)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"cannot create hard links here: {e}")
+
+    def test_a_hard_linked_lock_file_is_refused(self):
+        """R5: a second name would put a (mandatory, on Windows) lock on another file."""
+        for target in (os.path.join(self.dir, "other.bin"), self.model):
+            with self.subTest(target=os.path.basename(target)):
+                lock = lb._lock_path(self.model)
+                if target != self.model:
+                    with open(target, "wb") as f:
+                        f.write(b"keep")
+                self._hardlink(target, lock)
+                with self.assertRaises(SystemExit) as caught:
+                    _patch(self.model)
+                self.assertIn("hard link", str(caught.exception))
+                self.assertEqual(_first_block(self.model), self.block)
+                self.assertFalse(os.path.lexists(self.backup))
+                os.remove(lock)
+
+    def test_every_spelling_of_the_model_shares_one_lock(self):
+        """R4: an 8.3 short name, another case, or a detour must not get its own lock."""
+        spellings = [os.path.join(self.dir, os.pardir, os.path.basename(self.dir),
+                                  os.path.basename(self.model))]
+        if os.name == "nt":
+            import ctypes
+            buf = ctypes.create_unicode_buffer(32768)
+            for fn in (ctypes.windll.kernel32.GetShortPathNameW,
+                       ctypes.windll.kernel32.GetLongPathNameW):
+                if fn(self.model, buf, len(buf)) and buf.value != self.model:
+                    spellings.append(buf.value)
+            spellings.append(self.model.upper())
+        self.assertEqual({lb._lock_path(p) for p in spellings + [self.model]},
+                         {lb._lock_path(self.model)})
+        self.hold_in_another_process()
+        for other in spellings:
+            with self.subTest(other=other):
+                with self.assertRaises(SystemExit) as caught:
+                    _patch(other)
+                self.assertIn("is running on", str(caught.exception))
+        self.assertEqual(_first_block(self.model), self.block)
 
     def test_released_after_a_normal_run(self):
         _patch(self.model)
