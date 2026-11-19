@@ -72,8 +72,13 @@ failed verification, and `patch` refuses to run again until you decide:
     litertlm_backend.py discard-backup <model.litertlm>   # keep what is there
 
 Refusing is the point. The backup is the only way back from a partial write, so a second
-attempt must never replace it — and because it is created exclusively, the same file is
-what stops two patches running at once.
+attempt must never replace it.
+
+Two writers are kept apart by something else: `patch`, `restore` and `discard-backup`
+each hold an exclusive OS lock on `<model>.litertlm.lock` for their whole run (flock on
+POSIX, msvcrt.locking on Windows), and a second one refuses at once rather than waiting.
+The OS drops the lock when the process ends, however it ends, so a crash leaves nothing
+stale. The `.lock` file itself stays on disk and means nothing on its own.
 
 Any command that hits an unreadable header says this, and says which case applies.
 Re-importing the model is the external fallback. Operating on a copy remains
@@ -91,6 +96,8 @@ caller already obtained consent in the same invocation.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import errno
 import glob
 import importlib.metadata
 import io
@@ -289,19 +296,26 @@ def _main_constraint(buf):
     return out
 
 
-def _unreadable(path, exc):
+def _unreadable(path, exc, held=False):
     """Turn a header parse failure into an answer instead of a traceback.
 
     This is what an interrupted patch looks like from the outside: the declared
     header length and the header bytes disagree, so the flatbuffer reads truncated
     and any command touching it explodes. That is precisely the moment to point at
-    the backup, not to print a stack.
+    the backup, not to print a stack — unless a write is running right now, in which
+    case the header is mid-rewrite and the backup is that write's, not a leftover.
+    `held` says the caller holds the write lock itself, so there is nothing to ask.
     """
     backup = _backup_path(path)
-    hint = (f"  A backup from an interrupted patch is present. Restore it:\n"
-            f"    litertlm_backend.py restore {path}\n"
-            if os.path.isfile(backup)
-            else "  No backup is present, so re-import the model to replace it.\n")
+    if not os.path.isfile(backup):
+        hint = "  No backup is present, so re-import the model to replace it.\n"
+    elif not held and _write_running(path):
+        hint = (f"  A patch, restore or discard-backup is running on it now and holds\n"
+                f"  {_lock_path(path)}; the header may be mid-rewrite. Run this again once\n"
+                "  it has finished, rather than restoring.\n")
+    else:
+        hint = (f"  A backup from an interrupted patch is present. Restore it:\n"
+                f"    litertlm_backend.py restore {path}\n")
     # Qualify the type: the usual one is `struct.error`, whose bare __name__ is the
     # unhelpfully generic "error".
     kind = f"{type(exc).__module__}.{type(exc).__name__}".removeprefix("builtins.")
@@ -766,6 +780,199 @@ def _create_exclusive(path, data):
     _fsync_dir(path)
 
 
+def _lock_path(model):
+    # Keyed on the resolved path, so every spelling of one file — an 8.3 short name, a
+    # different case on Windows, a `dir/../dir` detour — contends for the same lock.
+    return os.path.realpath(model) + ".lock"
+
+
+# A held OS lock on `<model>.lock` is what keeps two writers apart: `patch`, `restore` and
+# `discard-backup` each take it, without waiting, for their whole run. The OS drops it when
+# the process ends, however it ends, so a crash or a BSOD leaves no stale lock. The file
+# itself is left on disk and means nothing on its own: only a held lock does. That is also
+# why it is never removed — unlinking a lock file lets a third process lock a new inode
+# while a second still holds the old one.
+#
+# Two accepted edges. `check` (read-only) asks whether a write is running by taking the
+# lock for an instant and dropping it, so a writer that starts in that instant refuses as
+# "running"; run it again. And Windows can take a moment to release a dead process's lock,
+# so a writer refused just after a crash should simply retry.
+#
+# It is opened read-only and created 0o644: a lock needs no write access on either OS,
+# and another user sharing the model directory can still take it.
+try:
+    import fcntl  # POSIX
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+try:
+    import msvcrt  # Windows
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None
+
+# What a non-blocking attempt raises when someone else holds the lock: flock gives
+# EWOULDBLOCK/EAGAIN, msvcrt.locking gives EACCES (or EDEADLOCK).
+_LOCK_BUSY = {errno.EAGAIN, errno.EACCES,
+              getattr(errno, "EWOULDBLOCK", errno.EAGAIN),
+              getattr(errno, "EDEADLK", errno.EAGAIN),
+              getattr(errno, "EDEADLOCK", errno.EAGAIN)}
+
+
+_REPARSE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+
+def _is_link_or_reparse(st):
+    """A symlink, or on Windows any reparse point (a junction or a mount point included)."""
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & _REPARSE)
+
+
+def _check_lock_handle(fd, path):
+    """Refuse unless `fd` is the one plain, singly-named file that `path` itself names."""
+    held, named = os.fstat(fd), os.lstat(path)
+    if _is_link_or_reparse(named) or not stat.S_ISREG(held.st_mode) or \
+            (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
+        raise SystemExit(
+            f"ABORT: the lock path changed while it was being opened:\n  {path}\n"
+            "  Something there is not the plain file it should be (a link, or a swap).\n"
+            "  Nothing was written to the model. Inspect it before running the command again.")
+    if held.st_nlink != 1:
+        raise SystemExit(
+            f"ABORT: the lock file has {held.st_nlink} names (a hard link):\n  {path}\n"
+            "  This tool never creates that, and locking it could lock another file.\n"
+            "  Nothing was written. Inspect it and remove that name yourself.")
+
+
+def _open_lock_file(path, create):
+    """A descriptor on the regular file at exactly `path`, never on what a link names.
+
+    On POSIX, O_NOFOLLOW makes both the create and the open refuse a link outright.
+    Windows has neither O_NOFOLLOW nor a public no-follow open, and O_CREAT|O_EXCL there
+    FOLLOWS a dangling link and creates its target. So on every platform anything
+    already at the name is examined with lstat first and refused unless it is a plain
+    file, and every descriptor, created or opened, is then checked against the name: a
+    link planted between the check and the open shows up as a mismatch, and the handle
+    is closed and refused. (A file that such a race made at the link's target is left
+    alone: this tool cannot be sure of that path, and never deletes through a link.)
+    It must also have exactly one name: a hard link to another file would put the lock,
+    which is mandatory on Windows, on that file's bytes.
+    Nothing is ever written to it, so a refused open has changed nothing at the model.
+    Returns None when `create` is false and nothing is there.
+    """
+    flags = os.O_RDONLY | _NOFOLLOW | _BINARY
+    if not os.path.lexists(path):
+        if not create:
+            return None
+        try:
+            fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            pass                      # appeared meanwhile: examine it like any other
+        else:
+            try:
+                _check_lock_handle(fd, path)
+            except BaseException:
+                os.close(fd)
+                raise
+            _fsync_dir(path)
+            return fd
+    try:
+        named = os.lstat(path)
+    except FileNotFoundError:
+        raise SystemExit(f"ABORT: the lock file vanished while it was being opened:\n  {path}\n"
+                         "  Nothing was written. Run the command again.") from None
+    if _is_link_or_reparse(named) or not stat.S_ISREG(named.st_mode):
+        raise SystemExit(
+            f"ABORT: something other than a regular file is at the lock path:\n  {path}\n"
+            "  This tool never creates that. Nothing was written. Inspect it and remove it\n"
+            "  yourself; if it is a link, removing the link does not touch what it points at.")
+    fd = os.open(path, flags)        # O_NOFOLLOW: a link here is ELOOP on POSIX
+    try:
+        _check_lock_handle(fd, path)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _try_lock(fd):
+    """Take the exclusive lock without waiting. False if another process holds it."""
+    try:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)   # past EOF is allowed; nothing is written
+    except OSError as e:
+        if e.errno in _LOCK_BUSY:
+            return False
+        raise
+    return True
+
+
+def _unlock(fd):
+    try:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        else:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass                 # closing the descriptor releases it regardless
+
+
+def _lock_busy_message(model):
+    return (f"ABORT: another patch, restore or discard-backup is running on:\n  {model}\n"
+            f"  It holds {_lock_path(model)}. Nothing was written. Run the command again\n"
+            "  once it has finished.")
+
+
+@contextlib.contextmanager
+def _write_lock(model):
+    """Hold the model's write lock for the body, or refuse at once if it is taken."""
+    path = _lock_path(model)
+    try:
+        fd = _open_lock_file(path, create=True)
+    except OSError as e:
+        raise SystemExit(f"ABORT: could not open the lock file, so nothing was written:\n"
+                         f"  {path}\n  {e}") from None
+    try:
+        try:
+            got = _try_lock(fd)
+        except OSError as e:
+            raise SystemExit(
+                f"ABORT: could not lock {path}, so nothing was written:\n  {e}\n"
+                "  Writing without the lock could let two commands interleave.") from None
+        if not got:
+            raise SystemExit(_lock_busy_message(model))
+        try:
+            yield
+        finally:
+            _unlock(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_running(model):
+    """Does another process hold the write lock right now? Never creates the lock file.
+
+    Only for callers that do not hold the lock themselves: probing your own lock through
+    a second descriptor reports it as someone else's.
+    """
+    try:
+        fd = _open_lock_file(_lock_path(model), create=False)
+    except (SystemExit, OSError):
+        return False
+    if fd is None:
+        return False
+    try:
+        if not _try_lock(fd):
+            return True
+        _unlock(fd)
+        return False
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
 def _require_regular_model(model):
     """Writes go to the file the caller named, not wherever a link there points."""
     if not _is_regular(model):
@@ -775,18 +982,30 @@ def _require_regular_model(model):
             "  beside the link rather than the file. Name the real path.")
 
 
-def _refuse_pending_backup(model):
-    """Stop while a recovery copy exists, whatever is actually at that name."""
+def _refuse_pending_backup(model, held=False):
+    """Stop while a recovery copy exists, whatever is actually at that name.
+
+    `held` says the caller holds the write lock. Then no other write can be running, so
+    the copy is an interrupted one and both ways out are offered. A caller without the
+    lock asks the lock instead: a copy that belongs to a write still in progress is not
+    an interrupted one, and restoring or discarding it then would undo that write.
+    """
     path = _backup_path(model)
     if not os.path.lexists(path):
         return
+    if not held and _write_running(model):
+        raise SystemExit(_lock_busy_message(model))
     if _is_regular(path):
         raise SystemExit(
             f"ABORT: a header backup is already present:\n  {path}\n"
-            "  An earlier patch did not finish, or one is running now. Nothing was written,\n"
-            "  and that file was left exactly as it is: it may be the only way back.\n"
+            "  An earlier patch or restore did not finish, or failed verification. Nothing\n"
+            "  was written, and that file was left exactly as it is: it may be the only way back.\n"
             f"    Go back:          litertlm_backend.py restore {model}\n"
             f"    Keep the current: litertlm_backend.py discard-backup {model}")
+    if not os.path.lexists(path):
+        # Without the lock, the write that owned it can finish while this looks: the
+        # copy is gone because nothing is pending any more, not because it was odd.
+        return
     raise SystemExit(
         f"ABORT: something other than a regular file is at the backup path:\n  {path}\n"
         "  This tool never creates that. Nothing was written. Inspect it and remove it\n"
@@ -803,8 +1022,9 @@ def _copy_first_block(model):
     protects is several GB, and re-downloading one is the alternative. This machine has
     already taken one unplanned BSOD.
 
-    Exclusive creation also makes this the lock: of two concurrent writers, one gets
-    the file. Needs no parseable header, because a restore may be fixing one.
+    Only a recovery point, not the lock: callers hold `_write_lock` first. Exclusive
+    creation still refuses to replace an existing copy, or to create through a link.
+    Needs no parseable header, because a restore may be fixing one.
     """
     with open(model, "rb") as f:
         block = f.read(CORE.BLOCK_SIZE)
@@ -814,7 +1034,7 @@ def _copy_first_block(model):
     try:
         _create_exclusive(path, block)
     except FileExistsError:
-        _refuse_pending_backup(model)
+        _refuse_pending_backup(model, held=True)
         raise SystemExit(f"ABORT: {path} appeared and vanished; retry.") from None
     except OSError as e:
         raise SystemExit(
@@ -826,15 +1046,16 @@ def _copy_first_block(model):
 def _take_write_authority(model, header_end, orig):
     """`_copy_first_block`, then confirm the file is still the one that was validated.
 
-    Everything `patch` computed came from a read taken BEFORE it held authority, and a
-    patch that finished in that gap has already moved the file on from what `orig`
-    describes. Writing anyway would replace that patch's result with a stale one.
+    Called with the write lock held, so no cooperating writer can have run since `orig`
+    was read. The re-check stays for what the lock cannot exclude — an older copy of this
+    tool, a re-import, anything else that writes the file — because writing over such a
+    change would replace its result with a stale one.
     """
     path, block = _copy_first_block(model)
     if _block_header(block) != (header_end, orig):
         os.remove(path)
         raise SystemExit(
-            f"ABORT: {model} changed while it was being checked; another patch ran.\n"
+            f"ABORT: {model} changed while it was being checked; something else wrote it.\n"
             "  Nothing was written. Run the command again to see the current state.")
     return path, block
 
@@ -965,6 +1186,11 @@ def _same_bytes(path, block):
 def cmd_restore(args):
     """Put back a saved first block: an interrupted patch's, or the original."""
     _require_regular_model(args.model)
+    with _write_lock(args.model):
+        _restore_locked(args)
+
+
+def _restore_locked(args):
     backup = _backup_path(args.model)
     original = _original_path(args.model)
     path = original if args.original else backup
@@ -972,7 +1198,7 @@ def cmd_restore(args):
     if args.original:
         # Finishing that first is not bureaucracy: this restore needs the same path for
         # its own recovery copy, and must not take it from an unresolved one.
-        _refuse_pending_backup(args.model)
+        _refuse_pending_backup(args.model, held=True)
     if not os.path.lexists(path):
         raise SystemExit(
             f"No original header is saved at:\n  {path}\n"
@@ -1015,6 +1241,15 @@ def cmd_discard_backup(args):
     path = _backup_path(args.model)
     if not os.path.lexists(path):
         raise SystemExit(f"No backup found at:\n  {path}")
+    # Under the lock, because a backup that a running patch or restore still depends on
+    # is its only way back: deleting it mid-write would leave that write unrecoverable.
+    with _write_lock(args.model):
+        _discard_backup_locked(args, path)
+
+
+def _discard_backup_locked(args, path):
+    if not os.path.lexists(path):
+        raise SystemExit(f"No backup found at:\n  {path}")
     if stat.S_ISDIR(os.lstat(path).st_mode):
         raise SystemExit(f"ABORT: {path} is a directory; inspect it and remove it yourself.")
     try:
@@ -1022,7 +1257,7 @@ def cmd_discard_backup(args):
     except SystemExit:
         raise
     except Exception as e:  # noqa: BLE001
-        _unreadable(args.model, e)
+        _unreadable(args.model, e, held=True)
 
     if not _consent(
         f"\nThe model header parses. About to delete the recovery copy:\n  {path}\n"
@@ -1101,6 +1336,17 @@ def cmd_patch(args):
             f"--backend {args.backend}\n"
             "    To edit the header regardless, pass --legacy-header-edit.")
 
+    # Everything from the read that is validated to the backup's removal happens under
+    # the lock, so no other patch, restore or discard-backup can run in between. The
+    # config gate above writes nothing, so it runs without one and leaves no lock file.
+    with _write_lock(args.model):
+        _patch_locked(args)
+
+
+def _patch_locked(args):
+    _refuse_pending_backup(args.model, held=True)
+    # No backup can exist here (refused just above, under the lock), so an unreadable
+    # header never reaches _unreadable's lock probe, which would see our own lock.
     header_end, orig, new, changed, fits = _validate(args.model, args.backend)
     if not changed:
         raise SystemExit("ABORT: no main section found to patch.")

@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -454,13 +455,14 @@ class MismatchedCopy(Case):
 
 class Concurrency(Case):
     def test_only_one_of_two_writers_gets_authority(self):
-        """Hold both at the point of no return, so neither can finish first."""
-        barrier = threading.Barrier(2, timeout=10)
+        """Hold the first writer at the point of no return while a second one starts."""
+        inside, release = threading.Event(), threading.Event()
         real = lb._copy_first_block
         results = []
 
-        def racing(model):
-            barrier.wait()
+        def held(model):
+            inside.set()
+            release.wait(10)
             return real(model)
 
         def run():
@@ -470,17 +472,18 @@ class Concurrency(Case):
             except SystemExit as e:
                 results.append(str(e))
 
-        with mock.patch.object(lb, "_copy_first_block", racing):
-            threads = [threading.Thread(target=run) for _ in range(2)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join(20)
-        self.assertEqual(len(results), 2)
-        wrote = results.count("wrote")
-        # Either one lost on the exclusive create, or it ran second and noticed that the
-        # file had moved on. Both writing is the failure; both refusing is not reachable.
-        self.assertEqual(wrote, 1, results)
+        with mock.patch.object(lb, "_copy_first_block", held):
+            first = threading.Thread(target=run)
+            first.start()
+            self.assertTrue(inside.wait(10), "the first writer never reached authority")
+            second = threading.Thread(target=run)
+            second.start()
+            second.join(20)
+            release.set()
+            first.join(20)
+        self.assertEqual(len(results), 2, results)
+        self.assertEqual(results.count("wrote"), 1, results)
+        self.assertIn("is running on", results[0])
         self.assertEqual(lb._main_constraint(lb.read_header(self.model)[1]), ["gpu"])
 
     def test_a_patch_that_lands_before_authority_is_detected(self):
@@ -495,6 +498,344 @@ class Concurrency(Case):
             with self.assertRaises(SystemExit) as caught:
                 _patch(self.model)
         self.assertIn("changed while it was being checked", str(caught.exception))
+        self.assertFalse(os.path.lexists(self.backup))
+
+
+# Holds the model's write lock in a separate process until its stdin closes, or until it
+# is killed. A real second process is the case the lock exists for: in-process tests can
+# only show that two descriptors exclude each other.
+_HOLDER = r"""
+import sys
+sys.path.insert(0, sys.argv[1])
+import litertlm_backend as lb
+with lb._write_lock(sys.argv[2]):
+    print("held", flush=True)
+    sys.stdin.read()
+"""
+
+
+class WriteLock(Case):
+    def hold_in_another_process(self):
+        proc = subprocess.Popen([sys.executable, "-c", _HOLDER, _TOOLS, self.model],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+
+        def stop():
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(20)
+            for s in (proc.stdin, proc.stdout, proc.stderr):
+                s.close()
+        self.addCleanup(stop)
+        line = proc.stdout.readline()
+        if line.strip() != "held":
+            proc.kill()
+            self.fail(f"the holder never took the lock: {line!r} {proc.stderr.read()!r}")
+        return proc
+
+    def leave_a_pending_backup(self):
+        with _crash_at_write(2), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(_Crash):
+                _patch(self.model)
+        self.assertTrue(lb._is_regular(self.backup))
+        return _first_block(self.model), _first_block(self.backup)
+
+    def test_a_second_process_writer_refuses_and_writes_nothing(self):
+        self.hold_in_another_process()
+        with self.assertRaises(SystemExit) as caught:
+            _patch(self.model)
+        self.assertIn("is running on", str(caught.exception))
+        self.assertEqual(_first_block(self.model), self.block)
+        self.assertFalse(os.path.lexists(self.backup))
+        self.assertFalse(os.path.lexists(self.original))
+
+    def test_the_lock_is_released_when_its_holder_dies(self):
+        proc = self.hold_in_another_process()
+        proc.kill()
+        proc.wait(20)
+        # Windows can take a moment to drop a dead process's lock; that is a delay, not a
+        # stale lock, so allow a bounded wait for it before calling it a failure.
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                _patch(self.model)
+                break
+            except SystemExit as e:
+                if "is running on" not in str(e) or time.monotonic() > deadline:
+                    raise
+                time.sleep(0.2)
+        self.assertEqual(lb._main_constraint(lb.read_header(self.model)[1]), ["gpu"])
+
+    def test_the_lock_is_released_when_its_holder_finishes(self):
+        proc = self.hold_in_another_process()
+        proc.stdin.close()
+        self.assertEqual(proc.wait(20), 0, proc.stderr.read())
+        _patch(self.model)
+        self.assertEqual(lb._main_constraint(lb.read_header(self.model)[1]), ["gpu"])
+
+    def test_discard_backup_refuses_while_a_write_holds_the_lock(self):
+        _, saved = self.leave_a_pending_backup()
+        self.hold_in_another_process()
+        with self.assertRaises(SystemExit) as caught:
+            _discard(self.model)
+        self.assertIn("is running on", str(caught.exception))
+        self.assertEqual(_first_block(self.backup), saved)
+
+    def test_restore_refuses_while_a_write_holds_the_lock(self):
+        model, saved = self.leave_a_pending_backup()
+        self.hold_in_another_process()
+        with self.assertRaises(SystemExit) as caught:
+            _restore(self.model)
+        self.assertIn("is running on", str(caught.exception))
+        self.assertEqual(_first_block(self.model), model)
+        self.assertEqual(_first_block(self.backup), saved)
+
+    def test_a_pending_backup_while_locked_is_not_offered_for_restore(self):
+        """R1-11: a backup that belongs to a running write is not an interrupted one."""
+        self.leave_a_pending_backup()
+        self.hold_in_another_process()
+        for run in (lambda: _patch(self.model),
+                    lambda: lb.cmd_check(SimpleNamespace(model=self.model, backend="gpu"))):
+            with self.assertRaises(SystemExit) as caught:
+                run()
+            message = str(caught.exception)
+            self.assertIn("is running on", message)
+            self.assertNotIn("litertlm_backend.py", message, "offers no way out mid-write")
+
+    def test_an_unheld_backup_names_both_ways_out_and_no_running_write(self):
+        self.leave_a_pending_backup()
+        with self.assertRaises(SystemExit) as caught:
+            _patch(self.model)
+        message = str(caught.exception)
+        self.assertIn("already present", message)
+        self.assertIn("restore", message)
+        self.assertIn("discard-backup", message)
+        self.assertNotIn("running now", message)
+
+    def test_an_unreadable_header_is_not_offered_for_restore_mid_write(self):
+        """L25-R1: show and check, which take no lock, must not say "Restore it"."""
+        self.leave_a_pending_backup()
+        self.hold_in_another_process()
+        runs = {
+            "show": lambda: lb.cmd_show(SimpleNamespace(model=self.model)),
+            "check": lambda: lb.cmd_check(SimpleNamespace(model=self.model, backend="gpu")),
+        }
+        for name, run in runs.items():
+            with self.subTest(name), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    run()
+                message = str(caught.exception)
+                self.assertIn("running on", message)
+                self.assertNotIn("Restore it", message)
+                self.assertNotIn("litertlm_backend.py restore", message)
+
+    def test_an_unreadable_header_without_a_running_write_still_names_restore(self):
+        self.leave_a_pending_backup()
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                lb.cmd_show(SimpleNamespace(model=self.model))
+        self.assertIn("Restore it", str(caught.exception))
+
+    def test_discard_backup_does_not_mistake_its_own_lock_for_a_running_write(self):
+        """It holds the lock when it reads the header, so it must not probe it."""
+        self.leave_a_pending_backup()
+        with self.assertRaises(SystemExit) as caught:
+            _discard(self.model)
+        message = str(caught.exception)
+        self.assertIn("Restore it", message)
+        self.assertNotIn("running", message)
+        self.assertTrue(lb._is_regular(self.backup))
+
+    def test_a_backup_that_appears_before_the_lock_is_refused_under_it(self):
+        """M5: the check inside the lock, not the advisory one before it, is the gate.
+
+        The copy lands after the unlocked check and before the lock is taken. Refused
+        under the lock, the run stops before validating or asking for consent; without
+        that check it would go on to the consent gate and stop there for another reason.
+        """
+        real = lb._write_lock
+
+        @contextlib.contextmanager
+        def late_backup(model):
+            with open(self.backup, "wb") as f:
+                f.write(self.block)
+            with real(model):
+                yield
+
+        with mock.patch.object(lb, "_write_lock", late_backup), \
+                mock.patch.object(sys.stdin, "isatty", return_value=False), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                lb.cmd_patch(SimpleNamespace(model=self.model, backend="gpu", yes=False,
+                                             legacy_header_edit=True))
+        self.assertIn("already present", str(caught.exception))
+        self.assertEqual(_first_block(self.model), self.block)
+
+    def test_a_lock_file_swapped_during_the_open_is_refused(self):
+        """M7: the opened descriptor must be the file the name holds.
+
+        Simulates what O_NOFOLLOW cannot stop on Windows: the open lands on another file
+        (a link followed, or a swap between check and open). Platform-independent.
+        """
+        lock = lb._lock_path(self.model)
+        with open(lock, "wb"):
+            pass
+        victim = os.path.join(self.dir, "victim.bin")
+        with open(victim, "wb") as f:
+            f.write(b"keep")
+        real_open = os.open
+
+        def diverted(path, flags, *rest):
+            if os.path.normcase(os.fspath(path)) == os.path.normcase(lock) \
+                    and not flags & os.O_CREAT:
+                return real_open(victim, flags, *rest)
+            return real_open(path, flags, *rest)
+
+        with mock.patch.object(lb.os, "open", diverted):
+            with self.assertRaises(SystemExit) as caught:
+                _patch(self.model)
+        self.assertIn("changed while it was being opened", str(caught.exception))
+        self.assertEqual(_first_block(self.model), self.block)
+        with open(victim, "rb") as f:
+            self.assertEqual(f.read(), b"keep")
+
+    def _hardlink(self, target, link):
+        try:
+            os.link(target, link)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"cannot create hard links here: {e}")
+
+    def test_a_hard_linked_lock_file_is_refused(self):
+        """R5: a second name would put a (mandatory, on Windows) lock on another file."""
+        for target in (os.path.join(self.dir, "other.bin"), self.model):
+            with self.subTest(target=os.path.basename(target)):
+                lock = lb._lock_path(self.model)
+                if target != self.model:
+                    with open(target, "wb") as f:
+                        f.write(b"keep")
+                self._hardlink(target, lock)
+                with self.assertRaises(SystemExit) as caught:
+                    _patch(self.model)
+                self.assertIn("hard link", str(caught.exception))
+                self.assertEqual(_first_block(self.model), self.block)
+                self.assertFalse(os.path.lexists(self.backup))
+                os.remove(lock)
+
+    def test_every_spelling_of_the_model_shares_one_lock(self):
+        """R4: an 8.3 short name, another case, or a detour must not get its own lock."""
+        spellings = [os.path.join(self.dir, os.pardir, os.path.basename(self.dir),
+                                  os.path.basename(self.model))]
+        if os.name == "nt":
+            import ctypes
+            buf = ctypes.create_unicode_buffer(32768)
+            for fn in (ctypes.windll.kernel32.GetShortPathNameW,
+                       ctypes.windll.kernel32.GetLongPathNameW):
+                if fn(self.model, buf, len(buf)) and buf.value != self.model:
+                    spellings.append(buf.value)
+            spellings.append(self.model.upper())
+        self.assertEqual({lb._lock_path(p) for p in spellings + [self.model]},
+                         {lb._lock_path(self.model)})
+        self.hold_in_another_process()
+        for other in spellings:
+            with self.subTest(other=other):
+                with self.assertRaises(SystemExit) as caught:
+                    _patch(other)
+                self.assertIn("is running on", str(caught.exception))
+        self.assertEqual(_first_block(self.model), self.block)
+
+    def test_released_after_a_normal_run(self):
+        _patch(self.model)
+        with lb._write_lock(self.model):
+            pass
+
+    def test_released_after_an_exception(self):
+        with _crash_at_write(1), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(_Crash):
+                _patch(self.model)
+        with lb._write_lock(self.model):
+            pass
+        with self.assertRaises(ValueError):
+            with lb._write_lock(self.model):
+                raise ValueError("inside")
+        with lb._write_lock(self.model):
+            pass
+
+    def test_a_stale_lock_file_with_no_holder_does_not_block(self):
+        with open(lb._lock_path(self.model), "wb") as f:
+            f.write(b"left by a process that died")
+        _patch(self.model)
+        self.assertEqual(lb._main_constraint(lb.read_header(self.model)[1]), ["gpu"])
+        with open(lb._lock_path(self.model), "rb") as f:
+            self.assertEqual(f.read(), b"left by a process that died", "never written")
+
+    def _symlink(self, target, link):
+        try:
+            os.symlink(target, link)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"cannot create symlinks here: {e}")
+
+    def test_a_symlink_at_the_lock_path_is_refused(self):
+        victim = os.path.join(self.dir, "victim.txt")
+        with open(victim, "wb") as f:
+            f.write(b"keep")
+        self._symlink(victim, lb._lock_path(self.model))
+        for run in (lambda: _patch(self.model), lambda: _restore(self.model, original=True)):
+            with self.assertRaises(SystemExit) as caught:
+                run()
+            self.assertIn("lock path", str(caught.exception))
+        self.assertEqual(_first_block(self.model), self.block)
+        self.assertFalse(os.path.lexists(self.backup))
+        with open(victim, "rb") as f:
+            self.assertEqual(f.read(), b"keep")
+
+    def test_a_dangling_symlink_at_the_lock_path_creates_nothing(self):
+        target = os.path.join(self.dir, "nowhere.lock")
+        self._symlink(target, lb._lock_path(self.model))
+        with self.assertRaises(SystemExit) as caught:
+            _patch(self.model)
+        self.assertIn("lock path", str(caught.exception))
+        self.assertFalse(os.path.lexists(target))
+        self.assertEqual(_first_block(self.model), self.block)
+
+    @unittest.skipUnless(os.name == "nt", "junctions are a Windows object")
+    def test_a_dangling_junction_at_the_lock_path_is_refused(self):
+        """The no-privilege variant of the dangling-link test, so Windows runs it locally."""
+        import _winapi
+        target = os.path.join(self.dir, "gone")
+        os.mkdir(target)
+        _winapi.CreateJunction(target, lb._lock_path(self.model))
+        os.rmdir(target)                  # dangling now: the junction names nothing
+        with self.assertRaises(SystemExit) as caught:
+            _patch(self.model)
+        self.assertIn("lock path", str(caught.exception))
+        self.assertFalse(os.path.lexists(target))
+        self.assertEqual(_first_block(self.model), self.block)
+        self.assertFalse(os.path.lexists(self.backup))
+
+    def test_a_create_that_lands_elsewhere_is_refused(self):
+        """What a dangling link planted after the check does on Windows, where O_EXCL follows it.
+
+        The create succeeds, but on the link's target, while the name still holds
+        something else. The descriptor must be checked against the name and refused, or
+        the lock would be taken on a file nobody else will ever open by that name.
+        """
+        lock = lb._lock_path(self.model)
+        elsewhere = os.path.join(self.dir, "link-target.lock")
+        real_open = os.open
+
+        def through_a_link(path, flags, *rest):
+            if os.path.normcase(os.fspath(path)) == os.path.normcase(lock) and flags & os.O_CREAT:
+                fd = real_open(elsewhere, flags, *rest)
+                with open(lock, "wb"):    # stands in for the link the name now holds
+                    pass
+                return fd
+            return real_open(path, flags, *rest)
+
+        with mock.patch.object(lb.os, "open", through_a_link):
+            with self.assertRaises(SystemExit) as caught:
+                _patch(self.model)
+        self.assertIn("changed while it was being opened", str(caught.exception))
+        self.assertEqual(_first_block(self.model), self.block)
         self.assertFalse(os.path.lexists(self.backup))
 
 
